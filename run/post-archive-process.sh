@@ -216,6 +216,24 @@ BEFORE_STATS=$(curl -sf "${API_URL}/api/drives/stats" 2>/dev/null)
 DRIVES_BEFORE=$(echo "$BEFORE_STATS" | grep -o '"drives_count":[0-9]*' | cut -d: -f2)
 DRIVES_BEFORE=${DRIVES_BEFORE:-0}
 
+# Baseline from the end of the last reachable post-archive cycle. The delta
+# between this baseline and DRIVES_BEFORE is what snapshotloop mapped silently
+# while the archive was unreachable (DRIVE_MAP_WHILE_AWAY=true).
+LAST_REACHABLE_STATS_FILE="/mutable/.last-reachable-drives-stats"
+LAST_REACHABLE_EXISTS=false
+LAST_DRIVES_COUNT=0
+LAST_DIST_MI=0
+LAST_DIST_KM=0
+if [ -f "$LAST_REACHABLE_STATS_FILE" ]; then
+  LAST_REACHABLE_EXISTS=true
+  LAST_DRIVES_COUNT=$(grep -o '"drives_count":[0-9]*' "$LAST_REACHABLE_STATS_FILE" | cut -d: -f2)
+  LAST_DRIVES_COUNT=${LAST_DRIVES_COUNT:-0}
+  LAST_DIST_MI=$(grep -o '"total_distance_mi":[0-9.]*' "$LAST_REACHABLE_STATS_FILE" | cut -d: -f2)
+  LAST_DIST_MI=${LAST_DIST_MI:-0}
+  LAST_DIST_KM=$(grep -o '"total_distance_km":[0-9.]*' "$LAST_REACHABLE_STATS_FILE" | cut -d: -f2)
+  LAST_DIST_KM=${LAST_DIST_KM:-0}
+fi
+
 process_clips_dir "$CLIPS_DIR"
 PROCESSED=$?
 
@@ -308,44 +326,77 @@ if [ "$ARCHIVE_REACHABLE" = "true" ]; then
   fi
 fi
 
-# Send notification only if new drives were added
+# Send notification with split counts: drives mapped silently while the archive
+# was unreachable (snapshotloop) vs drives mapped in this post-archive cycle.
+# Baseline (LAST_*) for the "while unreachable" bucket is loaded near the top.
 if [ -x /root/bin/send-push-message ]; then
   STATS=$(curl -sf "${API_URL}/api/drives/stats" 2>/dev/null)
   if [ $? -eq 0 ]; then
     DRIVES_AFTER=$(echo "$STATS" | grep -o '"drives_count":[0-9]*' | cut -d: -f2)
     DRIVES_AFTER=${DRIVES_AFTER:-0}
-    if [ "$DRIVES_AFTER" -gt "$DRIVES_BEFORE" ]; then
-      NEW_DRIVES=$((DRIVES_AFTER - DRIVES_BEFORE))
 
-      # Check user unit preference (mi or km) from setup config (DRIVE_MAP_UNIT)
-      UNIT_PREF=$(curl -sf "${API_URL}/api/setup/config" 2>/dev/null | grep -o '"DRIVE_MAP_UNIT":{[^}]*}' | grep -o '"value":"[^"]*"' | cut -d'"' -f4)
+    # Check user unit preference (mi or km) from setup config (DRIVE_MAP_UNIT)
+    UNIT_PREF=$(curl -sf "${API_URL}/api/setup/config" 2>/dev/null | grep -o '"DRIVE_MAP_UNIT":{[^}]*}' | grep -o '"value":"[^"]*"' | cut -d'"' -f4)
+    if [ "$UNIT_PREF" = "km" ]; then
+      DIST_AFTER=$(echo "$STATS" | grep -o '"total_distance_km":[0-9.]*' | cut -d: -f2)
+      DIST_BEFORE=$(echo "$BEFORE_STATS" | grep -o '"total_distance_km":[0-9.]*' | cut -d: -f2)
+      DIST_LAST=$LAST_DIST_KM
+      DIST_LABEL="km"
+    else
+      DIST_AFTER=$(echo "$STATS" | grep -o '"total_distance_mi":[0-9.]*' | cut -d: -f2)
+      DIST_BEFORE=$(echo "$BEFORE_STATS" | grep -o '"total_distance_mi":[0-9.]*' | cut -d: -f2)
+      DIST_LAST=$LAST_DIST_MI
+      DIST_LABEL="miles"
+    fi
+    DIST_BEFORE=${DIST_BEFORE:-0}
+    DIST_AFTER=${DIST_AFTER:-0}
 
-      # Calculate NEW distance by subtracting before from after
-      if [ "$UNIT_PREF" = "km" ]; then
-        DIST_AFTER=$(echo "$STATS" | grep -o '"total_distance_km":[0-9.]*' | cut -d: -f2)
-        DIST_BEFORE=$(echo "$BEFORE_STATS" | grep -o '"total_distance_km":[0-9.]*' | cut -d: -f2)
-        DIST_LABEL="km"
-      else
-        DIST_AFTER=$(echo "$STATS" | grep -o '"total_distance_mi":[0-9.]*' | cut -d: -f2)
-        DIST_BEFORE=$(echo "$BEFORE_STATS" | grep -o '"total_distance_mi":[0-9.]*' | cut -d: -f2)
-        DIST_LABEL="miles"
-      fi
-      DIST_BEFORE=${DIST_BEFORE:-0}
-      DIST_AFTER=${DIST_AFTER:-0}
-      # Calculate new distance (using awk for float subtraction)
-      NEW_DIST=$(awk "BEGIN { printf \"%.2f\", ${DIST_AFTER} - ${DIST_BEFORE} }")
+    # Bucket 1: drives added by snapshotloop while archive was unreachable.
+    # Skip on the first-ever run (no baseline) — otherwise we'd attribute every
+    # historical drive to "while away."
+    if [ "$LAST_REACHABLE_EXISTS" = "true" ]; then
+      AWAY_DRIVES=$((DRIVES_BEFORE - LAST_DRIVES_COUNT))
+      [ "$AWAY_DRIVES" -lt 0 ] && AWAY_DRIVES=0
+      AWAY_DIST=$(awk "BEGIN { d = ${DIST_BEFORE} - ${DIST_LAST}; if (d < 0) d = 0; printf \"%.2f\", d }")
+    else
+      AWAY_DRIVES=0
+      AWAY_DIST="0.00"
+    fi
 
-      if [ "$NEW_DRIVES" -eq 1 ]; then
-        DRIVE_WORD="drive"
-      else
-        DRIVE_WORD="drives"
-      fi
+    # Bucket 2: drives just added by this post-archive cycle.
+    NOW_DRIVES=$((DRIVES_AFTER - DRIVES_BEFORE))
+    [ "$NOW_DRIVES" -lt 0 ] && NOW_DRIVES=0
+    NOW_DIST=$(awk "BEGIN { d = ${DIST_AFTER} - ${DIST_BEFORE}; if (d < 0) d = 0; printf \"%.2f\", d }")
 
-      /root/bin/send-push-message "${NOTIFICATION_TITLE:-SentryUSB}:" \
-        "${NEW_DRIVES} new ${DRIVE_WORD} mapped (${NEW_DIST} ${DIST_LABEL})." \
-        info drives || log "Failed to send notification"
+    word() { [ "$1" -eq 1 ] && echo drive || echo drives; }
+
+    MSG=""
+    if [ "$AWAY_DRIVES" -gt 0 ] && [ "$NOW_DRIVES" -gt 0 ]; then
+      MSG="${AWAY_DRIVES} new $(word $AWAY_DRIVES) mapped while archive was unreachable (${AWAY_DIST} ${DIST_LABEL}). ${NOW_DRIVES} new $(word $NOW_DRIVES) mapped now (${NOW_DIST} ${DIST_LABEL})."
+    elif [ "$AWAY_DRIVES" -gt 0 ]; then
+      MSG="${AWAY_DRIVES} new $(word $AWAY_DRIVES) mapped while archive was unreachable (${AWAY_DIST} ${DIST_LABEL})."
+    elif [ "$NOW_DRIVES" -gt 0 ]; then
+      MSG="${NOW_DRIVES} new $(word $NOW_DRIVES) mapped (${NOW_DIST} ${DIST_LABEL})."
+    fi
+
+    if [ -n "$MSG" ]; then
+      /root/bin/send-push-message "${NOTIFICATION_TITLE:-SentryUSB}:" "$MSG" info drives \
+        || log "Failed to send notification"
     else
       log "No new drives found, skipping drive stats notification."
+    fi
+
+    # Update baseline for next cycle (always — even when no notification fired —
+    # so AWAY_DRIVES on the next run reflects only deltas added after this point).
+    DIST_AFTER_MI=$(echo "$STATS" | grep -o '"total_distance_mi":[0-9.]*' | cut -d: -f2)
+    DIST_AFTER_KM=$(echo "$STATS" | grep -o '"total_distance_km":[0-9.]*' | cut -d: -f2)
+    DIST_AFTER_MI=${DIST_AFTER_MI:-0}
+    DIST_AFTER_KM=${DIST_AFTER_KM:-0}
+    NOW_TS=$(date +%s)
+    TMP_STATS="${LAST_REACHABLE_STATS_FILE}.tmp"
+    if printf '{"drives_count":%d,"total_distance_mi":%s,"total_distance_km":%s,"updated_at":%d}\n' \
+       "$DRIVES_AFTER" "$DIST_AFTER_MI" "$DIST_AFTER_KM" "$NOW_TS" > "$TMP_STATS" 2>/dev/null; then
+      mv -f "$TMP_STATS" "$LAST_REACHABLE_STATS_FILE" 2>/dev/null || rm -f "$TMP_STATS"
     fi
   fi
 fi
