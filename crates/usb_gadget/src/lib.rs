@@ -327,6 +327,13 @@ pub fn disable() -> Result<()> {
     let _ = fs::remove_file(cfg_dir.join("mass_storage.0"));
     let cfg_strings = cfg_dir.join(format!("strings/{}", LANG));
     let _ = fs::remove_dir(&cfg_strings);
+    // Legacy form: the pre-fix Rust binary used LANG="0x0409", which on
+    // install paths that route archiveloop through Rust (install-pi.sh
+    // shim, sentryusb gadget enable CLI shim) created the dir literally
+    // as `0x0409`. Hot-upgrading to the current binary would otherwise
+    // leave the orphan, pinning libcomposite forever. NotFound on
+    // shell-script installs is silently ignored.
+    let _ = fs::remove_dir(cfg_dir.join("strings/0x0409"));
 
     // Now that the function is detached, release each LUN's backing-file
     // handle by clearing its `file` attribute. On kernels that aggressively
@@ -362,6 +369,7 @@ pub fn disable() -> Result<()> {
     // Remove config and string dirs
     let _ = fs::remove_dir(&cfg_dir);
     let _ = fs::remove_dir(gadget.join(format!("strings/{}", LANG)));
+    let _ = fs::remove_dir(gadget.join("strings/0x0409")); // legacy form — see above
     let _ = fs::remove_dir(&gadget);
 
     // Unload remaining function modules (mass storage is already gone).
