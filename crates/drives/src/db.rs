@@ -66,14 +66,17 @@ pub const IMPORT_SOURCE_CANDIDATES: &[&str] = &[
     LEGACY_JSON_PATH,                // /root/drive-data.json (pre-SQLite)
 ];
 
-/// Files this binary used to write under `/mutable` that are now obsolete.
-/// Removed once at startup so the small `/mutable` partition doesn't carry
-/// stale megabytes across upgrades. Order doesn't matter; each is best-effort.
+/// Files this binary used to write under `/mutable` that are now obsolete and
+/// are safe to delete at startup. Limited to the `drive-data.json` family
+/// because the importer in `DriveStore::open` consumes the legacy
+/// `/mutable/drive-data.json` (if any) *before* this cleanup runs, so the
+/// data is already migrated into the DB. Other legacy paths (notification
+/// history, preferences) are deliberately left alone — they're tiny and
+/// some Rust code still reads them as a lazy fallback for upgraders whose
+/// data only lives at the legacy location.
 const LEGACY_MUTABLE_ORPHANS: &[&str] = &[
-    "/mutable/drive-data.json",            // moved to /backingfiles/drive-data.json
-    "/mutable/drive-data.json.tmp",        // half-written atomic-rename leftover
-    "/mutable/.notification_history.json", // pre-Rust notification queue
-    "/mutable/sentryusb-prefs.json",       // pre-Rust preferences file
+    "/mutable/drive-data.json",     // moved to /backingfiles/drive-data.json
+    "/mutable/drive-data.json.tmp", // half-written atomic-rename leftover
 ];
 
 /// Remove orphaned `/mutable` files left behind by older binaries that wrote

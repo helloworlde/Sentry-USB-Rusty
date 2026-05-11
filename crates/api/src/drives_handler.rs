@@ -570,7 +570,7 @@ pub async fn download_data(
 
 /// POST /api/drives/data/export-for-sync
 ///
-/// Regenerate `/mutable/drive-data.json` from the live SQLite store so
+/// Regenerate `/backingfiles/drive-data.json` from the live SQLite store so
 /// `post-archive-process.sh` can ship it to the rsync / rclone archive
 /// server. Returns the byte count of the regenerated file so the shell
 /// script can log it.
