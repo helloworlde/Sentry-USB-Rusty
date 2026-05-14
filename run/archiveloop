@@ -1047,6 +1047,20 @@ function archive_clips () {
     log "Archiving failed."
   fi
 
+  # If the user drove away during archive, the gadget is still presented to
+  # the car (clean_cam_mount was skipped inside archive_teslacam_clips). Skip
+  # all post-archive cleanup — every step below cycles the USB gadget, which
+  # would interrupt the car's recording. The skipped work (music sync, drive-
+  # map, cloud upload) will run on the next archive cycle when the user is
+  # parked at home again.
+  if ! archive_is_reachable; then
+    log "Archive became unreachable during clip archiving (user likely drove away); skipping music sync and post-archive processing to keep USB drive stable for the car"
+    touch /tmp/flag_post_archive
+    clear_archive_status
+    /root/bin/disconnect-archive.sh 2>> "$LOG_FILE" || true
+    return
+  fi
+
   if { timeout 5 [ -d "${MUSIC_ARCHIVE_MOUNT:-}" -a -d "$MUSIC_MOUNT" ]; } || \
      { [ "${ARCHIVE_SYSTEM:-none}" = "rsync" ] && [ -n "${MUSIC_SHARE_NAME:-}" ] && [ -f /backingfiles/music_disk.bin ]; }
   then
@@ -1316,7 +1330,11 @@ then
 
   doubleblink
 
-  connect_usb_drives_to_host
+  # Skip the gadget cycle if the user drove away during archive — the gadget
+  # is still presented to the car and re-cycling it would interrupt recording.
+  if archive_is_reachable; then
+    connect_usb_drives_to_host
+  fi
 
   if archive_is_reachable; then
     wait_for_archive_to_be_unreachable
@@ -1363,7 +1381,11 @@ do
 
   doubleblink
 
-  connect_usb_drives_to_host
+  # Skip the gadget cycle if the user drove away during archive — the gadget
+  # is still presented to the car and re-cycling it would interrupt recording.
+  if archive_is_reachable; then
+    connect_usb_drives_to_host
+  fi
 
   if archive_is_reachable; then
     wait_for_archive_to_be_unreachable
