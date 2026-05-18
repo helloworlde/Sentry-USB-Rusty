@@ -503,16 +503,55 @@ pub async fn send_test_notification(State(_s): State<AppState>) -> (StatusCode, 
         &format!("Test notification from {} — push notifications are working!", hostname),
     ).await;
 
-    match result {
+    let (status_code, body, send_ok, error_msg) = match result {
         Ok(()) => {
             info!("[notifications] Test notification sent successfully");
-            (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+            (
+                StatusCode::OK,
+                serde_json::json!({"status": "ok"}),
+                true,
+                String::new(),
+            )
         }
         Err(e) => {
-            warn!("[notifications] Test notification failed: {}", e);
-            crate::json_error(StatusCode::BAD_GATEWAY, &e.to_string())
+            let msg = e.to_string();
+            warn!("[notifications] Test notification failed: {}", msg);
+            (
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({"status": "error", "error": msg.clone()}),
+                false,
+                msg,
+            )
         }
+    };
+
+    // Record in notification history so the web UI / Notification Center
+    // can show test results alongside real archive/temperature events.
+    // Matches the real /api/notifications/send path which calls
+    // record_event() after each send. Without this, users testing the
+    // pairing flow see "sent successfully" in the API response but the
+    // History tab stays empty — which incorrectly looks like the push
+    // never happened.
+    let mut results_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    results_map.insert(
+        "sentry_connect".to_string(),
+        if send_ok { "ok".to_string() } else { format!("error: {}", error_msg) },
+    );
+    let event = crate::notification_center::NotificationEvent {
+        id: String::new(),
+        timestamp: 0,
+        event_type: "test".to_string(),
+        title: "SentryUSB Test".to_string(),
+        message: format!("Test notification from {} — push notifications are working!", hostname),
+        providers: vec!["sentry_connect".to_string()],
+        results: results_map,
+    };
+    if let Err(e) = crate::notification_center::record_event(event) {
+        warn!("[notifications] Failed to record test notification in history: {}", e);
     }
+
+    (status_code, Json(body))
 }
 
 // -----------------------------------------------------------------------------
