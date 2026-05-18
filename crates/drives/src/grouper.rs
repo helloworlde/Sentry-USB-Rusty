@@ -2119,9 +2119,7 @@ struct TimedSummary<'a> {
 }
 
 /// Sub-segment of a clip, produced when a clip contains internal park
-/// gaps that should split it across two or more drives. Mirrors the
-/// cloud's `{row, startFrame, endFrame, totalFrames, fraction}` shape
-/// (web/src/lib/drives/grouper.js `makeSubClip`).
+/// gaps that should split it across two or more drives.
 ///
 /// A "whole-clip" sub-clip has `start_frame=0, end_frame=total_frames,
 /// fraction=1.0`. Aggregator multiplies per-clip aggregates by `fraction`
@@ -2176,11 +2174,10 @@ impl<'a> SubClipSummary<'a> {
 /// `group_clips` but operates on summary rows that don't carry point
 /// arrays.
 ///
-/// Returns `Vec<Vec<SubClipSummary>>` (not `Vec<Vec<TimedSummary>>`) —
-/// `split_summary_by_gear_state` slices clips with internal park gaps
-/// into sub-segments so the drive boundaries and per-drive aggregates
-/// match the cloud's `splitByGearStateSummary` exactly, instead of the
-/// pre-2026-05-18 atomic-clip approximation.
+/// Returns `Vec<Vec<SubClipSummary>>`: `split_summary_by_gear_state`
+/// slices clips with internal park gaps into sub-segments so multi-
+/// park-gap clips produce the correct drive count and per-drive
+/// aggregates fraction-scale across the resulting drives.
 fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<SubClipSummary<'a>>> {
     if summaries.is_empty() {
         return Vec::new();
@@ -2236,7 +2233,7 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<SubClipSumm
 
 /// Summary-side equivalent of `split_by_external_signature`. Operates
 /// on sub-clips (post gear-state split) so signature buckets preserve
-/// the mid-clip park-gap slicing.
+/// any mid-clip park-gap slicing.
 fn split_summary_by_external_signature<'a>(
     group: Vec<SubClipSummary<'a>>,
 ) -> Vec<Vec<SubClipSummary<'a>>> {
@@ -2270,10 +2267,8 @@ fn split_summary_by_external_signature<'a>(
 }
 
 /// Summary-side equivalent of `split_by_gear_state`. Slices clips with
-/// internal Park gaps into sub-segments so the resulting drives match
-/// the cloud's `splitByGearStateSummary` (web/src/lib/drives/grouper.js)
-/// — including the multi-park-gap case where one clip contributes to
-/// 3+ drives.
+/// internal Park gaps into sub-segments — including the multi-park-gap
+/// case where one clip contributes to 3+ drives.
 ///
 /// Each produced sub-clip carries `(start_frame, end_frame, fraction)`
 /// so `build_summary_from_aggregates` can fraction-scale per-clip
@@ -2296,8 +2291,7 @@ fn split_summary_by_gear_state<'a>(
     for clip in group {
         let total_frames: u32 = clip.summary.gear_runs.iter().map(|r| r.frames).sum();
 
-        // No gear data: treat whole clip as one non-park sub-segment
-        // (matches cloud's `if (!gr || gr.length < 2)` short-circuit).
+        // No gear data: treat whole clip as one non-park sub-segment.
         if total_frames == 0 {
             current.push(SubClipSummary::whole(clip));
             continue;
@@ -2306,7 +2300,7 @@ fn split_summary_by_gear_state<'a>(
         let spf = 60.0 / total_frames as f64;
 
         // Raw per-gear-run segments, marked parked iff GEAR_PARK and the
-        // run lasts at least PARK_GAP_SECONDS. Mirrors cloud's `rawSegs`.
+        // run lasts at least PARK_GAP_SECONDS.
         #[derive(Clone)]
         struct Seg {
             start: u32,
@@ -2903,13 +2897,12 @@ mod tests {
         }
     }
 
-    /// Regression for the "fractions of a percent" divergence noted in
-    /// the 2026-05-18 CLAUDE.md entry. A single clip with TWO internal
-    /// park gaps (drive/park/drive/park/drive) used to undercount by
-    /// producing one drive boundary and dumping the full clip's
-    /// aggregates into the first drive. Post-port it should produce
-    /// THREE drives, each receiving roughly a third of the clip's
-    /// distance.
+    /// A single clip with TWO internal park gaps
+    /// (drive/park/drive/park/drive) must split into three drives, each
+    /// receiving its proportional slice of the clip's per-clip
+    /// aggregates. Regression guard against the previous atomic-clip
+    /// behavior that produced one drive boundary and dumped the full
+    /// clip's aggregates into the first drive.
     #[test]
     fn test_split_summary_multi_park_gap_produces_three_drives() {
         // 60 frames total: drive 20, park 5, drive 15, park 5, drive 15.
