@@ -266,6 +266,18 @@ impl Processor {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
+                // Skip Tesla event folders. SavedClips contains user-saved
+                // clips that are byte-identical to RecentClips entries
+                // (different paths the grouper's path-based dedup can't
+                // catch). SentryClips contains parked Sentry-mode recordings
+                // that the gear-state splitter emits as spurious "drives"
+                // bordering an actual trip. Matches Sentry-Drive's
+                // discoverFrontCameraFiles (process.js:91-94).
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if is_event_folder(name) {
+                        continue;
+                    }
+                }
                 self.scan_dir(&path, files)?;
             } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.ends_with("-front.mp4") {
@@ -279,5 +291,30 @@ impl Processor {
             }
         }
         Ok(())
+    }
+}
+
+/// Directory names that hold Tesla event clips (Sentry triggers + user
+/// saves). Excluded from drive discovery to keep parked recordings and
+/// duplicate-of-RecentClips entries out of the grouper.
+pub(crate) fn is_event_folder(name: &str) -> bool {
+    name == "SavedClips" || name == "SentryClips"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_event_folder() {
+        assert!(is_event_folder("SavedClips"));
+        assert!(is_event_folder("SentryClips"));
+        assert!(!is_event_folder("RecentClips"));
+        assert!(!is_event_folder("2026-05-17"));
+        assert!(!is_event_folder("2026-05-17_18-47-59"));
+        assert!(!is_event_folder(""));
+        // Case sensitive — Tesla's folder names are exact.
+        assert!(!is_event_folder("savedclips"));
+        assert!(!is_event_folder("SAVEDCLIPS"));
     }
 }

@@ -240,6 +240,15 @@ pub fn build_single_drive_from_clips(
 // Internal: clip grouping
 // ---------------------------------------------------------------------------
 
+/// True when a route's `file` path lives under a Tesla event folder
+/// (`SavedClips/` or `SentryClips/`). The `replace('\\', "/")` handles
+/// drive-data.json imports that came from a Windows export (Sentry-Drive
+/// writes backslashes in its file paths).
+fn is_event_folder_path(file: &str) -> bool {
+    let norm = file.replace('\\', "/");
+    norm.starts_with("SavedClips/") || norm.starts_with("SentryClips/")
+}
+
 /// Dedup by normalized file path, parse timestamps, sort, split on 5-min gaps,
 /// then split by gear state transitions.
 fn group_clips(routes: &[Route]) -> Vec<Vec<TimedRoute>> {
@@ -247,23 +256,42 @@ fn group_clips(routes: &[Route]) -> Vec<Vec<TimedRoute>> {
         return Vec::new();
     }
 
-    // Deduplicate by normalized file path (handles mixed \ and /)
+    // Filter out routes that live under SavedClips/SentryClips event folders
+    // BEFORE dedup. These contain (a) clips that duplicate RecentClips data
+    // with a different path the dedup-by-path can't catch, and (b) parked
+    // Sentry-mode recordings the gear-state splitter would otherwise emit
+    // as a spurious "drive" bordering an actual trip. Mirrors the discovery
+    // filter in processor.rs::scan_dir and Sentry-Drive's process.js:91-94.
+    // Safety net for: pre-v5 DB rows the migration may have missed, and
+    // imports of a drive-data.json produced by an unfixed build.
     let input_count = routes.len();
     let mut seen = HashMap::with_capacity(routes.len());
     let mut unique = Vec::with_capacity(routes.len());
+    let mut filtered_event_folder = 0usize;
     for r in routes {
+        if is_event_folder_path(&r.file) {
+            filtered_event_folder += 1;
+            continue;
+        }
         let norm = r.file.replace('\\', "/");
         if seen.insert(norm, ()).is_none() {
             unique.push(r);
         }
     }
     let unique_count = unique.len();
-    if unique_count < input_count {
+    if filtered_event_folder > 0 {
+        info!(
+            "group_clips: filtered {} SavedClips/SentryClips route(s)",
+            filtered_event_folder
+        );
+    }
+    if unique_count + filtered_event_folder < input_count {
         warn!(
-            "group_clips: dedup dropped {} duplicate-path route(s) (input={} unique={})",
-            input_count - unique_count,
+            "group_clips: dedup dropped {} duplicate-path route(s) (input={} unique={} event_filtered={})",
+            input_count - unique_count - filtered_event_folder,
             input_count,
             unique_count,
+            filtered_event_folder,
         );
     }
 
@@ -2671,5 +2699,140 @@ mod tests {
         assert_eq!(stats.total_distance_km, 0.0);
     }
 
+    #[test]
+    fn test_is_event_folder_path() {
+        // Linux-style paths produced by scan_dir.
+        assert!(is_event_folder_path("SavedClips/2026-05-17_18-47-59/2026-05-17_18-47-34-front.mp4"));
+        assert!(is_event_folder_path("SentryClips/2026-05-17_18-46-39/2026-05-17_18-35-39-front.mp4"));
+        // Windows-style paths from a Sentry-Drive drive-data.json import.
+        assert!(is_event_folder_path("SavedClips\\2026-05-17_18-47-59\\2026-05-17_18-47-34-front.mp4"));
+        assert!(is_event_folder_path("SentryClips\\foo\\bar-front.mp4"));
+        // Real drive content stays in.
+        assert!(!is_event_folder_path("RecentClips/2026-05-17/2026-05-17_18-47-34-front.mp4"));
+        assert!(!is_event_folder_path("2026-05-17/2026-05-17_18-47-34-front.mp4"));
+        assert!(!is_event_folder_path("2026-05-17\\2026-05-17_18-47-34-front.mp4"));
+        assert!(!is_event_folder_path(""));
+        // Substring matches don't count — must be a top-level segment.
+        assert!(!is_event_folder_path("foo/SavedClips/x.mp4"));
+        assert!(!is_event_folder_path("MySavedClips/x.mp4"));
+    }
 
+    /// Park-only gear run for one full-minute clip (60 raw frames). Used to
+    /// model SentryClips event recordings where the car was parked the
+    /// entire time.
+    fn park_route(file: &str, lat: f64) -> Route {
+        Route {
+            file: file.to_string(),
+            date: "SentryClips".to_string(),
+            points: vec![[lat, -76.795]],
+            gear_states: vec![GEAR_PARK; 60],
+            autopilot_states: vec![AUTOPILOT_OFF; 60],
+            speeds: vec![0.0; 60],
+            accel_positions: vec![0.0; 60],
+            raw_park_count: 60,
+            raw_frame_count: 60,
+            gear_runs: vec![GearRun {
+                gear: GEAR_PARK,
+                frames: 60,
+            }],
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
+        }
+    }
+
+    #[test]
+    fn test_group_clips_filters_event_folder_routes() {
+        // Three routes within the same minute — without filtering they'd all
+        // land in one time group. With filtering only the RecentClips route
+        // survives, and the group contains exactly one clip.
+        let routes = vec![
+            test_route(
+                "RecentClips/2025-01-15/2025-01-15_12-30-00-front.mp4",
+                vec![[37.0, -122.0]],
+            ),
+            test_route(
+                "SavedClips/2025-01-15_12-30-30/2025-01-15_12-30-00-front.mp4",
+                vec![[37.0, -122.0]],
+            ),
+            test_route(
+                "SentryClips/2025-01-15_12-29-30/2025-01-15_12-30-00-front.mp4",
+                vec![[37.0, -122.0]],
+            ),
+        ];
+        let groups = group_clips(&routes);
+        assert_eq!(groups.len(), 1, "expected one drive after filtering");
+        assert_eq!(groups[0].len(), 1, "expected one route in the drive");
+        assert!(
+            groups[0][0].route.file.starts_with("RecentClips/"),
+            "the surviving route should be the RecentClips one, got {}",
+            groups[0][0].route.file
+        );
+    }
+
+    #[test]
+    fn test_group_clips_may17_regression() {
+        // Reproduces the user-reported May 17 6:47 PM scenario:
+        //   - 11 SentryClips event recordings (car parked) from 18:35-18:45
+        //   - 1 SavedClips duplicate of the 18:47:34 RecentClips file
+        //   - 5 RecentClips files from the actual drive 18:47:34 - 18:51:34
+        //
+        // Before the fix this produced 2 drives: a fake "parked" drive built
+        // from the SentryClips Park frames, then the real trip. With the fix
+        // the event-folder routes are filtered, leaving a single drive of 5
+        // RecentClips routes.
+        let mut routes: Vec<Route> = Vec::new();
+
+        // SentryClips: 11 minutes of parked recording, all Park gear.
+        for minute in 35..=45 {
+            let file = format!(
+                "SentryClips/2026-05-17_18-46-39/2026-05-17_18-{:02}-{:02}-front.mp4",
+                minute,
+                39 + (minute - 35),
+            );
+            routes.push(park_route(&file, 39.198_8 + (minute as f64) * 1e-6));
+        }
+
+        // SavedClips: one duplicate of the 18:47:34 RecentClips file.
+        routes.push(test_route(
+            "SavedClips/2026-05-17_18-47-59/2026-05-17_18-47-34-front.mp4",
+            vec![[39.198_835, -76.795_246]],
+        ));
+
+        // RecentClips: 5 minutes of actual driving.
+        let drive_starts = [
+            "RecentClips/2026-05-17/2026-05-17_18-47-34-front.mp4",
+            "RecentClips/2026-05-17/2026-05-17_18-48-34-front.mp4",
+            "RecentClips/2026-05-17/2026-05-17_18-49-34-front.mp4",
+            "RecentClips/2026-05-17/2026-05-17_18-50-34-front.mp4",
+            "RecentClips/2026-05-17/2026-05-17_18-51-34-front.mp4",
+        ];
+        for (i, f) in drive_starts.iter().enumerate() {
+            routes.push(test_route(
+                f,
+                vec![[39.198_835 + (i as f64) * 1e-4, -76.795_246]],
+            ));
+        }
+
+        let groups = group_clips(&routes);
+        assert_eq!(
+            groups.len(),
+            1,
+            "May 17 trip must group into a single drive; got {} groups",
+            groups.len()
+        );
+        assert_eq!(
+            groups[0].len(),
+            drive_starts.len(),
+            "the drive should contain exactly the {} RecentClips routes",
+            drive_starts.len()
+        );
+        for clip in &groups[0] {
+            assert!(
+                clip.route.file.starts_with("RecentClips/"),
+                "unexpected non-RecentClips route in drive: {}",
+                clip.route.file
+            );
+        }
+    }
 }

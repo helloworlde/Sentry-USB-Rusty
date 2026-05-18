@@ -15,7 +15,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 /// Schema version this binary writes. Stored in the `meta` table and
 /// checked on every open so future upgrades can run targeted migrations.
-pub const CURRENT_SCHEMA_VERSION: i32 = 4;
+///
+/// v4 -> v5: data-only cleanup. Pre-v5 scans wrote rows for
+/// `SavedClips/...` and `SentryClips/...` clips that produce spurious
+/// "drives" (parked Sentry recordings) and duplicates of RecentClips
+/// data. v5 deletes those rows from `routes` and `processed_files`.
+/// scan_dir + grouper now refuse to add them going forward.
+pub const CURRENT_SCHEMA_VERSION: i32 = 5;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly —
@@ -144,6 +150,37 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute(V3_CLOUD_PENDING_INDEX, [])
         .context("migrate: creating idx_routes_cloud_pending")?;
 
+    // v5 data cleanup: purge SavedClips/SentryClips routes that pre-v5
+    // scans wrote. Gated on the stored schema_version so we only pay the
+    // table-scan cost during the one upgrade-to-v5 open. Fresh DBs
+    // (schema_version = None) have no rows to delete and skip the work.
+    let stored_version_for_v5 = meta_get(conn, "schema_version")?;
+    let needs_v5_cleanup = matches!(
+        stored_version_for_v5.as_deref(),
+        Some(v) if stored_less_than(v, 5),
+    );
+    if needs_v5_cleanup {
+        let deleted_routes = conn
+            .execute(
+                "DELETE FROM routes WHERE file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%'",
+                [],
+            )
+            .context("migrate v5: purging event-folder routes")?;
+        let deleted_processed = conn
+            .execute(
+                "DELETE FROM processed_files WHERE file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%'",
+                [],
+            )
+            .context("migrate v5: purging event-folder processed_files")?;
+        if deleted_routes > 0 || deleted_processed > 0 {
+            tracing::info!(
+                "schema v5: purged {} route(s) and {} processed_files row(s) from SavedClips/SentryClips",
+                deleted_routes,
+                deleted_processed,
+            );
+        }
+    }
+
     // schema_version handling:
     //   * first-ever migrate: seed to CURRENT_SCHEMA_VERSION.
     //   * upgrading from an older version: bump up to current.
@@ -238,7 +275,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("4"),
+            Some("5"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -272,7 +309,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("4")
+            Some("5")
         );
     }
 
@@ -300,7 +337,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("4")
+            Some("5")
         );
     }
 
@@ -328,7 +365,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("4")
+            Some("5")
         );
     }
 
@@ -367,5 +404,126 @@ mod tests {
         assert!(stored_less_than("3", 4));
         assert!(!stored_less_than("4", 4));
         assert!(!stored_less_than("99", 4));
+    }
+
+    /// Seed `routes` and `processed_files` with a row from each category.
+    /// Returns the count of each category present in `routes`.
+    fn seed_three_categories(conn: &Connection) {
+        for file in [
+            "RecentClips/2026-05-17/2026-05-17_18-47-34-front.mp4",
+            "SavedClips/2026-05-17_18-47-59/2026-05-17_18-47-34-front.mp4",
+            "SentryClips/2026-05-17_18-46-39/2026-05-17_18-35-39-front.mp4",
+        ] {
+            conn.execute(
+                "INSERT INTO routes (file, date_dir, points_blob, updated_at) VALUES (?1, ?2, X'', 0)",
+                params![file, "RecentClips"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO processed_files (file, added_at) VALUES (?1, 0)",
+                params![file],
+            )
+            .unwrap();
+        }
+    }
+
+    fn count_routes(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM routes", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn count_processed(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM processed_files", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn migrate_v5_purges_event_folder_rows() {
+        let conn = open();
+        // Stand up a v4 DB with three seed rows (one per category).
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        meta_set(&conn, "schema_version", "4").unwrap();
+        seed_three_categories(&conn);
+        assert_eq!(count_routes(&conn), 3);
+        assert_eq!(count_processed(&conn), 3);
+
+        migrate(&conn).unwrap();
+
+        // Only the RecentClips row survives in both tables.
+        assert_eq!(count_routes(&conn), 1, "expected only RecentClips route to remain");
+        assert_eq!(count_processed(&conn), 1, "expected only RecentClips processed_files row");
+        let surviving_route: String = conn
+            .query_row("SELECT file FROM routes", [], |row| row.get(0))
+            .unwrap();
+        assert!(surviving_route.starts_with("RecentClips/"));
+        let surviving_processed: String = conn
+            .query_row("SELECT file FROM processed_files", [], |row| row.get(0))
+            .unwrap();
+        assert!(surviving_processed.starts_with("RecentClips/"));
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("5")
+        );
+    }
+
+    #[test]
+    fn migrate_v5_is_idempotent() {
+        let conn = open();
+        migrate(&conn).unwrap();
+        // After the first migrate, schema_version is "5", so a second
+        // migrate must NOT re-run the cleanup. Seed an event-folder row
+        // AFTER the version is set, and confirm the second migrate leaves
+        // it alone — proves the cleanup is gated on schema_version.
+        conn.execute(
+            "INSERT INTO routes (file, date_dir, points_blob, updated_at) VALUES (?1, ?2, X'', 0)",
+            params!["SavedClips/x/y-front.mp4", "SavedClips"],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(count_routes(&conn), 1, "v5 cleanup must not re-run on a v5 DB");
+    }
+
+    #[test]
+    fn migrate_v5_skips_cleanup_on_fresh_db() {
+        // A fresh DB (no stored schema_version) shouldn't even attempt
+        // the DELETE — there's nothing to clean. Verify by inserting an
+        // event-folder row after we manually create the schema but before
+        // calling migrate, and observe that the row survives because
+        // schema_version is None on entry.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO routes (file, date_dir, points_blob, updated_at) VALUES (?1, ?2, X'', 0)",
+            params!["SavedClips/x/y-front.mp4", "SavedClips"],
+        )
+        .unwrap();
+        assert_eq!(meta_get(&conn, "schema_version").unwrap(), None);
+        migrate(&conn).unwrap();
+        // Fresh-DB seed path: v5 cleanup skipped, version stamped at 5.
+        assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("5")
+        );
     }
 }
