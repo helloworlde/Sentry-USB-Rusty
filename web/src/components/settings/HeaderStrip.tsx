@@ -1,0 +1,62 @@
+import { Settings as SettingsIcon, Wand2 } from "lucide-react"
+import { formatUptime } from "@/lib/utils"
+import { useVersion } from "@/hooks/useVersion"
+
+interface HeaderStripProps {
+  hostname?: string | null
+  sbc?: string | null
+  uptimeSec?: number | null
+  onOpenWizard: () => void
+}
+
+export function HeaderStrip({
+  hostname,
+  sbc,
+  uptimeSec,
+  onOpenWizard,
+}: HeaderStripProps) {
+  const version = useVersion()
+
+  return (
+    <div className="glass-card settings-strip">
+      <span className="halo-accent inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl">
+        <SettingsIcon className="h-4.5 w-4.5" />
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="t-md font-semibold">Settings</div>
+        <div className="mt-0.5 flex flex-wrap gap-x-3.5 gap-y-1">
+          {sbc && (
+            <span className="t-xs">
+              <span className="text-slate-500">SBC</span>{" "}
+              <span className="text-slate-300">{sbc}</span>
+            </span>
+          )}
+          {hostname && (
+            <span className="t-xs">
+              <span className="text-slate-500">Host</span>{" "}
+              <span className="t-mono text-slate-300">{hostname}</span>
+            </span>
+          )}
+          <span className="t-xs">
+            <span className="text-slate-500">Version</span>{" "}
+            <span className="t-mono text-slate-300">{version ?? "…"}</span>
+          </span>
+          {uptimeSec != null && uptimeSec > 0 && (
+            <span className="t-xs">
+              <span className="text-slate-500">Uptime</span>{" "}
+              <span className="text-slate-300">{formatUptime(uptimeSec)}</span>
+            </span>
+          )}
+        </div>
+      </div>
+      <button
+        onClick={onOpenWizard}
+        className="action-chip"
+        style={{ background: "#161b24", border: "1px solid #1e242f" }}
+      >
+        <Wand2 className="h-3.5 w-3.5" />
+        Setup Wizard
+      </button>
+    </div>
+  )
+}

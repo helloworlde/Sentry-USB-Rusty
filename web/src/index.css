@@ -293,3 +293,118 @@ code, pre, .font-mono {
   50% { width: 65%; opacity: 1; }
   100% { width: 15%; opacity: 0.7; }
 }
+
+/* ────────────────────────────────────────────────────────────────
+   ▌ Redesign utilities — shared primitives for Dashboard/Settings
+   ──────────────────────────────────────────────────────────────── */
+
+/* StatusTile primitive */
+.tile { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.tile-header { display: flex; align-items: center; gap: 10px; }
+.tile-icon { flex: 0 0 auto; width: 32px; height: 32px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; }
+.tile-title { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #7a8294; flex: 1 1 auto; min-width: 0; }
+.tile-action { flex: 0 0 auto; }
+.tile-body { display: flex; flex-direction: column; gap: 6px; }
+.tile-row { display: flex; align-items: center; gap: 8px; min-height: 22px; }
+.tile-row > .lbl { color: #b8bfcf; font-size: 12px; }
+.tile-row > .val { margin-left: auto; font-size: 13px; font-weight: 600; color: #e6e9ef; }
+.tile-row > .sub { font-size: 10px; color: #7a8294; }
+.tile-divider { height: 1px; background: rgba(255,255,255,.04); margin: 2px 0; }
+
+/* Auto-fit tile grid — reflows cleanly when optional tiles hide. */
+.tile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+
+/* Banner stack */
+.banner { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 14px; border: 1px solid; }
+.banner-icon { width: 32px; height: 32px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; }
+.banner-body { flex: 1 1 auto; min-width: 0; }
+.banner-title { font-size: 13px; font-weight: 600; }
+.banner-sub   { font-size: 11px; color: #7a8294; }
+.banner--error { border-color: rgba(248,113,113,.25); background: rgba(248,113,113,.06); }
+.banner--warn  { border-color: rgba(251,191,36,.22); background: rgba(251,191,36,.05); }
+.banner--info  { border-color: rgba(56,189,248,.22); background: rgba(56,189,248,.05); }
+.banner--update{ border-color: oklch(0.82 0.18 150 / 0.28); background: oklch(0.82 0.18 150 / 0.05); }
+
+/* SentryCloud compact bar */
+.cloud-bar { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 14px; }
+
+/* Settings header strip + actions rail */
+.settings-strip { display: flex; align-items: center; gap: 14px; padding: 14px; }
+.actions-rail { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px; border-radius: 12px; border: 1px solid #1e242f; background: #0b0e13; }
+.actions-rail .sep { flex: 1 1 auto; }
+
+/* Mobile actions rail: flex spacer collapses; danger chip keeps a
+   visual separator via border-left so destructive intent survives wrap. */
+@media (max-width: 520px) {
+  .actions-rail .sep { display: none; }
+  .actions-rail .action-chip--danger { margin-left: 4px; padding-left: 12px; border-left: 1px solid #1e242f; border-radius: 9px; }
+}
+
+/* Tab bar — horizontal-scroll variant for mobile (6 tabs > 375px). */
+.tab-bar--scroll { overflow-x: auto; scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch; position: relative; scrollbar-width: none; }
+.tab-bar--scroll::-webkit-scrollbar { display: none; }
+.tab-bar--scroll .tab-item { flex: 0 0 auto; min-width: 92px; scroll-snap-align: start; }
+.tab-bar-wrap { position: relative; }
+.tab-bar-wrap::after {
+  content: ""; position: absolute; top: 1px; right: 1px; bottom: 1px; width: 28px;
+  pointer-events: none; border-radius: 0 11px 11px 0;
+  background: linear-gradient(to right, rgba(11,14,19,0), rgba(11,14,19,0.92));
+}
+
+/* Action chip — used in actions rail and elsewhere */
+.action-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 9px; font-size: 12px; font-weight: 500; color: #b8bfcf; background: transparent; border: 0; cursor: pointer; transition: background .15s, color .15s; }
+.action-chip:hover { background: #161b24; color: #e6e9ef; }
+.action-chip:disabled { opacity: 0.5; cursor: not-allowed; }
+.action-chip--danger { color: #fca5a5; }
+.action-chip--danger:hover { background: rgba(248,113,113,.10); color: #fca5a5; }
+.action-chip--accent { color: oklch(0.82 0.18 150); background: oklch(0.82 0.18 150 / 0.15); }
+.action-chip--accent:hover { background: oklch(0.82 0.18 150 / 0.25); color: oklch(0.82 0.18 150); }
+.action-chip[aria-pressed="true"] { background: oklch(0.82 0.18 150 / 0.12); color: oklch(0.82 0.18 150); }
+
+/* Modal primitive — replaces 3 inconsistently-built overlays */
+.modal-shell { position: fixed; inset: 0; background: rgba(0,0,0,.55); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 50; }
+.modal-card { width: 100%; max-width: 560px; max-height: 90vh; display: flex; flex-direction: column; }
+.modal-header { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,.05); }
+.modal-header .modal-title { font-size: 14px; font-weight: 600; color: #e6e9ef; flex: 1 1 auto; }
+.modal-close { width: 28px; height: 28px; border-radius: 8px; border: 0; background: transparent; color: #7a8294; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+.modal-close:hover { background: #161b24; color: #e6e9ef; }
+.modal-body { padding: 16px; overflow: auto; }
+
+/* Severity halo helpers (status-aware icon backgrounds) */
+.halo-accent  { background: oklch(0.82 0.18 150 / 0.15); color: oklch(0.82 0.18 150); }
+.halo-amber   { background: rgba(251,191,36,.15); color: #fbbf24; }
+.halo-red     { background: rgba(248,113,113,.15); color: #f87171; }
+.halo-rose    { background: rgba(251,113,133,.15); color: #fb7185; }
+.halo-blue    { background: rgba(56,189,248,.15); color: #38bdf8; }
+.halo-violet  { background: rgba(196,181,253,.15); color: #c4b5fd; }
+.halo-purple  { background: rgba(192,132,252,.15); color: #c084fc; }
+.halo-slate   { background: rgba(122,130,148,.12); color: #b8bfcf; }
+
+/* Mini segmented progress bar (Storage tile) */
+.seg-bar { height: 8px; border-radius: 999px; background: #161b24; overflow: hidden; display: flex; }
+.seg-bar > div { height: 100%; }
+.seg-bar > div:first-child { border-top-left-radius: 999px; border-bottom-left-radius: 999px; }
+.seg-bar > div:last-child  { border-top-right-radius: 999px; border-bottom-right-radius: 999px; }
+
+/* Generic progress bar */
+.bar { height: 6px; border-radius: 999px; background: #161b24; overflow: hidden; }
+.bar > div { height: 100%; border-radius: 999px; transition: width .4s; }
+
+/* Pill chip */
+.pill { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 600; letter-spacing: .04em; }
+.pill--accent { background: oklch(0.82 0.18 150 / 0.15); color: oklch(0.82 0.18 150); }
+.pill--amber  { background: rgba(251,191,36,.15); color: #fbbf24; }
+.pill--rose   { background: rgba(251,113,133,.15); color: #fb7185; }
+.pill--sky    { background: rgba(56,189,248,.15); color: #38bdf8; }
+.pill--slate  { background: rgba(122,130,148,.15); color: #b8bfcf; }
+
+/* Small text helpers */
+.t-xs   { font-size: 11px; color: #7a8294; }
+.t-sm   { font-size: 12px; color: #b8bfcf; }
+.t-md   { font-size: 13px; color: #e6e9ef; }
+.t-mono { font-family: "JetBrains Mono", ui-monospace, monospace; }
+.t-num  { font-variant-numeric: tabular-nums; }
+
+/* Live indicator dot */
+@keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:.35} }
+.dot-live { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse-dot 1.4s ease-in-out infinite; }
