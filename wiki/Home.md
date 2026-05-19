@@ -19,9 +19,9 @@ Then open `http://sentryusb.local` and the [Setup Wizard](Setup-Wizard-Guide) ta
 
 | Tier | Boards | Notes |
 |------|--------|-------|
-| **Recommended** | Raspberry Pi 4B, Raspberry Pi 5 | USB 3.0 — fastest copies, best web UI responsiveness |
+| **Recommended** | Raspberry Pi 4B, Raspberry Pi 5 | USB 2.0 OTG — fastest archiving, best web UI responsiveness |
 | **Tested** | Raspberry Pi Zero 2 W, Raspberry Pi 3 (A+/B/B+) | USB 2.0 OTG — works fine, slower archive speeds |
-| **Community** | Radxa Rock Pi 4C+, Radxa Zero 3W | Reported working by users, not officially supported |
+| **Community** | Radxa Rock Pi 4C+, Radxa Zero 3W | USB 3.0 OTG Reported working by users, not officially supported |
 
 Plus:
 - MicroSD card, **256 GB or larger** recommended
