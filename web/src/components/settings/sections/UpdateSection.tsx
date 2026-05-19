@@ -300,7 +300,8 @@ export function UpdateSection({ onInstallStart }: Props) {
         title="Software Updates"
         badge={
           stableUpdate ? (
-            <Pill kind="accent">v{stableUpdate.version}</Pill>
+            // API version strings already carry the "v" prefix (e.g. "v2.7.3").
+            <Pill kind="accent">{stableUpdate.version}</Pill>
           ) : (
             <Pill kind="slate">{version ?? "…"}</Pill>
           )
