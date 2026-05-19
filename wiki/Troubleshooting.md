@@ -1,131 +1,43 @@
 # Troubleshooting
 
-Common issues and how to resolve them.
+Most install problems fall into a few buckets. If your issue isn't here, ping **[Discord](https://discord.gg/9QZEzVwdnt)** — answers come fast and we'll add common ones to this page over time.
 
----
+## Can't reach http://sentryusb.local
 
-## Pi Won't Connect to WiFi
+The Pi is up but its hostname isn't resolving on your network.
 
-- **Double-check SSID and password** — case-sensitive, watch for special characters
-- **Connect a monitor + keyboard** to debug directly
-- **Pi Zero**: Creates a USB gadget network interface — plug into your computer and try `ssh pi@169.254.x.x`
-- **Hidden SSID** (Bookworm+): Use `sudo nmcli device wifi connect "SSID" password "PASS" hidden yes` via SSH
-- **Hidden SSID** (legacy): Edit `/boot/wpa_supplicant.conf` and uncomment `scan_ssid=1` in the `network={...}` block
+**Try:**
+1. Open your router's admin page and confirm the Pi shows up as `sentryusb`. Use the IP directly in your browser instead (e.g., `http://192.168.1.47`).
+2. On Windows, install **[Bonjour Print Services](https://support.apple.com/kb/DL999)** — Windows doesn't ship with mDNS by default.
+3. Some corporate / mesh / guest WiFi networks block mDNS broadcasts. Try a different network or use the IP.
 
-## Tesla Doesn't See the USB Drive
+## Tesla dashcam icon never appears
 
-- Use a **data** cable, not a charge-only cable
-- **Pi Zero**: Make sure you're plugged into the **USB** port, not the **PWR** port
-- **Pi 4/5**: The USB-C port is used for both power and data — only plug into the Tesla after setup is complete
-- Wait 2–3 minutes. Check Dashboard → "USB Drives" should show "Connected"
+The car isn't seeing the Pi as a USB drive.
 
-## Web UI Won't Load
+**Try:**
+1. **Check the cable** — make sure it's a **USB data cable**, not charge-only. The cheap ones bundled with most USB chargers are charge-only.
+2. Plug the Pi into a different USB port on the Tesla. Newer cars: glovebox port. Older cars: front console ports.
+3. Power-cycle the Pi (unplug, wait 5 seconds, plug back in).
+4. SSH into the Pi and check the USB gadget service: `systemctl status sentryusb-gadget`.
 
-1. Try the IP address directly: check your router's DHCP list for the Pi's IP
-2. SSH in and check the service:
+## CIFS/SMB connection fails
+
+**Try:**
+1. Re-run the [Setup Wizard](Setup-Wizard-Guide) → Archive step → fill in **CIFS Version** as `2.0` or `1.0` (some older NAS devices reject SMB3 negotiation).
+2. Check your password — special characters sometimes need escaping; try a simpler password as a test.
+3. From the Pi, try mounting manually:
    ```bash
-   ssh pi@sentryusb.local
-   sudo systemctl status sentryusb
-   sudo journalctl -u sentryusb -f
+   sudo mount -t cifs //<server>/<share> /mnt -o username=<user>
    ```
-3. If the service isn't running, try restarting it:
-   ```bash
-   sudo systemctl restart sentryusb
-   ```
+   If that errors, the error message tells you exactly what's wrong.
 
-## Setup Fails or Gets Stuck
+## "Reinstall required" banner in Settings
 
-- Check **Logs** → "Setup Log" in the web UI
-- Common causes:
-  - Wrong WiFi password
-  - Archive server unreachable
-  - SD card too small (64 GB minimum, 128 GB+ recommended)
-- **The Pi rebooting multiple times during setup is normal** (3–5 reboots, 10–20 minutes total)
-- You can safely re-run the wizard — it's idempotent
-- Try `sudo -i` then `/etc/rc.local` to manually restart the setup process
+Your Pi is running the old Go version of Sentry USB and the auto-updater has been disabled because it can't safely upgrade in place. See [Rusty Migration](Rusty-Migration) for the re-image steps. `sentryusb.conf` survives.
 
-### LED Flash Stages During Setup
+## Still stuck?
 
-| Flashes | Stage |
-|---------|-------|
-| 2 | Verifying configuration |
-| 3 | Downloading setup scripts |
-| 4 | Creating drive partitions |
-| 5 | Setup complete, rebooting |
-
-## WiFi or Access Point Stops Working After Setup
-
-If WiFi or the AP breaks after a reboot (common symptom: `brcmf_cfg80211_stop_ap` or `dnsmasq: Read-only file system` in logs), the read-only root networking fix can be applied without re-running the full setup:
-
-```bash
-ssh pi@sentryusb.local
-sudo -i
-/root/bin/setup-sentryusb fix_networking
-reboot
-```
-
-This updates fstab and networking paths so WiFi and Ethernet work even when the mutable partition is slow to mount. Safe to run multiple times.
-
-## Archive Not Working
-
-1. **Check connectivity**: Can the Pi reach your archive server?
-   ```bash
-   ping -c 3 your-server
-   ```
-2. **Check credentials**: Re-run the Setup Wizard and verify the archive settings
-3. **Check logs**: Go to **Logs** → "Archive Loop" in the web UI
-4. **rsync**: Make sure SSH keys are set up (`ssh-copy-id` — see [Archive Methods](ArchiveMethods))
-5. **rclone**: Make sure `rclone config` was run and the remote name matches what's in the wizard
-
-## Read-Only Filesystem Errors
-
-If you get "read-only filesystem" errors when trying to edit files via SSH:
-
-```bash
-sudo -i
-/root/bin/remountfs_rw
-```
-
-This temporarily remounts the root filesystem as read-write. It will return to read-only after a reboot.
-
-## System Clock Is Wrong
-
-If the date is far off, SSL/TLS authentication will fail, preventing downloads and updates:
-
-```bash
-date -s "20 Feb 2026 15:04:05"
-```
-
-Or wait for NTP to sync after WiFi connects.
-
-## Diagnostics
-
-### From the Web UI
-Go to **Settings** and use the diagnostics download feature to get a full system report.
-
-### From SSH
-```bash
-sudo /root/bin/setup-sentryusb diagnose
-```
-
-This collects system info, logs, and configuration (with sensitive values masked) into a diagnostics bundle.
-
-### Useful Commands
-
-| Command | What It Does |
-|---------|-------------|
-| `sudo systemctl status sentryusb` | Check if the SentryUSB service is running |
-| `sudo journalctl -u sentryusb -f` | Live-tail the SentryUSB server logs |
-| `tail -f /sentryusb/sentryusb-setup.log` | Watch setup logs in real time |
-| `df -h` | Check disk space |
-| `lsblk` | List block devices and partitions |
-| `vcgencmd measure_temp` | Check CPU temperature |
-
----
-
-## Still Stuck?
-
-- Check the [FAQ](FAQ) for common questions
-- Search [existing issues](https://github.com/Sentry-Six/Sentry-USB-Rusty/issues) on GitHub
-- Ask on [Discord](https://discord.gg/9QZEzVwdnt)
-- File a [bug report](https://github.com/Sentry-Six/Sentry-USB-Rusty/issues/new?template=bug_report.yml) if you've found a bug
+- **[Discord](https://discord.gg/9QZEzVwdnt)** — fastest help, real humans
+- **[Open an issue](https://github.com/Sentry-Six/Sentry-USB-Rusty/issues)** — for reproducible bugs
+- Include: Pi model, what step you're stuck on, exact error message, and the output of `journalctl -u sentryusb -n 100` if relevant.
