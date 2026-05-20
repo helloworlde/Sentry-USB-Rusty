@@ -1880,6 +1880,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "chrono",
+ "crc32fast",
  "futures-util",
  "hex",
  "libc",

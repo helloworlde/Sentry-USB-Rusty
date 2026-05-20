@@ -1,13 +1,18 @@
 //! File operations API: list, mkdir, mv, cp, delete, upload, download, zip.
 
-use std::io::Write;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::body::Body;
+use axum::extract::{Form, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::ReaderStream;
 use tracing::info;
 
 use crate::router::AppState;
@@ -373,22 +378,28 @@ pub async fn download_file(State(_s): State<AppState>, Query(params): Query<Dele
         return (StatusCode::FORBIDDEN, "Access denied").into_response();
     }
 
-    match tokio::fs::read(&clean).await {
-        Ok(data) => {
-            let filename = clean.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("download");
-            (
-                StatusCode::OK,
-                [
-                    (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename)),
-                    (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
-                ],
-                data,
-            ).into_response()
-        }
-        Err(_) => (StatusCode::NOT_FOUND, "File not found").into_response(),
+    let file = match tokio::fs::File::open(&clean).await {
+        Ok(f) => f,
+        Err(_) => return (StatusCode::NOT_FOUND, "File not found").into_response(),
+    };
+    // Opening a directory succeeds on Unix but streaming it errors mid-body;
+    // reject up front so the status matches the previous buffered behavior.
+    match file.metadata().await {
+        Ok(m) if !m.is_dir() => {}
+        _ => return (StatusCode::NOT_FOUND, "File not found").into_response(),
     }
+
+    let filename = clean.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download");
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename)),
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+        ],
+        Body::from_stream(ReaderStream::new(file)),
+    ).into_response()
 }
 
 /// GET /api/files/download-zip
@@ -404,30 +415,28 @@ pub async fn download_zip(State(_s): State<AppState>, Query(params): Query<Delet
 
     let dirname = clean.file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("download");
+        .unwrap_or("download")
+        .to_string();
 
-    let mut buf = Vec::new();
-    {
-        let mut zip_writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        add_dir_to_zip(&mut zip_writer, &clean, &clean, options);
-        let _ = zip_writer.finish();
-    }
-
-    (
-        StatusCode::OK,
-        [
-            (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
-            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}.zip\"", dirname)),
-        ],
-        buf,
-    ).into_response()
+    let root = clean.clone();
+    spawn_zip_stream(
+        format!("attachment; filename=\"{}.zip\"", dirname),
+        move |z, central| walk_dir(z, central, &root, &root),
+    )
 }
 
 /// POST /api/files/download-zip-multi
-pub async fn download_zip_multi(State(_s): State<AppState>, Json(req): Json<MultiZipRequest>) -> impl IntoResponse {
+pub async fn download_zip_multi(State(_s): State<AppState>, Form(req): Form<MultiZipRequest>) -> impl IntoResponse {
+    let paths: Vec<String> = match serde_json::from_str(&req.paths) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Missing or invalid paths").into_response(),
+    };
+    if paths.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Missing or invalid paths").into_response();
+    }
+
     let mut clean_paths = Vec::new();
-    for p in &req.paths {
+    for p in &paths {
         let (clean, allowed) = is_path_allowed(p);
         if !allowed {
             return (StatusCode::FORBIDDEN, format!("Access denied: {}", p)).into_response();
@@ -438,60 +447,387 @@ pub async fn download_zip_multi(State(_s): State<AppState>, Json(req): Json<Mult
         clean_paths.push(clean);
     }
 
-    let mut buf = Vec::new();
-    {
-        let mut zip_writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-
-        for cp in &clean_paths {
-            if cp.is_dir() {
-                let parent = cp.parent().unwrap_or(cp);
-                add_dir_to_zip(&mut zip_writer, cp, parent, options);
-            } else if let Ok(data) = std::fs::read(cp) {
-                let name = cp.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-                if zip_writer.start_file(name, options).is_ok() {
-                    let _ = zip_writer.write_all(&data);
+    spawn_zip_stream(
+        "attachment; filename=\"download.zip\"".to_string(),
+        move |z, central| {
+            for cp in &clean_paths {
+                if cp.is_dir() {
+                    let parent = cp.parent().unwrap_or(cp);
+                    walk_dir(z, central, cp, parent)?;
+                } else {
+                    let name = cp.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                    write_stored_entry(z, central, name, cp)?;
                 }
             }
-        }
-        let _ = zip_writer.finish();
-    }
-
-    (
-        StatusCode::OK,
-        [
-            (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
-            (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"download.zip\"".to_string()),
-        ],
-        buf,
-    ).into_response()
+            Ok(())
+        },
+    )
 }
 
 #[derive(Deserialize)]
 pub struct MultiZipRequest {
-    paths: Vec<String>,
+    /// JSON-encoded array of paths. The frontend submits a native form whose
+    /// single `paths` field holds `JSON.stringify([...])`, so this arrives as a
+    /// string that we then parse — matching the Go handler's
+    /// `json.Unmarshal(r.FormValue("paths"))`.
+    paths: String,
 }
 
-fn add_dir_to_zip<W: Write + std::io::Seek>(
-    zip_writer: &mut zip::ZipWriter<W>,
+// ---- Streaming zip writer ----
+//
+// We emit the ZIP format by hand so the archive streams out with a fixed, tiny
+// memory footprint regardless of file or archive size. Each entry is: a local
+// header with the CRC/size fields zeroed and the "data descriptor" flag set, the
+// file bytes streamed straight through (hashed as they go), then a trailing data
+// descriptor carrying the real CRC-32 and size. Nothing is ever patched in place,
+// so no part of the output is retained — exactly how the Go original streamed.
+//
+// Entries are Stored (no compression): dashcam clips are already-compressed video,
+// so deflating them would burn the Pi's CPU for ~0% gain. Readers take sizes and
+// offsets from the central directory (authoritative), so Stored + data descriptor
+// extracts correctly in macOS Finder, Windows Explorer, unzip and 7-zip.
+//
+// The only thing held in memory is one `CentralEntry` per file, written out as the
+// central directory at the end. That scales with file *count*, not bytes (a few MB
+// for tens of thousands of clips) and is unavoidable for any zip.
+//
+// ZIP64 is emitted once an entry's offset or size crosses 4 GiB, or the entry count
+// exceeds 65535 — which a full-day (~100 GB) archive will hit.
+
+const ZIP_CHUNK: usize = 64 * 1024;
+const ZIP_CHANNEL_DEPTH: usize = 8;
+
+const SIG_LOCAL: u32 = 0x0403_4b50;
+const SIG_DATA_DESC: u32 = 0x0807_4b50;
+const SIG_CENTRAL: u32 = 0x0201_4b50;
+const SIG_EOCD: u32 = 0x0605_4b50;
+const SIG_ZIP64_EOCD: u32 = 0x0606_4b50;
+const SIG_ZIP64_LOCATOR: u32 = 0x0706_4b50;
+/// General-purpose flags: bit 3 (data descriptor follows) + bit 11 (UTF-8 name).
+const GP_FLAGS: u16 = 0x0808;
+const U32_MAX: u64 = 0xFFFF_FFFF;
+
+/// Thresholds at which a field overflows its 32-/16-bit slot and forces ZIP64.
+/// Real limits in production; tests shrink them to exercise the ZIP64 path without
+/// generating multi-GB input.
+#[derive(Clone, Copy)]
+struct Zip64Thresholds {
+    bytes: u64,
+    entries: usize,
+}
+
+impl Default for Zip64Thresholds {
+    fn default() -> Self {
+        Zip64Thresholds { bytes: U32_MAX, entries: 0xFFFF }
+    }
+}
+
+/// Sequential, non-seekable sink: ships bytes to the response via an mpsc channel
+/// and tracks the absolute offset (needed for central-directory records).
+struct ZipStream {
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    offset: u64,
+    limits: Zip64Thresholds,
+}
+
+impl ZipStream {
+    /// Send a block to the client. `Err` (broken pipe) means the client went away.
+    fn send(&mut self, data: Vec<u8>) -> std::io::Result<()> {
+        let len = data.len() as u64;
+        self.tx.blocking_send(data).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected")
+        })?;
+        self.offset += len;
+        Ok(())
+    }
+}
+
+/// Per-entry metadata retained to build the central directory at the end.
+struct CentralEntry {
+    name: Vec<u8>,
+    crc: u32,
+    size: u64,
+    offset: u64,
+    dos_date: u16,
+    dos_time: u16,
+    zip64_size: bool,
+}
+
+fn le_u16(v: &mut Vec<u8>, n: u16) {
+    v.extend_from_slice(&n.to_le_bytes());
+}
+fn le_u32(v: &mut Vec<u8>, n: u32) {
+    v.extend_from_slice(&n.to_le_bytes());
+}
+fn le_u64(v: &mut Vec<u8>, n: u64) {
+    v.extend_from_slice(&n.to_le_bytes());
+}
+
+/// Convert a file mtime to a DOS date/time pair (the FAT epoch is 1980).
+fn dos_datetime(t: SystemTime) -> (u16, u16) {
+    let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    match chrono::DateTime::from_timestamp(secs as i64, 0) {
+        Some(dt) => {
+            use chrono::{Datelike, Timelike};
+            if dt.year() < 1980 {
+                return (0x0021, 0); // 1980-01-01 00:00:00
+            }
+            let date = (((dt.year() - 1980) as u16) << 9)
+                | ((dt.month() as u16) << 5)
+                | (dt.day() as u16);
+            let time = ((dt.hour() as u16) << 11)
+                | ((dt.minute() as u16) << 5)
+                | ((dt.second() as u16) / 2);
+            (date, time)
+        }
+        None => (0x0021, 0),
+    }
+}
+
+/// Stream one file into the archive: local header, the bytes (hashed as they go),
+/// then a data descriptor; records central-directory metadata. Unreadable files
+/// are skipped (best-effort, like the Go original). `Err` means the client left.
+fn write_stored_entry(
+    z: &mut ZipStream,
+    central: &mut Vec<CentralEntry>,
+    name: &str,
+    path: &Path,
+) -> std::io::Result<()> {
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Ok(()),
+    };
+    let meta = f.metadata().ok();
+    let (dos_date, dos_time) = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .map(dos_datetime)
+        .unwrap_or((0x0021, 0));
+    let stat_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    // Decide ZIP64-ness up front (size is known) so the local header and the data
+    // descriptor agree regardless of what is actually read.
+    let zip64 = stat_size >= z.limits.bytes;
+    let name_bytes = name.as_bytes();
+    let offset = z.offset;
+
+    let mut h = Vec::with_capacity(30 + name_bytes.len() + 20);
+    le_u32(&mut h, SIG_LOCAL);
+    le_u16(&mut h, if zip64 { 45 } else { 20 }); // version needed
+    le_u16(&mut h, GP_FLAGS);
+    le_u16(&mut h, 0); // method: stored
+    le_u16(&mut h, dos_time);
+    le_u16(&mut h, dos_date);
+    le_u32(&mut h, 0); // crc-32 (in data descriptor)
+    let size_field = if zip64 { U32_MAX as u32 } else { 0 };
+    le_u32(&mut h, size_field); // compressed size (in descriptor / zip64 extra)
+    le_u32(&mut h, size_field); // uncompressed size
+    le_u16(&mut h, name_bytes.len() as u16);
+    let extra = if zip64 {
+        let mut e = Vec::new();
+        le_u16(&mut e, 0x0001); // ZIP64 extended information tag
+        le_u16(&mut e, 16); // body size: two u64s
+        le_u64(&mut e, stat_size); // uncompressed
+        le_u64(&mut e, stat_size); // compressed
+        e
+    } else {
+        Vec::new()
+    };
+    le_u16(&mut h, extra.len() as u16);
+    h.extend_from_slice(name_bytes);
+    h.extend_from_slice(&extra);
+    z.send(h)?;
+
+    let mut hasher = crc32fast::Hasher::new();
+    let mut size: u64 = 0;
+    let mut buf = vec![0u8; ZIP_CHUNK];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+        z.send(buf[..n].to_vec())?;
+    }
+    let crc = hasher.finalize();
+
+    let mut d = Vec::with_capacity(24);
+    le_u32(&mut d, SIG_DATA_DESC);
+    le_u32(&mut d, crc);
+    if zip64 {
+        le_u64(&mut d, size); // compressed
+        le_u64(&mut d, size); // uncompressed
+    } else {
+        le_u32(&mut d, size as u32);
+        le_u32(&mut d, size as u32);
+    }
+    z.send(d)?;
+
+    central.push(CentralEntry {
+        name: name_bytes.to_vec(),
+        crc,
+        size,
+        offset,
+        dos_date,
+        dos_time,
+        zip64_size: zip64,
+    });
+    Ok(())
+}
+
+/// Recursively add every regular file under `dir` to the archive, naming entries
+/// relative to `base`.
+fn walk_dir(
+    z: &mut ZipStream,
+    central: &mut Vec<CentralEntry>,
     dir: &Path,
     base: &Path,
-    options: zip::write::SimpleFileOptions,
-) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                add_dir_to_zip(zip_writer, &path, base, options);
-            } else if let Ok(data) = std::fs::read(&path) {
-                let rel = path.strip_prefix(base).unwrap_or(&path);
-                let name = rel.to_str().unwrap_or("");
-                if !name.is_empty() && zip_writer.start_file(name, options).is_ok() {
-                    let _ = zip_writer.write_all(&data);
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_dir(z, central, &path, base)?;
+        } else {
+            let rel = path.strip_prefix(base).unwrap_or(&path);
+            if let Some(name) = rel.to_str() {
+                if !name.is_empty() {
+                    write_stored_entry(z, central, name, &path)?;
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// Write the central directory and end-of-central-directory records (with ZIP64
+/// structures when offsets/sizes/counts overflow their 32-/16-bit fields).
+fn write_central_directory(z: &mut ZipStream, central: &[CentralEntry]) -> std::io::Result<()> {
+    let central_start = z.offset;
+    for e in central {
+        let offset_zip64 = e.offset >= z.limits.bytes;
+        let size_zip64 = e.zip64_size;
+
+        let mut extra = Vec::new();
+        if size_zip64 || offset_zip64 {
+            let mut body = Vec::new();
+            if size_zip64 {
+                le_u64(&mut body, e.size); // uncompressed
+                le_u64(&mut body, e.size); // compressed
+            }
+            if offset_zip64 {
+                le_u64(&mut body, e.offset);
+            }
+            le_u16(&mut extra, 0x0001);
+            le_u16(&mut extra, body.len() as u16);
+            extra.extend_from_slice(&body);
+        }
+        let version: u16 = if extra.is_empty() { 20 } else { 45 };
+
+        let mut h = Vec::with_capacity(46 + e.name.len() + extra.len());
+        le_u32(&mut h, SIG_CENTRAL);
+        le_u16(&mut h, (3 << 8) | version); // version made by (UNIX)
+        le_u16(&mut h, version); // version needed
+        le_u16(&mut h, GP_FLAGS);
+        le_u16(&mut h, 0); // method: stored
+        le_u16(&mut h, e.dos_time);
+        le_u16(&mut h, e.dos_date);
+        le_u32(&mut h, e.crc);
+        let size_field = if size_zip64 { U32_MAX as u32 } else { e.size as u32 };
+        le_u32(&mut h, size_field); // compressed
+        le_u32(&mut h, size_field); // uncompressed
+        le_u16(&mut h, e.name.len() as u16);
+        le_u16(&mut h, extra.len() as u16);
+        le_u16(&mut h, 0); // file comment length
+        le_u16(&mut h, 0); // disk number start
+        le_u16(&mut h, 0); // internal attributes
+        // External attributes carry the Unix mode in the high 16 bits (host = UNIX
+        // in "version made by"); 0o100644 = regular file, rw-r--r-- so extracted
+        // files are readable. Leaving this 0 makes unzip apply mode 0000.
+        le_u32(&mut h, 0o100644 << 16); // external attributes
+        le_u32(&mut h, if offset_zip64 { U32_MAX as u32 } else { e.offset as u32 });
+        h.extend_from_slice(&e.name);
+        h.extend_from_slice(&extra);
+        z.send(h)?;
+    }
+
+    let central_size = z.offset - central_start;
+    let count = central.len();
+    let need_zip64 = central_start >= z.limits.bytes
+        || central_size >= z.limits.bytes
+        || count >= z.limits.entries;
+
+    if need_zip64 {
+        let zip64_eocd_at = z.offset;
+        let mut r = Vec::with_capacity(56);
+        le_u32(&mut r, SIG_ZIP64_EOCD);
+        le_u64(&mut r, 44); // size of the record that follows this field
+        le_u16(&mut r, (3 << 8) | 45); // version made by
+        le_u16(&mut r, 45); // version needed
+        le_u32(&mut r, 0); // number of this disk
+        le_u32(&mut r, 0); // disk with central directory
+        le_u64(&mut r, count as u64); // entries on this disk
+        le_u64(&mut r, count as u64); // total entries
+        le_u64(&mut r, central_size);
+        le_u64(&mut r, central_start);
+        z.send(r)?;
+
+        let mut loc = Vec::with_capacity(20);
+        le_u32(&mut loc, SIG_ZIP64_LOCATOR);
+        le_u32(&mut loc, 0); // disk with the ZIP64 EOCD
+        le_u64(&mut loc, zip64_eocd_at);
+        le_u32(&mut loc, 1); // total number of disks
+        z.send(loc)?;
+    }
+
+    // The end-of-central-directory record carries real values where they fit and
+    // the 0xFFFF/0xFFFFFFFF sentinels (which point readers at the ZIP64 EOCD) only
+    // on genuine 32-/16-bit overflow.
+    let mut eocd = Vec::with_capacity(22);
+    le_u32(&mut eocd, SIG_EOCD);
+    le_u16(&mut eocd, 0); // number of this disk
+    le_u16(&mut eocd, 0); // disk with central directory
+    let count16 = if count >= 0xFFFF { 0xFFFF } else { count as u16 };
+    le_u16(&mut eocd, count16);
+    le_u16(&mut eocd, count16);
+    le_u32(&mut eocd, if central_size >= U32_MAX { U32_MAX as u32 } else { central_size as u32 });
+    le_u32(&mut eocd, if central_start >= U32_MAX { U32_MAX as u32 } else { central_start as u32 });
+    le_u16(&mut eocd, 0); // comment length
+    z.send(eocd)?;
+    Ok(())
+}
+
+/// Spawn a blocking task that streams a zip built by `build` to the response body.
+/// Returns a `200` streaming response with the given Content-Disposition;
+/// validation/status decisions happen in the caller, so the contract is unchanged.
+fn spawn_zip_stream<F>(disposition: String, build: F) -> Response
+where
+    F: FnOnce(&mut ZipStream, &mut Vec<CentralEntry>) -> std::io::Result<()> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(ZIP_CHANNEL_DEPTH);
+    tokio::task::spawn_blocking(move || {
+        let mut z = ZipStream { tx, offset: 0, limits: Zip64Thresholds::default() };
+        let mut central = Vec::new();
+        // If the client disconnects mid-stream, `build` returns Err; skip the
+        // central directory (a partial body is unavoidable once headers are sent).
+        if build(&mut z, &mut central).is_ok() {
+            let _ = write_central_directory(&mut z, &central);
+        }
+    });
+
+    let stream = ReceiverStream::new(rx).map(Ok::<Vec<u8>, std::io::Error>);
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 /// Clean up snapshot symlinks after deleting SavedClips/SentryClips files.
@@ -550,4 +886,96 @@ fn cleanup_snapshot_symlinks(deleted_path: &str) {
     }
 
     info!("[files] Snapshot symlink cleanup complete for {}/{}", clip_type, event_name);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    /// Run the streaming build exactly as the handlers do and collect the bytes.
+    async fn build_archive(root: &Path, limits: Zip64Thresholds) -> Vec<u8> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(ZIP_CHANNEL_DEPTH);
+        let root = root.to_path_buf();
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut z = ZipStream { tx, offset: 0, limits };
+            let mut central = Vec::new();
+            walk_dir(&mut z, &mut central, &root, &root).unwrap();
+            write_central_directory(&mut z, &central).unwrap();
+        });
+        // Drain concurrently so blocking_send doesn't stall on the channel bound.
+        let mut bytes = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            bytes.extend_from_slice(&chunk);
+        }
+        handle.await.unwrap();
+        bytes
+    }
+
+    /// Nested dirs plus a file larger than one send chunk: confirm the streamed
+    /// bytes form a valid archive whose entries round-trip, stored uncompressed.
+    #[tokio::test]
+    async fn streaming_zip_roundtrips() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let big = vec![7u8; 300 * 1024]; // spans multiple ZIP_CHUNK sends
+        std::fs::write(dir.path().join("sub").join("b.bin"), &big).unwrap();
+
+        let bytes = build_archive(dir.path(), Zip64Thresholds::default()).await;
+
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("valid zip");
+        let mut names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a.txt".to_string(), "sub/b.bin".to_string()]);
+
+        let a = archive.by_name("a.txt").unwrap();
+        assert_eq!(a.compression(), zip::CompressionMethod::Stored);
+        drop(a);
+
+        let mut s = String::new();
+        archive.by_name("a.txt").unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "hello");
+
+        let mut buf = Vec::new();
+        archive.by_name("sub/b.bin").unwrap().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, big);
+    }
+
+    /// Force the ZIP64 code paths with tiny thresholds — exercising per-entry zip64
+    /// extra fields (both size and offset) and the ZIP64 EOCD without building >4 GiB
+    /// of input — then confirm a real reader still extracts every entry.
+    #[tokio::test]
+    async fn streaming_zip64_path_roundtrips() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let big = vec![9u8; 200 * 1024]; // size >= threshold -> size zip64
+        std::fs::write(dir.path().join("b.bin"), &big).unwrap();
+        std::fs::write(dir.path().join("c.txt"), b"tail").unwrap(); // small but late -> offset zip64
+
+        // Anything >= 10 bytes (or past offset 10) goes zip64; >= 2 entries forces
+        // the ZIP64 end-of-central-directory record.
+        let limits = Zip64Thresholds { bytes: 10, entries: 2 };
+        let bytes = build_archive(dir.path(), limits).await;
+
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("valid zip64 archive");
+        assert_eq!(archive.len(), 3);
+
+        let mut got = String::new();
+        archive.by_name("a.txt").unwrap().read_to_string(&mut got).unwrap();
+        assert_eq!(got, "hello");
+
+        let mut b = Vec::new();
+        archive.by_name("b.bin").unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(b, big);
+
+        let mut t = String::new();
+        archive.by_name("c.txt").unwrap().read_to_string(&mut t).unwrap();
+        assert_eq!(t, "tail");
+    }
 }
