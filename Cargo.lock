@@ -1792,6 +1792,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "libc",
  "mime_guess",
  "rust-embed",
  "sentryusb-api",
