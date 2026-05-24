@@ -121,7 +121,7 @@ export default function Drives() {
             <DriveRow
               key={d.id}
               drive={d}
-              routePoints={list.routesById.get(d.id) ?? []}
+              routePoints={list.routesByStartTime.get(d.startTime) ?? []}
               metric={metric}
               selectMode={selectMode}
               selected={selected.has(d.id)}

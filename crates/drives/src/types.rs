@@ -368,12 +368,21 @@ pub struct FsdAnalytics {
 }
 
 /// Overview route for map display (downsampled points).
+///
+/// `start_time` is included so the Drives list page can reliably
+/// associate a route with its DriveSummary entry: the list cache
+/// uses sub-clip-aware grouping (`group_summary_clips`) while this
+/// endpoint uses `group_clips` (full-clip), so the integer `id`
+/// indices CAN drift apart when a clip is split mid-way. Joining on
+/// the formatted start_time string is robust to that drift.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RouteOverview {
     pub id: i32,
     pub points: Vec<GpsPoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    pub start_time: String,
 }
 
 /// Extracted GPS data from a single MP4 file.

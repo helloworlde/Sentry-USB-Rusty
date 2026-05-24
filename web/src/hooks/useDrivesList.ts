@@ -29,7 +29,7 @@ export interface DrivesFilters {
 export interface DrivesListState {
   drives: DriveSummary[]
   visible: DriveSummary[]
-  routesById: Map<number, [number, number][]>
+  routesByStartTime: Map<string, [number, number][]>
   total: number
   page: number
   pageCount: number
@@ -163,9 +163,11 @@ export function useDrivesList(): DrivesListState {
     }
   }, [refreshTick])
 
-  const routesById = useMemo(() => {
-    const m = new Map<number, [number, number][]>()
-    for (const r of routes) m.set(r.id, r.points)
+  const routesByStartTime = useMemo(() => {
+    const m = new Map<string, [number, number][]>()
+    for (const r of routes) {
+      if (r.startTime) m.set(r.startTime, r.points)
+    }
     return m
   }, [routes])
 
@@ -241,7 +243,7 @@ export function useDrivesList(): DrivesListState {
   return {
     drives,
     visible,
-    routesById,
+    routesByStartTime,
     total,
     page: safePage,
     pageCount,

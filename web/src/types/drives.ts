@@ -68,4 +68,10 @@ export interface RouteOverview {
   id: number
   points: [number, number][]
   source?: string
+  // ISO start_time of the drive, used to join with DriveSummary entries.
+  // The integer `id` is NOT a reliable join key because /api/drives uses
+  // sub-clip-aware grouping while /api/drives/routes uses full-clip
+  // grouping; the enumerations can drift apart on drives split by
+  // mid-clip park gaps.
+  startTime: string
 }

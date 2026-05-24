@@ -1422,10 +1422,21 @@ fn group_routes_overview(routes: &[Route], max_points_per_drive: usize) -> Vec<R
         }
 
         let source = clips.first().and_then(|c| c.route.source.clone());
+        // Format matches build_summary_from_aggregates (grouper.rs ~2588) so
+        // the frontend can join /api/drives/routes entries against the cached
+        // /api/drives DriveSummary list by start_time. The integer `id` is
+        // kept for backwards compatibility but the two enumeration paths
+        // (group_clips here vs. group_summary_clips for the list cache) can
+        // produce different indices when sub-clip splitting occurs.
+        let start_time = clips
+            .first()
+            .map(|c| c.timestamp.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .unwrap_or_default();
         result.push(RouteOverview {
             id: idx as i32,
             points: downsample(&pts, max_points_per_drive),
             source,
+            start_time,
         });
     }
 
