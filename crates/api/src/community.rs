@@ -2,12 +2,16 @@
 //!
 //! Mirrors `server/api/community_wraps.go`:
 //! - Validates wrap/chime codes against `^[A-Za-z0-9]{3,10}$` before proxying.
-//! - Forwards `X-Passcode` (admin fingerprint access) on every route that
-//!   accepts it — library, upload, download, admin, plus the chime variants.
-//! - Injects `X-Fingerprint` on upload/download so the backend can rate-limit
-//!   and tie uploads to a device.
+//! - Forwards `X-Passcode` (admin access) on every route that accepts it —
+//!   library, upload, download, admin, plus the chime variants.
 //! - Returns binary PNG for thumbnail/preview with `Cache-Control: max-age=3600`.
 //! - Preserves upstream status codes rather than collapsing to 200.
+//!
+//! Privacy: this module used to inject `X-Fingerprint` on upload/download so
+//! the backend could per-device rate-limit and maintain a block list. That
+//! header was removed entirely — the backend now rate-limits by IP and abuse
+//! is handled through the Discord moderation queue. The fingerprint helper
+//! in `update.rs` is no longer called from here.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -30,19 +34,14 @@ fn valid_code(code: &str) -> bool {
         .is_match(code)
 }
 
-fn forward_headers(src: &HeaderMap, inject_fingerprint: bool) -> reqwest::header::HeaderMap {
+/// Forward request headers we want the backend to see. Currently only
+/// `X-Passcode` (admin auth). `X-Fingerprint` was deliberately removed
+/// — see module docstring.
+fn forward_headers(src: &HeaderMap) -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
     if let Some(v) = src.get("x-passcode") {
         if let Ok(val) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
             h.insert("x-passcode", val);
-        }
-    }
-    if inject_fingerprint {
-        let fp = crate::update::get_fingerprint();
-        if !fp.is_empty() {
-            if let Ok(val) = reqwest::header::HeaderValue::from_str(fp) {
-                h.insert("x-fingerprint", val);
-            }
         }
     }
     h
@@ -107,7 +106,7 @@ async fn proxy_library(
     };
     let resp = match client
         .get(&url)
-        .headers(forward_headers(&headers, false))
+        .headers(forward_headers(&headers))
         .query(params)
         .send()
         .await
@@ -240,7 +239,7 @@ pub async fn lock_chime_upload(
             req = req.header("Content-Type", v);
         }
     }
-    req = req.headers(forward_headers(&headers, true));
+    req = req.headers(forward_headers(&headers));
     let resp = match req.body(body.to_vec()).send().await {
         Ok(r) => r,
         Err(e) => return bad_gateway(&format!("Community service unreachable: {}", e)),
@@ -283,7 +282,7 @@ pub async fn lock_chime_download(
     };
     let resp = match client
         .get(&url)
-        .headers(forward_headers(&headers, true))
+        .headers(forward_headers(&headers))
         .send()
         .await
     {
@@ -410,7 +409,7 @@ pub async fn lock_chime_admin_validate(
         reqwest::Method::POST,
         "/lockchime/admin/validate",
         None,
-        forward_headers(&headers, false),
+        forward_headers(&headers),
         Duration::from_secs(15),
     )
     .await
@@ -436,7 +435,7 @@ pub async fn lock_chime_admin_edit(
         reqwest::Method::PUT,
         &format!("/lockchime/admin/edit/{}", code),
         Some(body.to_vec()),
-        forward_headers(&headers, false),
+        forward_headers(&headers),
         Duration::from_secs(15),
     )
     .await
@@ -461,7 +460,7 @@ pub async fn lock_chime_admin_delete(
         reqwest::Method::DELETE,
         &format!("/lockchime/admin/delete/{}", code),
         None,
-        forward_headers(&headers, false),
+        forward_headers(&headers),
         Duration::from_secs(15),
     )
     .await
@@ -523,7 +522,7 @@ pub async fn wraps_upload(
             req = req.header("Content-Type", v);
         }
     }
-    req = req.headers(forward_headers(&headers, true));
+    req = req.headers(forward_headers(&headers));
     let resp = match req.body(body.to_vec()).send().await {
         Ok(r) => r,
         Err(e) => return bad_gateway(&format!("Community service unreachable: {}", e)),
@@ -567,7 +566,7 @@ pub async fn wraps_download(
     };
     let resp = match client
         .get(&url)
-        .headers(forward_headers(&headers, true))
+        .headers(forward_headers(&headers))
         .send()
         .await
     {
@@ -664,7 +663,7 @@ pub async fn wraps_admin_validate(
         reqwest::Method::POST,
         "/wraps/admin/validate",
         None,
-        forward_headers(&headers, false),
+        forward_headers(&headers),
         Duration::from_secs(15),
     )
     .await
@@ -690,7 +689,7 @@ pub async fn wraps_admin_edit(
         reqwest::Method::PUT,
         &format!("/wraps/admin/edit/{}", code),
         Some(body.to_vec()),
-        forward_headers(&headers, false),
+        forward_headers(&headers),
         Duration::from_secs(15),
     )
     .await
@@ -715,7 +714,7 @@ pub async fn wraps_admin_delete(
         reqwest::Method::DELETE,
         &format!("/wraps/admin/delete/{}", code),
         None,
-        forward_headers(&headers, false),
+        forward_headers(&headers),
         Duration::from_secs(15),
     )
     .await

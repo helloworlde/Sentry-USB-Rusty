@@ -4,6 +4,25 @@ Raspberry Pi USB gadget that exposes a Tesla dashcam drive with a modern web UI
 for review, archive, and lock-chime customization. Rust rewrite of the original
 Go version, feature-parity and drop-in compatible with existing SD-card layouts.
 
+## Privacy
+
+By default, SentryUSB does **not** transmit any device identifier to our
+servers. Everything it sends out, listed in one place:
+
+| When | What | Identifier? |
+|---|---|---|
+| Daily update check | Software version, CPU arch, board model | None by default |
+| Once per install | Empty ping (no body) | None — anonymous counter |
+| Wraps / lock chime submissions | The file + your IP for rate-limiting | None (no device fingerprint) |
+| Sentry Cloud (if signed in) | Your account login + synced files | Account credentials |
+| iOS push pairing (if enabled) | Random pairing ID | Not tied to hardware |
+
+The only way a device fingerprint is sent is if you explicitly opt in to
+**Settings → Privacy → Analytics opt-in** (default: off). That's the GDPR
+Art. 21 right-to-object mechanism — it's a toggle, not an email, and the
+default is the opted-out state. Full details in
+[`wiki/Privacy.md`](wiki/Privacy.md).
+
 ## Install (fresh Pi)
 
 ```

@@ -691,27 +691,49 @@ fn find_latest_releases(releases: &[ReleaseInfo]) -> (Option<&ReleaseInfo>, Opti
     (stable, prerelease)
 }
 
-/// POST {fingerprint, current_version, update_available, new_version, arch, model}
-/// to the telemetry endpoint. Best-effort — errors are logged, never surfaced.
+/// Marker file. Once it exists, the install beacon has fired for this
+/// install and won't fire again. Lives under `/mutable/` so it survives
+/// SentryUSB updates but resets on a full SD-card reflash (which is
+/// indistinguishable from a fresh install anyway).
+const INSTALL_BEACON_MARKER: &str = "/mutable/.beaconed";
+
+/// POST update-check telemetry to the support server. The payload always
+/// carries `{current_version, update_available, new_version, arch, model}`.
+/// A device fingerprint is included **only** if the user has explicitly
+/// opted in via the `analytics_opt_in` preference (set by the setup wizard
+/// or Settings → Privacy). This is the GDPR Art. 6(1)(a) consent gate —
+/// without an opt-in, the backend treats the call as an opted-out heartbeat
+/// (no DB row, IP-rate-limited).
+///
+/// Best-effort — errors are logged, never surfaced to the caller.
 pub async fn send_telemetry(current: &str, update_available: bool, new_version: &str) {
-    let fp = get_fingerprint();
-    if fp.is_empty() {
-        return;
-    }
+    let opt_in = crate::preferences::load_prefs()
+        .get("analytics_opt_in")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let arch = sentryusb_shell::run("uname", &["-m"])
         .await
         .ok()
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| std::env::consts::ARCH.to_string());
-    let payload = serde_json::json!({
-        "fingerprint": fp,
+
+    let mut payload = serde_json::json!({
         "current_version": current,
         "update_available": update_available,
         "new_version": new_version,
         "arch": arch,
         "model": get_sbc_model(),
     });
-    let url = format!("https://api.sentry-six.com/sentryusb/telemetry");
+
+    if opt_in {
+        let fp = get_fingerprint();
+        if !fp.is_empty() {
+            payload["fingerprint"] = serde_json::Value::String(fp.to_string());
+        }
+    }
+
+    let url = "https://api.sentry-six.com/sentryusb/telemetry";
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -719,92 +741,65 @@ pub async fn send_telemetry(current: &str, update_available: bool, new_version: 
         Ok(c) => c,
         Err(_) => return,
     };
-    match client.post(&url).json(&payload).send().await {
-        Ok(r) => tracing::info!("[telemetry] sent (status {})", r.status()),
+    match client.post(url).json(&payload).send().await {
+        Ok(r) => tracing::info!(
+            "[telemetry] sent (status {}, mode={})",
+            r.status(),
+            if opt_in { "opt-in" } else { "opted-out" }
+        ),
         Err(e) => tracing::warn!("[telemetry] failed: {}", e),
     }
 }
 
-/// Called once at startup to announce this device + current version.
+/// Fire the anonymous install beacon exactly once per install. The beacon
+/// POSTs an **empty body** to `/sentryusb/install-beacon` — no fingerprint,
+/// no identifier, nothing. The backend just increments a daily counter.
+/// This is what gives us gross-install volume independent of the opt-in
+/// cohort, and it carries no personal data so there's nothing to opt out of.
 ///
-/// The HTTP call races DNS at boot (same failure mode as the migrate
-/// task — `nss-lookup.target` helps but the resolver's first query can
-/// still time out on a cold router DNS cache). Telemetry is best-effort
-/// so we can't afford to burn a lot of time on retries, but failing on
-/// every boot until the resolver warms up and then staying failed until
-/// the next reboot is needlessly noisy in the logs. Retry up to 3
-/// times with 5s/10s backoff, only on transient errors — permanent
-/// failures (HTTP 5xx, SSL verify) fail fast so we don't hammer the
-/// backend.
-pub fn spawn_startup_telemetry() {
+/// Guarded by `/mutable/.beaconed` — once that file exists, the beacon
+/// never fires again for this install (until /mutable is wiped, which on
+/// SentryUSB only happens on a full reflash).
+pub fn spawn_install_beacon() {
     tokio::spawn(async move {
-        let current = read_current_version();
+        if std::path::Path::new(INSTALL_BEACON_MARKER).exists() {
+            return;
+        }
+        // Retry on transient errors so a cold DNS cache at first boot
+        // doesn't drop the beacon. Three attempts max, then give up —
+        // if we can't reach the server after that, we'll just stay
+        // un-beaconed and try again next boot.
+        let url = "https://api.sentry-six.com/sentryusb/install-beacon";
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
         for attempt in 1..=3 {
-            if try_send_telemetry(&current, false, "").await {
-                return;
+            match client.post(url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    let _ = std::fs::write(INSTALL_BEACON_MARKER, b"1");
+                    tracing::info!("[beacon] install counted");
+                    return;
+                }
+                Ok(r) => {
+                    tracing::warn!("[beacon] non-success status {}", r.status());
+                    // 4xx won't fix with retry; 5xx might.
+                    if !r.status().is_server_error() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[beacon] attempt {} failed: {}", attempt, e);
+                }
             }
             if attempt < 3 {
-                let wait = std::time::Duration::from_secs(5 * attempt as u64);
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep(std::time::Duration::from_secs(5 * attempt)).await;
             }
         }
     });
-}
-
-/// Single-shot telemetry attempt. Returns `true` on success or on a
-/// "no point retrying" failure (non-transient HTTP error, missing
-/// fingerprint) — i.e. true means "stop trying". Returns `false` only
-/// when a retry is likely to help (DNS, connect, timeout).
-async fn try_send_telemetry(current: &str, update_available: bool, new_version: &str) -> bool {
-    let fp = get_fingerprint();
-    if fp.is_empty() {
-        return true; // no fingerprint → no reason to retry
-    }
-    let arch = sentryusb_shell::run("uname", &["-m"])
-        .await
-        .ok()
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| std::env::consts::ARCH.to_string());
-    let payload = serde_json::json!({
-        "fingerprint": fp,
-        "current_version": current,
-        "update_available": update_available,
-        "new_version": new_version,
-        "arch": arch,
-        "model": get_sbc_model(),
-    });
-    let url = "https://api.sentry-six.com/sentryusb/telemetry";
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return true, // client setup broken → won't fix with retry
-    };
-    match client.post(url).json(&payload).send().await {
-        Ok(r) => {
-            tracing::info!("[telemetry] sent (status {})", r.status());
-            true
-        }
-        Err(e) => {
-            // `is_timeout` / `is_connect` / the DNS-shaped error strings
-            // are the ones worth retrying. Anything else (TLS mismatch,
-            // bad URL) won't resolve itself on a second attempt.
-            let transient = e.is_timeout() || e.is_connect() || {
-                let s = e.to_string();
-                s.contains("dns error")
-                    || s.contains("Could not resolve host")
-                    || s.contains("Temporary failure in name resolution")
-            };
-            if transient {
-                tracing::warn!("[telemetry] transient failure, will retry: {}", e);
-                false
-            } else {
-                tracing::warn!("[telemetry] failed: {}", e);
-                true
-            }
-        }
-    }
 }
 
 /// GET /api/system/update-status

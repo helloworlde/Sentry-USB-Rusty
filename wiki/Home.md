@@ -38,6 +38,7 @@ Plus:
 | [Setup Wizard Guide](Setup-Wizard-Guide) | Every wizard step explained |
 | [Archive Methods](Archive-Methods) | CIFS, rsync, rclone, NFS |
 | [Notifications](Notifications) | Push notifications to your phone |
+| [Privacy](Privacy) | What we send, when, and why — and how to opt out |
 | [Sentry Cloud](Sentry-Cloud) | Encrypted cloud backup (in beta) |
 | [Troubleshooting](Troubleshooting) | Things that go wrong |
 | [FAQ](FAQ) | Common questions |
