@@ -30,7 +30,7 @@ export default function DriveChart({
       <ResponsiveContainer>
         <AreaChart
           data={series}
-          margin={{ top: 10, right: 12, bottom: 10, left: 4 }}
+          margin={{ top: 10, right: 16, bottom: 16, left: 4 }}
           onMouseMove={(s) => {
             const idx = s?.activeTooltipIndex
             if (typeof idx === "number" && idx >= 0 && idx < series.length) {
@@ -53,8 +53,9 @@ export default function DriveChart({
             tick={{ fill: "#64748b", fontSize: 11 }}
             tickLine={false}
             axisLine={false}
-            tickMargin={6}
+            tickMargin={10}
             minTickGap={56}
+            padding={{ left: 10, right: 4 }}
           />
           <YAxis
             stroke="#475569"
