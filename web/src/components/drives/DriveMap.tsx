@@ -217,8 +217,8 @@ export function DriveMap({
     // Playback info card — permanent tooltip floating next to the
     // pulse marker. Bound once here, content swapped on each scrubber
     // tick by the dedicated effect below. Position "right" so the
-    // card sits to the side of the pulse like Tessie's playback view;
-    // Leaflet auto-flips when it would go off the map edge.
+    // card sits beside the pulse rather than covering it; Leaflet
+    // auto-flips when it would go off the map edge.
     const baseMs = startTime ? new Date(startTime).getTime() : NaN
     const initialHtml = renderPlaybackHTML(
       points[0],

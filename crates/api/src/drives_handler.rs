@@ -854,9 +854,8 @@ pub struct SetTagsRequest {
 /// Time-series of interior + exterior cabin temperature across the
 /// drive, sourced from `telemetry_samples` (BLE sampler at 60s cadence)
 /// for the union of clip windows that make up the drive. The frontend
-/// renders this as a two-line chart on the DriveDetail Climate section
-/// — equivalent to Tessie's "Interior temperature" / "Exterior
-/// temperature" graphs combined into one.
+/// renders this as a two-line chart on the DriveDetail Climate section,
+/// one line per temperature source on a shared time axis.
 ///
 /// Response shape:
 /// ```json

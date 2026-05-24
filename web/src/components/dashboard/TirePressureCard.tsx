@@ -13,16 +13,15 @@ import {
   YAxis,
 } from "recharts"
 
-// Tire-pressure zones — labels and styling match Tessie's convention
-// (see user's reference screenshot). Each band is a solid-feeling
-// translucent block with the label centered vertically inside; the
-// boundaries between bands are drawn separately as dashed ReferenceLines
-// so the dividers read as a single line, not two stacked borders.
+// Tire-pressure zones — labels and styling per the user's spec. Each
+// band is a solid-feeling translucent block with the label centered
+// vertically inside; the boundaries between bands are drawn separately
+// as dashed ReferenceLines so the dividers read as a single line, not
+// two stacked borders.
 //
 // Colour intent: red (unsafe top + bottom), amber (harsher ride near top
 // of safe), green (optimal), orange (reduced handling near bottom of safe).
-// Opacities are higher than the previous pass so the zones read as
-// blocks rather than tints.
+// Opacity is high enough that the zones read as blocks rather than tints.
 const ZONES = [
   {
     y1: 50,
@@ -71,15 +70,15 @@ const ZONE_BOUNDARIES = [
   { y: 28, color: "rgba(252, 165, 165, 0.7)" }, // red above bottom-unsafe
 ] as const
 
-// Y range chosen so the visible bottom "UNSAFE" band has the same
-// presence Tessie gives it (~25-30% of the chart height). Going below
-// 20 just wastes space — tires never read that low in practice.
+// Y range chosen so the visible bottom "UNSAFE" band has real
+// presence (~25-30% of the chart height). Going below 20 just wastes
+// space — tires never read that low in practice.
 const Y_DOMAIN: [number, number] = [20, 55]
 
-// Per-tire line colours — green family to match Tessie's all-green
-// tracings while keeping the four wheels distinguishable on hover.
-// Picked far enough apart in lightness/hue that they don't melt into
-// each other or into the green OPTIMAL band when stacked.
+// Per-tire line colours — green family so the lines read against the
+// coloured zone bands while staying distinguishable from each other on
+// hover. Picked far enough apart in lightness/hue that they don't melt
+// together or into the green OPTIMAL band when stacked.
 const TIRE_COLORS = {
   fl: "#34d399", // emerald-400  — front-left
   fr: "#a3e635", // lime-400     — front-right
@@ -136,9 +135,9 @@ export function TirePressureCard({ days = 30 }: TirePressureCardProps) {
     }
   }, [days])
 
-  // Latest reading per tire for the header strip — same shape as the
-  // four green-check tiles in Tessie's screenshot, but inline so the
-  // card stays compact for the dashboard.
+  // Latest reading per tire for the header strip — rendered inline
+  // beside the title so the card stays compact for the dashboard
+  // grid.
   const latest = useMemo(() => {
     const points = data?.points ?? []
     const out: Partial<Record<"fl" | "fr" | "rl" | "rr", number>> = {}
