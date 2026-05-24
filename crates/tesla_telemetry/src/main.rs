@@ -22,7 +22,7 @@ mod lock;
 mod sample;
 mod usb_watch;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -36,18 +36,35 @@ use crate::usb_watch::CarState;
 /// Coordinated with `awake_start`'s owner string ("keep_awake").
 const OWNER: &str = "telemetry";
 
-/// Sample cadence while the car is awake. Storage cost is ~12 KB/h
-/// per the user's design call.
-const AWAKE_INTERVAL: Duration = Duration::from_secs(15);
+/// Tick cadence in Active mode. `state drive` always runs on each
+/// tick (highest priority — carries shiftState + location + odometer).
+/// The slower sub-samplers (climate, charge, tires) only run when
+/// their per-command interval has elapsed; see `Schedule` below.
+const DRIVE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Sample cadence for sleep-safe `body-controller-state` calls.
-/// Set to 1 min so the sampler notices a drive starting within a
-/// minute of the car coming out of sleep — body-controller-state
-/// doesn't wake the car, so polling this often is cheap from a
-/// battery-drain perspective. Replaces the old 15-min interval +
-/// ramp-up backoff (which made drive starts invisible for up to
-/// 15 min after sleep).
-const QUIET_INTERVAL: Duration = Duration::from_secs(60);
+/// How often to refresh climate (cabin/exterior temp, HVAC) in
+/// Active mode. 60s is fine — these are slow-changing.
+const CLIMATE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often to refresh charge (battery %) in Active mode. 60s,
+/// staggered 30s after climate so the two big-payload calls don't
+/// both fire on the same tick.
+const CHARGE_INTERVAL: Duration = Duration::from_secs(60);
+const CHARGE_INITIAL_OFFSET: Duration = Duration::from_secs(30);
+
+/// How often to refresh tire pressure in Active mode. 5 min — TPMS
+/// almost never changes mid-drive, and the call has the smallest
+/// payload of the four, so even at 5-min cadence it costs almost
+/// nothing.
+const TIRES_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Sample cadence for sleep-safe `body-controller-state` calls in
+/// Quiet mode. 30s (down from 60s) halves the worst-case wakeup
+/// latency — important because the user_presence flip is what
+/// promotes us back to Active when someone gets in a parked car.
+/// body-controller-state doesn't wake the car, so polling this
+/// often is cheap from a battery-drain perspective.
+const QUIET_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How many consecutive state polls must show shift_state = Park
 /// before we drop into the sleep-safe Quiet mode. 3 polls @ 15s =
@@ -71,6 +88,66 @@ const RADIO_CONTENDED_BACKOFF: Duration = Duration::from_secs(5);
 /// How long to sleep when BLE is disabled in settings. Doesn't need
 /// to be aggressive — settings changes are infrequent.
 const DISABLED_POLL: Duration = Duration::from_secs(60);
+
+/// Per-command "next due" timestamps for the Active-mode scheduler.
+///
+/// Each tick, the scheduler walks the four poll types in priority
+/// order and runs any that are due. `state drive` always runs first
+/// when due — it carries shiftState + locationName + odometer and
+/// must stay fresh. The slower polls (climate, charge, tires) only
+/// run when their per-command interval has elapsed and only after
+/// drive has gotten its turn this tick.
+///
+/// Stagger: charge starts 30s offset from climate so the two
+/// big-payload calls don't stack on the same tick. The offset is
+/// preserved automatically as long as both don't go overdue
+/// simultaneously (which only happens after a long Quiet period —
+/// acceptable, the next cycle restores the stagger naturally).
+struct Schedule {
+    next_drive: Instant,
+    next_climate: Instant,
+    next_charge: Instant,
+    next_tires: Instant,
+}
+
+impl Schedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            // Drive + climate + tires fire immediately on first
+            // tick — get a baseline snapshot.
+            next_drive: now,
+            next_climate: now,
+            next_charge: now + CHARGE_INITIAL_OFFSET,
+            next_tires: now,
+        }
+    }
+    fn drive_due(&self, now: Instant) -> bool { now >= self.next_drive }
+    fn climate_due(&self, now: Instant) -> bool { now >= self.next_climate }
+    fn charge_due(&self, now: Instant) -> bool { now >= self.next_charge }
+    fn tires_due(&self, now: Instant) -> bool { now >= self.next_tires }
+
+    fn mark_drive(&mut self, now: Instant) {
+        self.next_drive = now + DRIVE_INTERVAL;
+    }
+    fn mark_climate(&mut self, now: Instant) {
+        self.next_climate = now + CLIMATE_INTERVAL;
+    }
+    fn mark_charge(&mut self, now: Instant) {
+        self.next_charge = now + CHARGE_INTERVAL;
+    }
+    fn mark_tires(&mut self, now: Instant) {
+        self.next_tires = now + TIRES_INTERVAL;
+    }
+
+    /// When should the next tick fire? Min of all four next-due
+    /// timestamps. The main loop sleeps until this instant.
+    fn next_due(&self) -> Instant {
+        self.next_drive
+            .min(self.next_climate)
+            .min(self.next_charge)
+            .min(self.next_tires)
+    }
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -97,6 +174,12 @@ async fn main() -> Result<()> {
     // sampler can promote to Active on the next tick rather than
     // waiting for an external trigger.
     let mut last_user_presence: Option<bool> = None;
+    // Per-command scheduler for Active mode. Persists across ticks
+    // so per-poll cadences stay stable. Initialized so the first
+    // Active tick fires drive + climate + tires immediately (for a
+    // fresh start-of-drive snapshot), with charge deferred 30s so
+    // it doesn't stack with climate.
+    let mut schedule = Schedule::new(Instant::now());
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -124,6 +207,7 @@ async fn main() -> Result<()> {
                 &mut held_radio,
                 &mut parked_polls,
                 &mut last_user_presence,
+                &mut schedule,
             ) => {
                 tokio::time::sleep(sleep).await;
             }
@@ -158,6 +242,7 @@ async fn tick(
     held_radio: &mut bool,
     parked_polls: &mut u32,
     last_user_presence: &mut Option<bool>,
+    schedule: &mut Schedule,
 ) -> Duration {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -266,22 +351,36 @@ async fn tick(
             // poll `state drive` to catch a shift change. This
             // covers the "user sat in parked car for a while then
             // drove away" case where user_presence never flips.
-            // The car was already awake (user is in it), so we're
-            // not making things worse from a sleep-timer
-            // perspective.
+            // Drive-only (not the full telemetry batch) because
+            // we just need shiftState here — the full Active mode
+            // scheduler kicks in on the next tick if we detect a
+            // shift change.
             if presence_now == Some(true) {
-                match sample::sample_state(&cfg.vin).await {
-                    Ok(ss) => {
-                        let shift_changed_to_drive = ss
+                match sample::sample_drive(&cfg.vin).await {
+                    Ok(d) => {
+                        let shift_changed_to_drive = d
                             .shift_state
                             .map_or(false, |s| !s.is_park() && s != sample::ShiftState::Unknown);
-                        persist(conn, ss.sample);
+                        // Persist whatever the drive probe got
+                        // (location + odometer freshness even
+                        // while parked-with-Sentry).
+                        let probe_sample = Sample {
+                            ts: sample::now_secs(),
+                            location_name: d.location_name,
+                            odometer_mi: d.odometer_mi,
+                            source: "state".into(),
+                            ..Sample::default()
+                        };
+                        persist(conn, probe_sample);
                         if shift_changed_to_drive {
                             info!(
                                 "shift_state non-Park while user in car — resuming full state polls"
                             );
                             *parked_polls = 0;
                             *last_user_presence = presence_now;
+                            // Reset schedule so Active starts fresh
+                            // with a full snapshot.
+                            *schedule = Schedule::new(Instant::now());
                             return Duration::from_secs(1);
                         }
                     }
@@ -301,7 +400,13 @@ async fn tick(
         }
         QUIET_INTERVAL
     } else {
-        // Active state polling — full telemetry, car stays awake.
+        // Active mode — scheduler-driven multi-poll. Each tick
+        // composes one or more sub-samplers to run sequentially
+        // based on what's overdue. `state drive` always runs first
+        // when due (it carries shiftState + location + odometer —
+        // the freshest-required signals); climate/charge/tires
+        // run on slower per-command cadences and only inserted
+        // after drive has had its turn.
         if !*held_radio {
             match lock::try_acquire(OWNER) {
                 Ok(true) => {
@@ -309,9 +414,6 @@ async fn tick(
                     stop_ios_gatt().await;
                 }
                 Ok(false) => {
-                    // Bumped to info so the diagnostics panel shows
-                    // this — silent backoff used to look identical
-                    // to "sampler is dead" from the UI.
                     info!(
                         "radio held by {:?}, backing off {}s",
                         lock::current_owner(),
@@ -326,50 +428,149 @@ async fn tick(
             }
         }
 
-        match sample::sample_state(&cfg.vin).await {
-            Ok(ss) => {
-                // Update park-confirmation counter. Any non-Park
-                // reading resets it; an Unknown reading neither
-                // increments nor resets (better to stay in Active
-                // when the SDK returns a value we can't decode).
-                match ss.shift_state {
-                    Some(s) if s.is_park() => {
-                        *parked_polls = parked_polls.saturating_add(1);
-                        if *parked_polls == PARK_CONFIRMATIONS_BEFORE_QUIET {
-                            info!(
-                                "{} consecutive Park observations — dropping to body-controller polling so the car can sleep",
-                                PARK_CONFIRMATIONS_BEFORE_QUIET
-                            );
-                        }
-                    }
-                    Some(sample::ShiftState::Unknown) => {
-                        // leave counter alone
-                    }
-                    Some(_) => {
-                        // Drive / Reverse / Neutral — actively
-                        // moving, reset.
-                        *parked_polls = 0;
-                    }
-                    None => {
-                        // shift_state not present in response; treat
-                        // like Unknown.
-                    }
+        let tick_now = Instant::now();
+        // Detect "first tick after a long Quiet period" — the
+        // schedule's next_drive will be very stale (Quiet doesn't
+        // call mark_drive). Reset the schedule so climate/charge
+        // get their 30s stagger back, and so all four sub-samplers
+        // fire on this first tick for a fresh snapshot.
+        if tick_now.duration_since(schedule.next_drive)
+            > Duration::from_secs(2 * DRIVE_INTERVAL.as_secs())
+        {
+            *schedule = Schedule::new(tick_now);
+        }
+        // Single Sample built up across whatever sub-samplers ran
+        // this tick. Fields stay None for any sub-sampler that
+        // didn't run or that failed — the schema and the
+        // aggregator both handle per-field NULLs gracefully.
+        let mut sample = Sample {
+            ts: sample::now_secs(),
+            source: "state".into(),
+            ..Sample::default()
+        };
+        let mut shift_state_observed: Option<sample::ShiftState> = None;
+        let mut any_call_ran = false;
+
+        // ── 1. DRIVE (priority — runs first when due) ──
+        // Carries: shiftState (drive detection), locationName,
+        // odometer. The "must stay fresh" signals.
+        if schedule.drive_due(tick_now) {
+            match sample::sample_drive(&cfg.vin).await {
+                Ok(d) => {
+                    sample.odometer_mi = d.odometer_mi;
+                    sample.location_name = d.location_name;
+                    shift_state_observed = d.shift_state;
                 }
-                // Clear stale user_presence — next time we drop to
-                // Quiet, we want a fresh baseline before triggering
-                // the "got back in" transition.
-                *last_user_presence = None;
-                persist(conn, ss.sample);
+                Err(e) => {
+                    warn!("sample_drive failed: {e}");
+                }
             }
-            Err(e) => {
-                warn!("sample_state failed: {e}");
-                // Keep the radio — transient failure (car
-                // briefly out of range, BLE jitter). If
-                // failures persist the next clip-write probe
-                // will eventually flip us to Asleep.
+            // Mark as polled regardless of result so we don't
+            // hot-retry-loop on persistent failures.
+            schedule.mark_drive(tick_now);
+            any_call_ran = true;
+        }
+
+        // ── 2. CLIMATE (every 60s) ──
+        if schedule.climate_due(tick_now) {
+            match sample::sample_climate(&cfg.vin).await {
+                Ok(c) => {
+                    sample.interior_temp_c = c.interior_temp_c;
+                    sample.exterior_temp_c = c.exterior_temp_c;
+                    sample.hvac_on = c.hvac_on;
+                }
+                Err(e) => {
+                    warn!("sample_climate failed: {e}");
+                }
+            }
+            schedule.mark_climate(tick_now);
+            any_call_ran = true;
+        }
+
+        // ── 3. CHARGE (every 60s, offset 30s from climate) ──
+        if schedule.charge_due(tick_now) {
+            match sample::sample_charge(&cfg.vin).await {
+                Ok(c) => {
+                    sample.battery_pct = c.battery_pct;
+                }
+                Err(e) => {
+                    warn!("sample_charge failed: {e}");
+                }
+            }
+            schedule.mark_charge(tick_now);
+            any_call_ran = true;
+        }
+
+        // ── 4. TIRES (every 5 min) ──
+        if schedule.tires_due(tick_now) {
+            match sample::sample_tires(&cfg.vin).await {
+                Ok(t) => {
+                    sample.tire_fl_psi = t.tire_fl_psi;
+                    sample.tire_fr_psi = t.tire_fr_psi;
+                    sample.tire_rl_psi = t.tire_rl_psi;
+                    sample.tire_rr_psi = t.tire_rr_psi;
+                }
+                Err(e) => {
+                    warn!("sample_tires failed: {e}");
+                }
+            }
+            schedule.mark_tires(tick_now);
+            any_call_ran = true;
+        }
+
+        // Update park-confirmation counter from drive's shift
+        // observation (if drive ran this tick).
+        match shift_state_observed {
+            Some(s) if s.is_park() => {
+                *parked_polls = parked_polls.saturating_add(1);
+                if *parked_polls == PARK_CONFIRMATIONS_BEFORE_QUIET {
+                    info!(
+                        "{} consecutive Park observations — dropping to body-controller polling so the car can sleep",
+                        PARK_CONFIRMATIONS_BEFORE_QUIET
+                    );
+                }
+            }
+            Some(sample::ShiftState::Unknown) => {
+                // SDK returned an unrecognized shift code — leave
+                // counter alone (better to stay Active than drop to
+                // Quiet on a parsing miss).
+            }
+            Some(_) => {
+                // Drive / Reverse / Neutral — actively moving,
+                // reset the Park counter.
+                *parked_polls = 0;
+            }
+            None => {
+                // Drive didn't run this tick OR drive failed —
+                // leave the counter alone.
             }
         }
-        AWAKE_INTERVAL
+
+        // Clear stale user_presence — next time we drop to Quiet,
+        // we want a fresh baseline before triggering the "got back
+        // in" transition.
+        *last_user_presence = None;
+
+        // Persist whatever this tick collected. Even a single
+        // drive-only poll lands a row with location/odometer
+        // populated — the live-output panel and aggregator both
+        // handle the sparse-row case.
+        if any_call_ran {
+            persist(conn, sample);
+        }
+
+        // Sleep until the next scheduled sub-sampler is due. Drive
+        // is normally the soonest (15s), but if a slow call this
+        // tick blew through the budget, we'll wake up sooner.
+        let next = schedule.next_due();
+        let after = Instant::now();
+        if next > after {
+            next.duration_since(after)
+        } else {
+            // Already overdue — next tick immediately (cheap, the
+            // tick itself enforces the actual cadence).
+            Duration::from_millis(100)
+        }
     }
 }
 

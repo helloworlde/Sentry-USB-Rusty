@@ -195,15 +195,15 @@ function TelemetryStrip({ d, metric }: {
           title={
             d.odometerMiStart != null && d.odometerMiEnd != null
               ? metric
-                ? `${(d.odometerMiStart * 1.609344).toFixed(1)} → ${(d.odometerMiEnd * 1.609344).toFixed(1)} km`
-                : `${d.odometerMiStart.toFixed(1)} → ${d.odometerMiEnd.toFixed(1)} mi`
-              : undefined
+                ? `Odometer ${(d.odometerMiStart * 1.609344).toFixed(1)} → ${(d.odometerMiEnd * 1.609344).toFixed(1)} km (BLE — approximate, biased low at drive start/end due to BLE wake latency)`
+                : `Odometer ${d.odometerMiStart.toFixed(1)} → ${d.odometerMiEnd.toFixed(1)} mi (BLE — approximate, biased low at drive start/end due to BLE wake latency)`
+              : "BLE-derived odometer — approximate"
           }
         >
           <Gauge className="h-3 w-3 text-indigo-400/80" />
           {metric
-            ? `${(d.odometerMiDriven * 1.609344).toFixed(1)} km odo`
-            : `${d.odometerMiDriven.toFixed(1)} mi odo`}
+            ? `~${(d.odometerMiDriven * 1.609344).toFixed(1)} km odo`
+            : `~${d.odometerMiDriven.toFixed(1)} mi odo`}
         </span>
       )}
       {d.batteryPctUsed != null && d.batteryPctUsed > 0 && (
@@ -322,10 +322,15 @@ function DriveTelemetryDetail({
             highlight
           />
         )}
+        {/* Two "driven" values: the BLE-odometer delta (approximate
+            — biased low because BLE polling can miss the very first
+            and very last odometer ticks of a drive), and the
+            SEI-derived distance from clip GPS (the authoritative
+            number, shown in the header stats row as "Distance"). */}
         {d.odometerMiDriven != null && d.odometerMiDriven > 0 && (
           <Stat
-            label="Driven"
-            value={distStr(d.odometerMiDriven)}
+            label="Driven (odo)"
+            value={`~${distStr(d.odometerMiDriven)}`}
           />
         )}
         {hasBattery && (

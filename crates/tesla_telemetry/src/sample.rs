@@ -23,7 +23,23 @@ use tracing::{info, warn};
 
 const TESLA_CONTROL: &str = "/root/bin/tesla-control";
 const KEY_FILE: &str = "/root/.ble/key_private.pem";
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+/// Outer wall-clock budget for a single tesla-control invocation.
+/// Sized to comfortably cover the inner `-connect-timeout 40s` +
+/// `-command-timeout 10s` budget we pass to tesla-control plus a
+/// small buffer for SDK retry rounds. Was 20s, which false-failed
+/// slow-but-real responses (charge calls regularly take 14+s when
+/// the BLE link is congested).
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-call BLE connect budget passed to tesla-control. Default is
+/// 20s, but the vehicle-command Go library has an internal retry
+/// loop that needs room to re-handshake when the car's BLE stack
+/// is busy. 40s lets it retry once or twice before giving up.
+const CONNECT_TIMEOUT: &str = "40s";
+/// Per-call BLE command budget once the connection is established.
+/// Default is 5s, which is too tight for the bigger payloads
+/// (climate, charge). 10s comfortably covers the longest payload
+/// we observed during testing.
+const CMD_TIMEOUT: &str = "10s";
 
 /// Tesla shift state. Decoded from `state drive`'s `shiftState`
 /// field which is either a string ("P"/"R"/"N"/"D") or a protobuf
@@ -49,12 +65,38 @@ impl ShiftState {
     }
 }
 
-/// Result of a successful `sample_state` call. The Sample goes to
-/// the DB; the shift_state is in-memory state for the phase machine
-/// and intentionally NOT persisted (no DB column for it).
-pub struct StateSample {
-    pub sample: Sample,
+/// Result of a successful `sample_drive` call. Drive is the
+/// highest-priority poll because it carries the three signals that
+/// must stay fresh during a drive:
+///   * `shift_state` — phase-machine input (drive detection)
+///   * `location_name` — Tesla's reverse-geocoded address
+///   * `odometer_mi` — mile counter, ticks continuously while driving
+pub struct DriveResult {
+    pub location_name: Option<String>,
+    pub odometer_mi: Option<f64>,
     pub shift_state: Option<ShiftState>,
+}
+
+/// Result of a successful `sample_climate` call. Slow-changing —
+/// polled at a coarser cadence than `sample_drive`.
+pub struct ClimateResult {
+    pub interior_temp_c: Option<f64>,
+    pub exterior_temp_c: Option<f64>,
+    pub hvac_on: Option<bool>,
+}
+
+/// Result of a successful `sample_charge` call. Slow-changing.
+pub struct ChargeResult {
+    pub battery_pct: Option<f64>,
+}
+
+/// Result of a successful `sample_tires` call. Very slow-changing —
+/// polled at the coarsest cadence (every few minutes).
+pub struct TiresResult {
+    pub tire_fl_psi: Option<f64>,
+    pub tire_fr_psi: Option<f64>,
+    pub tire_rl_psi: Option<f64>,
+    pub tire_rr_psi: Option<f64>,
 }
 
 /// Result of a body-controller-state probe. Both fields are
@@ -98,84 +140,72 @@ pub struct Sample {
     pub source: String,
 }
 
-/// Full sample via `state climate` + `state charge` + `state drive`
-/// + `state tire-pressure`. Wakes the car briefly if it's asleep —
-/// only call when we already know the car is awake (recent clip
-/// writes).
+/// Highest-priority sample: `state drive`. Cheap, fast, and carries
+/// the three signals that matter most for drive tracking:
+///   * `shift_state` — input to the phase machine (drive detection)
+///   * `location_name` — Tesla's reverse-geocoded address (start/end)
+///   * `odometer_mi` — mile counter, ticks continuously while driving
+/// Polled every ~15s in Active mode because location and shift state
+/// must stay fresh; the other three sub-samplers below run on slower
+/// cadences (60s / 5 min).
 ///
 /// Note: `state software-update` is intentionally not called. Its
-/// response only contains the *pending* OTA version (often " "
-/// when no update is queued), never the currently-installed
-/// `car_version`. That field lives in `VehicleState` which tesla-
-/// control doesn't expose as a state category, so there's no point
-/// burning BLE air time on it.
-pub async fn sample_state(vin: &str) -> Result<StateSample> {
-    // Time each subcommand so a single grep-able summary line tells
-    // us at a glance which call is failing (and why). The two
-    // best-effort calls (tire-pressure / drive) used to silently
-    // .ok() their errors, which made "TPMS shows but location/
-    // odometer are missing" symptoms invisible in logs. Each
-    // failure is now warned explicitly.
-    let (climate_res, climate_o) = run_state_timed(vin, "climate").await;
-    let (charge_res, charge_o) = run_state_timed(vin, "charge").await;
-    let (tires_res, tires_o) = run_state_timed(vin, "tire-pressure").await;
-    let (drive_res, drive_o) = run_state_timed(vin, "drive").await;
-
-    // One-line summary, grep `state-poll` in journalctl to see the
-    // outcome pattern over time. INFO so it shows at default log
-    // level (no RUST_LOG bump needed).
-    let total_ms = climate_o.elapsed_ms
-        + charge_o.elapsed_ms
-        + tires_o.elapsed_ms
-        + drive_o.elapsed_ms;
-    info!(
-        "state-poll: climate={} charge={} tires={} drive={} [total={}ms]",
-        climate_o.fmt_short(),
-        charge_o.fmt_short(),
-        tires_o.fmt_short(),
-        drive_o.fmt_short(),
-        total_ms,
-    );
-
-    // Per-failure detail with the raw error string. Lets us tell
-    // apart "context deadline exceeded" (BLE saturated — too many
-    // keys connected) from other failure modes like JSON parse
-    // errors or process-spawn failures.
-    for (label, outcome) in [
-        ("climate", &climate_o),
-        ("charge", &charge_o),
-        ("tire-pressure", &tires_o),
-        ("drive", &drive_o),
-    ] {
-        if let Some(err) = &outcome.error {
-            warn!(
-                "state-poll subcommand failed: {} ({}ms): {}",
-                label, outcome.elapsed_ms, err
-            );
-        }
+/// response only contains the *pending* OTA version (often " "),
+/// never the currently-installed `car_version`. That field lives in
+/// `VehicleState` which tesla-control doesn't expose as a state
+/// category, so there's no point burning BLE air time on it.
+pub async fn sample_drive(vin: &str) -> Result<DriveResult> {
+    let (result, outcome) = run_state_timed(vin, "drive").await;
+    info!("state-poll: drive={}", outcome.fmt_short());
+    if let Some(err) = &outcome.error {
+        warn!(
+            "state-poll subcommand failed: drive ({}ms): {}",
+            outcome.elapsed_ms, err
+        );
     }
+    let drive = result?;
+    Ok(DriveResult {
+        // Reverse-geocoded address. Tesla emits it inside the
+        // `locationState` object that's also returned by `state drive`
+        // (separate from `driveState`); fall back to checking the
+        // top-level in case the shape varies.
+        location_name: pick_string(&drive, &["locationName", "location_name"]),
+        // Odometer — Tesla emits this as `odometerInHundredthsOfAMile`
+        // inside the `driveState` object. Divide by 100 for miles.
+        odometer_mi: pick_f64(
+            &drive,
+            &[
+                "odometerInHundredthsOfAMile",
+                "odometer_in_hundredths_of_a_mile",
+            ],
+        )
+        .map(|hundredths| hundredths / 100.0)
+        .or_else(|| {
+            // Older / alternate shape — already in miles.
+            pick_f64(
+                &drive,
+                &["odometer", "odometerMi", "odometer_mi", "odometerMiles"],
+            )
+        }),
+        // Shift state for the phase machine. Not persisted — purely
+        // a transient signal for "should the sampler back off?"
+        shift_state: pick_shift_state(&drive),
+    })
+}
 
-    // Required calls — climate + charge populate the bulk of the
-    // sample (battery, temps, HVAC). If either fails, bail.
-    let climate = climate_res?;
-    let charge = charge_res?;
-    // Best-effort: populate whatever subset succeeded. Errors were
-    // already warned above.
-    let tires = tires_res.ok();
-    let drive = drive_res.ok();
-    let now = now_secs();
-    // NOTE on battery_temp_c: Tesla's BLE state API does NOT expose
-    // battery cell temperature. Both charge_state and climate_state
-    // only return `battery_heater_on` / `battery_heater_no_power`
-    // (booleans — is the heater running, not how hot the pack is).
-    // The BMS knows the temperature internally but it isn't part of
-    // the public state query surface. We leave the column nullable
-    // in the schema for forward compatibility (in case Tesla adds it
-    // later) but we don't waste a probe trying to find it.
-    let sample = Sample {
-        ts: now,
-        battery_pct: pick_f64(&charge, &["batteryLevel", "battery_level", "batteryPct"]),
-        battery_temp_c: None,
+/// Slow-cadence sample: `state climate`. Polled every ~60s in
+/// Active mode. Returns the cabin/exterior temps + HVAC on/off.
+pub async fn sample_climate(vin: &str) -> Result<ClimateResult> {
+    let (result, outcome) = run_state_timed(vin, "climate").await;
+    info!("state-poll: climate={}", outcome.fmt_short());
+    if let Some(err) = &outcome.error {
+        warn!(
+            "state-poll subcommand failed: climate ({}ms): {}",
+            outcome.elapsed_ms, err
+        );
+    }
+    let climate = result?;
+    Ok(ClimateResult {
         interior_temp_c: pick_f64(
             &climate,
             &["insideTempCelsius", "insideTemp", "inside_temp", "insideTempC"],
@@ -188,72 +218,57 @@ pub async fn sample_state(vin: &str) -> Result<StateSample> {
             &climate,
             &["isClimateOn", "is_climate_on", "hvacAuto", "climateKeeperMode"],
         ),
-        // TPMS — Tesla emits `tpms_pressure_*` in BAR (matches the
-        // raw protobuf semantics and how teslamate / other open-source
-        // tools treat the value). Convert to PSI at sample time so
-        // every downstream consumer (DB column, API response, UI)
-        // sees the unit named on the field. A raw value of 3.0 bar
-        // becomes 43.5 PSI, matching what the Tesla app shows on US
-        // vehicles.
-        tire_fl_psi: tires
-            .as_ref()
-            .and_then(|t| pick_f64(t, &["tpmsPressureFl", "tpms_pressure_fl"]))
-            .map(bar_to_psi),
-        tire_fr_psi: tires
-            .as_ref()
-            .and_then(|t| pick_f64(t, &["tpmsPressureFr", "tpms_pressure_fr"]))
-            .map(bar_to_psi),
-        tire_rl_psi: tires
-            .as_ref()
-            .and_then(|t| pick_f64(t, &["tpmsPressureRl", "tpms_pressure_rl"]))
-            .map(bar_to_psi),
-        tire_rr_psi: tires
-            .as_ref()
-            .and_then(|t| pick_f64(t, &["tpmsPressureRr", "tpms_pressure_rr"]))
-            .map(bar_to_psi),
-        // Odometer — Tesla emits this as `odometerInHundredthsOfAMile`
-        // (an int) inside the `driveState` object. Convert to miles by
-        // dividing by 100. Keep fallback candidates in case the field
-        // name changes on a future SDK release.
-        odometer_mi: drive.as_ref().and_then(|d| {
-            pick_f64(
-                d,
-                &[
-                    "odometerInHundredthsOfAMile",
-                    "odometer_in_hundredths_of_a_mile",
-                ],
-            )
-            .map(|hundredths| hundredths / 100.0)
-            .or_else(|| {
-                // Older / alternate shape — assume already in miles.
-                pick_f64(
-                    d,
-                    &["odometer", "odometerMi", "odometer_mi", "odometerMiles"],
-                )
-            })
-        }),
-        // Reverse-geocoded address. Tesla emits it inside the
-        // `locationState` object that's also returned by `state drive`
-        // (separate from `driveState`); fall back to checking the
-        // top-level in case the shape varies. Becomes the drive
-        // start/end label after the per-drive rollup matches it (or
-        // doesn't) against the known home/work coords.
-        location_name: drive.as_ref().and_then(|d| {
-            pick_string(d, &["locationName", "location_name"])
-        }),
-        source: "state".into(),
-    };
-    // Decode shift state for the phase machine. Accepts string
-    // (P/R/N/D) or protobuf int (1/2/3/4). Returned alongside the
-    // Sample but NOT stored in the DB — it's purely a transient
-    // signal for "should the sampler back off to sleep-safe polling?"
-    let shift_state = drive
-        .as_ref()
-        .and_then(|d| pick_shift_state(d));
+    })
+}
 
-    Ok(StateSample {
-        sample,
-        shift_state,
+/// Slow-cadence sample: `state charge`. Polled every ~60s in
+/// Active mode, offset 30s from climate so the two big-payload
+/// calls don't stack in the same cycle. Returns battery percent.
+///
+/// NOTE on battery_temp_c: Tesla's BLE state API does NOT expose
+/// battery cell temperature. Both charge_state and climate_state
+/// only return `battery_heater_on` (boolean — is the heater
+/// running, not how hot the pack is). We leave the column nullable
+/// in the schema for forward compatibility but don't waste a probe.
+pub async fn sample_charge(vin: &str) -> Result<ChargeResult> {
+    let (result, outcome) = run_state_timed(vin, "charge").await;
+    info!("state-poll: charge={}", outcome.fmt_short());
+    if let Some(err) = &outcome.error {
+        warn!(
+            "state-poll subcommand failed: charge ({}ms): {}",
+            outcome.elapsed_ms, err
+        );
+    }
+    let charge = result?;
+    Ok(ChargeResult {
+        battery_pct: pick_f64(&charge, &["batteryLevel", "battery_level", "batteryPct"]),
+    })
+}
+
+/// Very-slow-cadence sample: `state tire-pressure`. Polled every
+/// ~5 min in Active mode — TPMS values almost never change during
+/// a single drive, so the slow cadence saves BLE air time without
+/// noticeable freshness cost. Values converted from Tesla's native
+/// BAR to PSI to match what US vehicles display.
+pub async fn sample_tires(vin: &str) -> Result<TiresResult> {
+    let (result, outcome) = run_state_timed(vin, "tire-pressure").await;
+    info!("state-poll: tires={}", outcome.fmt_short());
+    if let Some(err) = &outcome.error {
+        warn!(
+            "state-poll subcommand failed: tire-pressure ({}ms): {}",
+            outcome.elapsed_ms, err
+        );
+    }
+    let tires = result?;
+    Ok(TiresResult {
+        tire_fl_psi: pick_f64(&tires, &["tpmsPressureFl", "tpms_pressure_fl"])
+            .map(bar_to_psi),
+        tire_fr_psi: pick_f64(&tires, &["tpmsPressureFr", "tpms_pressure_fr"])
+            .map(bar_to_psi),
+        tire_rl_psi: pick_f64(&tires, &["tpmsPressureRl", "tpms_pressure_rl"])
+            .map(bar_to_psi),
+        tire_rr_psi: pick_f64(&tires, &["tpmsPressureRr", "tpms_pressure_rr"])
+            .map(bar_to_psi),
     })
 }
 
@@ -342,8 +357,23 @@ async fn run_state_timed(vin: &str, category: &str) -> (Result<Value>, Invocatio
 }
 
 async fn run_tesla_control(vin: &str, subcommand: &[&str]) -> Result<String> {
-    let mut args: Vec<&str> =
-        vec!["-ble", "-key-file", KEY_FILE, "-vin", vin];
+    // Pass tesla-control's own connect/command timeouts explicitly.
+    // Defaults are 20s connect / 5s command — too tight for our use
+    // case, which routinely sees 10-15s latencies during BLE
+    // contention. The vehicle-command library has an internal retry
+    // loop inside the connect window, so giving it more headroom
+    // converts what would be a hard failure into a successful retry.
+    let mut args: Vec<&str> = vec![
+        "-ble",
+        "-key-file",
+        KEY_FILE,
+        "-vin",
+        vin,
+        "-connect-timeout",
+        CONNECT_TIMEOUT,
+        "-command-timeout",
+        CMD_TIMEOUT,
+    ];
     args.extend_from_slice(subcommand);
     sentryusb_shell::run_with_timeout(COMMAND_TIMEOUT, TESLA_CONTROL, &args)
         .await
@@ -505,7 +535,7 @@ fn bar_to_psi(bar: f64) -> f64 {
     ((bar * 14.5038) * 10.0).round() / 10.0
 }
 
-fn now_secs() -> i64 {
+pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
