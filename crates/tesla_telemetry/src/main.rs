@@ -255,6 +255,15 @@ async fn main() -> Result<()> {
     let mut sigint = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::interrupt(),
     )?;
+    // SIGUSR1 = "do a full state poll now" — fired by the
+    // /api/system/ble-force-poll endpoint when the user clicks
+    // the "Poll now" button. Forces the next-due time of every
+    // sub-sampler to "now" and resets the parked-awake refresh
+    // timer, so the next tick runs everything regardless of the
+    // current phase.
+    let mut sigusr1 = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::user_defined1(),
+    )?;
 
     loop {
         tokio::select! {
@@ -267,6 +276,20 @@ async fn main() -> Result<()> {
                 info!("SIGINT received, releasing radio and exiting");
                 if held_radio { release_radio().await; }
                 return Ok(());
+            }
+            _ = sigusr1.recv() => {
+                info!("SIGUSR1 received — forcing a full state poll on next tick");
+                let now = Instant::now();
+                schedule = Schedule::new(now);
+                last_parked_awake_refresh = None;
+                // Reset parked_polls so the phase machine flips to
+                // Active even if we'd been in parked-confirmed
+                // Quiet — otherwise the force-poll would only fire
+                // a body_controller call. The next Park observation
+                // will tick the counter back up.
+                parked_polls = 0;
+                // Loop continues immediately — next tick runs at
+                // the top of the loop without sleeping.
             }
             sleep = tick(
                 &conn,

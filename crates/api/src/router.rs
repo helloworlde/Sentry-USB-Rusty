@@ -81,6 +81,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/ble-diagnostics", get(crate::ble::ble_diagnostics))
         .route("/api/system/ble-adapters", get(crate::ble::ble_adapters))
         .route("/api/system/ble-adapter", post(crate::ble::ble_adapter_set))
+        .route("/api/system/ble-force-poll", post(crate::ble::ble_force_poll))
         .route("/api/system/speedtest", get(crate::system::speedtest))
         .route("/api/system/rtc-status", get(crate::system::get_rtc_status))
         .route("/api/system/ssh-pubkey", get(crate::system::get_ssh_pubkey))
@@ -163,6 +164,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/drives/fsd-analytics", get(crate::drives_handler::fsd_analytics))
         .route("/api/drives/migration-status", get(crate::drives_handler::migration_status))
         .route("/api/drives/{id}/tags", put(crate::drives_handler::set_drive_tags))
+        .route(
+            "/api/drives/{id}/battery-series",
+            get(crate::drives_handler::battery_series),
+        )
         .route(
             "/api/drives/{id}/temperature-series",
             get(crate::drives_handler::temperature_series),

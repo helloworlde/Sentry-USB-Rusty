@@ -950,6 +950,95 @@ pub async fn temperature_series(
     }
 }
 
+/// GET /api/drives/{id}/battery-series
+///
+/// Time-series of battery percent across the drive, sourced from
+/// the same `telemetry_samples` table the temperature series uses.
+/// The BLE sampler polls `state charge` every 60s in Active mode,
+/// so a typical 30-min drive has ~30 samples — enough to draw a
+/// smooth line on a playback chart without needing to interpolate
+/// between start/end the way the older code did.
+///
+/// Response shape mirrors `temperature_series`:
+/// ```json
+/// {
+///   "points": [
+///     { "ts": 1716471234000, "batteryPct": 73.0 },
+///     ...
+///   ]
+/// }
+/// ```
+/// `batteryPct` is omitted only when a row in the window has NULL
+/// in that column — which is fine for the chart, gaps just don't
+/// draw.
+pub async fn battery_series(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let files = match state
+        .drives
+        .store
+        .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))
+    {
+        Ok(Some((_idx, f))) => f,
+        Ok(None) => {
+            return crate::json_error(
+                StatusCode::NOT_FOUND,
+                &format!("drive not found for id='{}'", id),
+            )
+        }
+        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    // Same window-derivation as temperature_series — min/max of the
+    // clip-file timestamps that make up this drive.
+    let mut start_ts: Option<i64> = None;
+    let mut end_ts: Option<i64> = None;
+    for f in &files {
+        if let Some((s, e)) = aggregate_telemetry::window_for_route_file(f) {
+            start_ts = Some(start_ts.map_or(s, |cur| cur.min(s)));
+            end_ts = Some(end_ts.map_or(e, |cur| cur.max(e)));
+        }
+    }
+    let (start_ts, end_ts) = match (start_ts, end_ts) {
+        (Some(s), Some(e)) => (s, e),
+        _ => return (StatusCode::OK, Json(serde_json::json!({ "points": [] }))),
+    };
+
+    let result = state.drives.store.with_locked_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT ts, battery_pct \
+             FROM telemetry_samples \
+             WHERE ts BETWEEN ?1 AND ?2 \
+               AND battery_pct IS NOT NULL \
+             ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![start_ts, end_ts],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?)),
+        )?;
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for row in rows {
+            let (ts, battery) = row?;
+            let mut obj = serde_json::Map::new();
+            obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
+            if let Some(v) = battery {
+                obj.insert("batteryPct".to_string(), serde_json::json!(v));
+            }
+            out.push(serde_json::Value::Object(obj));
+        }
+        Ok::<_, anyhow::Error>(out)
+    });
+
+    match result {
+        Ok(points) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "points": points })),
+        ),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub struct TireHistoryQuery {
     /// Window size in days. Clamped to [1, 365] to keep the down-sample

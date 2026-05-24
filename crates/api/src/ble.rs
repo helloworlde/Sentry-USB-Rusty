@@ -472,6 +472,39 @@ pub async fn ble_latest_sample(
     }
 }
 
+/// POST /api/system/ble-force-poll
+///
+/// Triggers a one-shot full state poll right now, bypassing the
+/// sampler's normal schedule. Useful when the user just changed
+/// something on the car (e.g. flipped Sentry on, plugged in a
+/// charger) and wants to verify the Pi can see fresh data without
+/// waiting for the next scheduled tick.
+///
+/// Sends SIGUSR1 to the telemetry daemon as a "do a state poll
+/// now" signal. The daemon listens and runs a one-cycle Active
+/// poll regardless of current phase. If the daemon doesn't respond
+/// (process not running, or signal handler not installed) the
+/// endpoint still returns 200 — the UI will just see no new
+/// sample within ~10s, which is its own feedback.
+///
+/// Implementation: we don't fork tesla-control from the api crate
+/// directly (would fight with the sampler for the BLE radio lock).
+/// Instead we ping the sampler to do it, which already knows how
+/// to coordinate the lock and persist results correctly.
+pub async fn ble_force_poll(
+    State(_s): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Best-effort: signal the daemon. Errors are non-fatal — the
+    // UI will discover the result via the normal poll cycle.
+    let _ = std::process::Command::new("systemctl")
+        .args(["kill", "-s", "SIGUSR1", "sentryusb-telemetry"])
+        .status();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "queued": true })),
+    )
+}
+
 /// GET /api/system/ble-adapters
 ///
 /// Returns the list of Bluetooth adapters the kernel is currently

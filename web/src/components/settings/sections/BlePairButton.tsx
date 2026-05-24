@@ -1056,6 +1056,37 @@ function TelemetryOutputPanel({
   // the same thing.
   const ageLabel = sample?.seconds_ago != null ? friendlyAge(sample.seconds_ago) : null
 
+  // "Poll now" sends SIGUSR1 to the sampler so it does a fresh
+  // full state read immediately instead of waiting for the next
+  // scheduled cycle. Useful for testing (just turned on Sentry,
+  // just plugged in to charge, etc) and as a manual override
+  // when the user wants to verify the connection works regardless
+  // of what the phase machine thinks.
+  const [polling, setPolling] = useState(false)
+  const [pollMsg, setPollMsg] = useState<string | null>(null)
+  const forcePoll = async () => {
+    setPolling(true)
+    setPollMsg(null)
+    try {
+      const res = await fetch("/api/system/ble-force-poll", { method: "POST" })
+      if (!res.ok) {
+        setPollMsg("Couldn't reach the Pi — try again in a moment.")
+      } else {
+        setPollMsg("Reading now…")
+        // Give the sampler ~8s to do its thing, then refresh the
+        // displayed values. Most state polls complete in 2-15s.
+        setTimeout(() => {
+          onRefresh()
+          setPollMsg(null)
+        }, 8_000)
+      }
+    } catch {
+      setPollMsg("Couldn't reach the Pi — try again in a moment.")
+    } finally {
+      setPolling(false)
+    }
+  }
+
   return (
     <div className="rounded-lg border border-white/5 bg-black/20 p-3 text-xs">
       <div className="mb-2 flex items-center justify-between">
@@ -1067,8 +1098,18 @@ function TelemetryOutputPanel({
             </span>
           )}
           <button
+            onClick={forcePoll}
+            disabled={polling || loading}
+            title="Ask the Pi to read your car's data right now"
+            className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-2 py-0.5 text-[10px] font-medium text-blue-400 hover:bg-blue-500/25 disabled:opacity-50"
+          >
+            {polling ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            Poll now
+          </button>
+          <button
             onClick={onRefresh}
             disabled={loading}
+            title="Reload the values from the Pi's database"
             className="inline-flex items-center gap-1 rounded bg-white/5 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-white/10 disabled:opacity-50"
           >
             {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
@@ -1076,6 +1117,9 @@ function TelemetryOutputPanel({
           </button>
         </div>
       </div>
+      {pollMsg && (
+        <p className="mb-2 text-[10px] text-blue-400/80">{pollMsg}</p>
+      )}
 
       {!hasSample && (
         <p className="text-slate-500">
