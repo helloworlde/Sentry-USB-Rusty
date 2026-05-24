@@ -312,14 +312,15 @@ async fn register_code_with_backend(
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    let fp = crate::update::get_fingerprint();
 
+    // Privacy: fingerprint deliberately omitted. The notification pairing
+    // identifies this device via its randomly-generated `device_id`; we no
+    // longer cross-link it to the telemetry-side hardware fingerprint.
     let body = serde_json::json!({
         "device_id": creds.device_id,
         "device_secret": creds.device_secret,
         "code": code,
         "hostname": hostname,
-        "fingerprint": fp,
     });
 
     let client = reqwest::Client::builder()

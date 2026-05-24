@@ -21,6 +21,7 @@ import { NetworkTab } from "@/pages/settings/NetworkTab"
 import { UpdatesTab } from "@/pages/settings/UpdatesTab"
 import { BackupsTab } from "@/pages/settings/BackupsTab"
 import { NotificationsTab } from "@/pages/settings/NotificationsTab"
+import { PrivacyTab } from "@/pages/settings/PrivacyTab"
 import { AboutTab } from "@/pages/settings/AboutTab"
 import type { PiStatus } from "@/lib/api"
 
@@ -30,6 +31,7 @@ const TABS = [
   "Updates",
   "Backups",
   "Notifications",
+  "Privacy",
   "About",
 ] as const
 type TabName = (typeof TABS)[number]
@@ -255,6 +257,7 @@ export default function Settings() {
       {activeTab === "Updates" && <UpdatesTab />}
       {activeTab === "Backups" && <BackupsTab onOpenRawConfig={handleOpenRawConfig} />}
       {activeTab === "Notifications" && <NotificationsTab />}
+      {activeTab === "Privacy" && <PrivacyTab />}
       {activeTab === "About" && (
         <AboutTab
           status={status}

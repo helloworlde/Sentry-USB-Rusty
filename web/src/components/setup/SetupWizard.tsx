@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight, Check, Loader2, AlertCircle, AlertTriangle }
 import { cn } from "@/lib/utils"
 import { SetupProgress } from "./SetupProgress"
 import { WelcomeStep } from "./steps/WelcomeStep"
+import { PrivacyStep } from "./steps/PrivacyStep"
 import { NetworkStep } from "./steps/NetworkStep"
 import { StorageStep } from "./steps/StorageStep"
 import { CommunityStep } from "./steps/CommunityStep"
@@ -141,14 +142,17 @@ function securityError(data: SetupFormData): string | null {
 }
 
 function getStepError(stepIdx: number, data: SetupFormData): string | null {
+  // Indices shifted by +1 from the original because the Privacy step was
+  // inserted at index 1 (between Welcome and Network).
   switch (stepIdx) {
-    case 1: return networkError(data)
-    case 2: return storageError(data)
-    // case 3 is the Community step — no validation needed (both can be unchecked)
-    case 4: return archiveError(data)
-    case 5: return keepAwakeError(data)
-    case 6: return notificationsError(data)
-    case 7: return securityError(data)
+    // case 1 is the Privacy step — no validation (opt-in is independent of wizard apply)
+    case 2: return networkError(data)
+    case 3: return storageError(data)
+    // case 4 is the Community step — no validation needed (both can be unchecked)
+    case 5: return archiveError(data)
+    case 6: return keepAwakeError(data)
+    case 7: return notificationsError(data)
+    case 8: return securityError(data)
     default: return null
   }
 }
@@ -244,6 +248,9 @@ function detectDestructiveChanges(
 
 const steps: StepDef[] = [
   { id: "welcome", title: "Welcome", component: WelcomeStep },
+  // Privacy disclosure runs right after Welcome so the user sees what's
+  // sent before anything outbound happens during setup (Art. 13 timing).
+  { id: "privacy", title: "Privacy", component: PrivacyStep },
   { id: "network", title: "Network", component: NetworkStep },
   { id: "storage", title: "Storage", component: StorageStep },
   { id: "community", title: "Community", component: CommunityStep },
