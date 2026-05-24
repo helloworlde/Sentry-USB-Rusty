@@ -35,8 +35,19 @@ export default function Drives() {
 
   const onTagsChange = useCallback(
     async (id: number, tags: string[]) => {
-      await setDriveTags(id, tags)
-      await list.refresh()
+      // Snapshot the previous tags so we can roll back if the PUT fails.
+      // Optimistic update keeps the popover snappy and avoids a full
+      // /api/drives refetch on every tag click. The backend invalidates
+      // the drive-list cache on set_drive_tags, so the next natural fetch
+      // (page revisit, manual refresh) rebuilds authoritatively.
+      const prev = list.drives.find((d) => d.id === id)?.tags ?? []
+      list.patchDriveTags(id, tags)
+      try {
+        await setDriveTags(id, tags)
+      } catch (e) {
+        list.patchDriveTags(id, prev)
+        throw e
+      }
     },
     [list],
   )

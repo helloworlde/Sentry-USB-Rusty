@@ -44,6 +44,11 @@ export interface DrivesListState {
   setFilters: (f: DrivesFilters) => void
   setSortDir: (d: "asc" | "desc") => void
   refresh: () => Promise<void>
+  // Patch the tags array on a single drive locally so the UI reflects an
+  // optimistic update without triggering a full /api/drives refetch. The
+  // backend cache invalidates itself on set_drive_tags, so the next natural
+  // refetch (e.g. navigation back to the page) will rebuild authoritatively.
+  patchDriveTags: (id: number, tags: string[]) => void
 }
 
 function readRange(params: URLSearchParams): DateRange {
@@ -238,6 +243,10 @@ export function useDrivesList(): DrivesListState {
     setRefreshTick((t) => t + 1)
   }
 
+  const patchDriveTags = (id: number, tags: string[]) => {
+    setDrives((prev) => prev.map((d) => (d.id === id ? { ...d, tags } : d)))
+  }
+
   return {
     drives,
     visible,
@@ -257,5 +266,6 @@ export function useDrivesList(): DrivesListState {
     setFilters,
     setSortDir,
     refresh,
+    patchDriveTags,
   }
 }
