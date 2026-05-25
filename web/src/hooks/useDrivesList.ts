@@ -5,6 +5,25 @@ import { fetchDrives, fetchRouteOverviews } from "@/api/drives"
 
 const PAGE_SIZE = 10
 
+// Module-scope cache for the Drives list. Survives the
+// component unmount/remount cycle as the user navigates
+// /drives → /drives/:id → /drives, so the list view paints
+// instantly on back-navigation instead of re-fetching from the
+// API every time. The cache is cleared by a full page reload.
+//
+// Cache hits within CACHE_STALE_MS skip the network fetch
+// entirely. Hits after that still render the cached data
+// immediately but trigger a silent background refresh so a
+// long-lived /drives session still picks up newly-processed
+// drives without forcing the user to manually reload.
+interface DrivesCache {
+  drives: DriveSummary[]
+  routes: RouteOverview[]
+  at: number
+}
+let listCache: DrivesCache | null = null
+const CACHE_STALE_MS = 30_000
+
 export type DateRange =
   | { kind: "preset"; preset: DatePreset }
   | { kind: "custom"; start: string; end: string }
@@ -152,9 +171,16 @@ function filterDrives(
 
 export function useDrivesList(): DrivesListState {
   const [params, setParams] = useSearchParams()
-  const [drives, setDrives] = useState<DriveSummary[]>([])
-  const [routes, setRoutes] = useState<RouteOverview[]>([])
-  const [loading, setLoading] = useState(true)
+  // Hydrate from the module cache when available — this is what
+  // makes back-navigation instant. Cold start (no cache yet) shows
+  // an empty list + loading spinner; cache hit paints immediately.
+  const [drives, setDrives] = useState<DriveSummary[]>(
+    () => listCache?.drives ?? [],
+  )
+  const [routes, setRoutes] = useState<RouteOverview[]>(
+    () => listCache?.routes ?? [],
+  )
+  const [loading, setLoading] = useState(listCache === null)
   const [error, setError] = useState<string | null>(null)
   const [refreshTick, setRefreshTick] = useState(0)
 
@@ -165,12 +191,30 @@ export function useDrivesList(): DrivesListState {
 
   useEffect(() => {
     let cancelled = false
-    /* eslint-disable-next-line react-hooks/set-state-in-effect */
-    setLoading(true)
+    const cacheFresh =
+      listCache !== null && Date.now() - listCache.at < CACHE_STALE_MS
+    // Back-navigation case: cache is fresh AND this is the
+    // first effect run after mount (refreshTick still 0). Skip
+    // the network entirely; the useState initializers already
+    // populated `drives`/`routes` from the cache.
+    if (cacheFresh && refreshTick === 0) {
+      return () => {
+        cancelled = true
+      }
+    }
+
+    // Cold start → show the spinner so the user sees we're working.
+    // Stale cache or manual refresh → keep rendering the previous
+    // data and fetch silently in the background (no spinner flash).
+    if (listCache === null) {
+      /* eslint-disable-next-line react-hooks/set-state-in-effect */
+      setLoading(true)
+    }
     setError(null)
     Promise.all([fetchDrives(), fetchRouteOverviews(20).catch(() => [])])
       .then(([d, r]) => {
         if (cancelled) return
+        listCache = { drives: d, routes: r, at: Date.now() }
         setDrives(d)
         setRoutes(r)
       })
@@ -312,6 +356,18 @@ export function useDrivesList(): DrivesListState {
 
   const patchDriveTags = (id: number, tags: string[]) => {
     setDrives((prev) => prev.map((d) => (d.id === id ? { ...d, tags } : d)))
+    // Mirror the change into the module cache so a /drives →
+    // /drives/:id → /drives round-trip still shows the new tag.
+    // Without this, navigating back would paint the pre-edit
+    // drives from the stale cache snapshot.
+    if (listCache) {
+      listCache = {
+        ...listCache,
+        drives: listCache.drives.map((d) =>
+          d.id === id ? { ...d, tags } : d,
+        ),
+      }
+    }
   }
 
   return {
