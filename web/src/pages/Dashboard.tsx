@@ -445,6 +445,25 @@ export default function Dashboard() {
           useFahrenheit={useFahrenheit}
           keepAwakeIdle={keepAwakeMode == null}
         />
+        {/* Car status overview — sits in the same row as System,
+            spans 2 tile columns. Shows last-known battery / cabin
+            temps / tire health as compact chips, with the tire-
+            pressure history chart hidden behind an expand toggle on
+            the Tires chip. The chart bundle (recharts ~380KB) stays
+            unloaded until the user expands it. Only mounts once we
+            have at least one BLE telemetry sample so users without
+            BLE pairing don't see an empty placeholder. */}
+        {carStatusSample && carStatusSample.ts != null && (
+          <div style={{ gridColumn: "span 2" }}>
+            <CarStatusCard
+              sample={carStatusSample}
+              latestDriveEnd={latestDriveEnd}
+              tireHistory={tireHistory ?? undefined}
+              useFahrenheit={useFahrenheit}
+              lockChimeName={activeChimeName}
+            />
+          </div>
+        )}
         <NetworkTile status={status} />
         <StorageTile
           status={status}
@@ -463,26 +482,6 @@ export default function Dashboard() {
         />
         {isAwayActive && <AwayModeTile />}
       </div>
-
-      {/* Car status overview — shows last-known battery / cabin temps
-          / tire health as compact chips, with the tire-pressure
-          history chart hidden behind an expand toggle on the Tires
-          chip. The chart bundle (recharts ~380KB) stays unloaded
-          until the user expands it.
-          Constrained to ~2 tile widths so on wide monitors the card
-          doesn't stretch into an awkwardly long strip. On narrow
-          viewports it shrinks naturally with the wrapper. */}
-      {carStatusSample && carStatusSample.ts != null && (
-        <div className="max-w-[640px]">
-          <CarStatusCard
-            sample={carStatusSample}
-            latestDriveEnd={latestDriveEnd}
-            tireHistory={tireHistory ?? undefined}
-            useFahrenheit={useFahrenheit}
-            lockChimeName={activeChimeName}
-          />
-        </div>
-      )}
     </div>
   )
 }
