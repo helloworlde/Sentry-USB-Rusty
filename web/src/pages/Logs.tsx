@@ -6,6 +6,11 @@ const logTabs = [
   { id: "archiveloop", label: "Archive Loop", url: "/api/logs/archiveloop" },
   { id: "setup", label: "Setup Log", url: "/api/logs/setup" },
   { id: "diagnostics", label: "Diagnostics", url: "/api/logs/diagnostics" },
+  // Live BLE state dump — service status, adapter pick, what the
+  // car-state observer thinks, sample DB counts, and the recently-
+  // filtered sampler journal lines. Built fresh every fetch by
+  // api/src/ble_debug.rs.
+  { id: "bluetooth", label: "Bluetooth", url: "/api/logs/bluetooth" },
 ]
 
 const SCROLL_THRESHOLD = 60
