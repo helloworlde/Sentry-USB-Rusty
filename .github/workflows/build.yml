@@ -70,7 +70,10 @@ jobs:
       - name: Install cross-compilation tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ${{ matrix.gcc }} brotli mold
+          # libdbus-1-dev + pkg-config are needed by `bluer`/`btleplug`
+          # (used by crates/tesla_ble for bluez D-Bus access). Without
+          # them `cargo test --workspace` fails to build libdbus-sys.
+          sudo apt-get install -y -qq ${{ matrix.gcc }} brotli mold libdbus-1-dev pkg-config
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -203,6 +206,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install bluez build deps
+        # `bluer`/`btleplug` (used by crates/tesla_ble) need libdbus-1
+        # headers + pkg-config to compile. Without these `cargo test
+        # --workspace` fails to build libdbus-sys.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libdbus-1-dev pkg-config
       - name: Ensure static dir exists
         run: |
           mkdir -p crates/sentryusb/static
