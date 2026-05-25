@@ -69,11 +69,40 @@ jobs:
 
       - name: Install cross-compilation tools
         run: |
-          sudo apt-get update -qq
           # libdbus-1-dev + pkg-config are needed by `bluer`/`btleplug`
-          # (used by crates/tesla_ble for bluez D-Bus access). Without
-          # them `cargo test --workspace` fails to build libdbus-sys.
-          sudo apt-get install -y -qq ${{ matrix.gcc }} brotli mold libdbus-1-dev pkg-config
+          # (used by crates/tesla_ble for bluez D-Bus access).
+          # Cross-compilation requires the TARGET arch's libdbus
+          # headers — host arch alone produces:
+          #   pkg-config has not been configured to support cross-compilation
+          # So enable arm64 + armhf foreign architectures and install
+          # both the host and target variants. armv6 piggybacks on the
+          # armhf packages (same EABI, slightly different ABI subset but
+          # libdbus's C headers are bit-identical).
+          sudo dpkg --add-architecture arm64
+          sudo dpkg --add-architecture armhf
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ${{ matrix.gcc }} brotli mold pkg-config \
+            libdbus-1-dev libdbus-1-dev:arm64 libdbus-1-dev:armhf
+
+      - name: Configure pkg-config for cross-compile
+        run: |
+          # pkg-config needs to be pointed at the target arch's .pc
+          # directory AND told that cross-compilation is OK
+          # (default refuses, on the theory that mixing host + target
+          # libs causes link-time disasters — which is exactly why we
+          # installed libdbus-1-dev:<arch> separately above).
+          case "${{ matrix.target }}" in
+            aarch64-*)
+              echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> "$GITHUB_ENV"
+              echo "PKG_CONFIG_SYSROOT_DIR=/" >> "$GITHUB_ENV"
+              ;;
+            armv7-*|arm-*)
+              echo "PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig" >> "$GITHUB_ENV"
+              echo "PKG_CONFIG_SYSROOT_DIR=/" >> "$GITHUB_ENV"
+              ;;
+          esac
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
 
       - name: Cache cargo registry
         uses: actions/cache@v5
