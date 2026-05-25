@@ -869,10 +869,10 @@ fn clock_is_sane() -> bool {
 /// within tolerance. Called from every success branch in tick() so
 /// any working sub-sample can fix the clock.
 fn try_sync_clock(meta: sample::ResponseMeta) {
-    if let (Some(vehicle_ts), Some(started)) =
-        (meta.vehicle_ts_secs, meta.request_started_at)
+    if let (Some(vehicle_ts_ms), Some(started)) =
+        (meta.vehicle_ts_ms, meta.request_started_at)
     {
-        clock_sync::maybe_set_clock_from_vehicle(vehicle_ts, started);
+        clock_sync::maybe_set_clock_from_vehicle(vehicle_ts_ms, started);
     }
 }
 

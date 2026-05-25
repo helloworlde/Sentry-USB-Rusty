@@ -32,7 +32,16 @@ use tracing::{info, warn};
 /// is < 5 minutes, assume one of those did its job and don't second-
 /// guess it. Above 5 minutes the clock is meaningfully wrong (typical
 /// non-RTC cold-boot states are years off, so this triggers cleanly).
-const ADJUSTMENT_THRESHOLD_SECS: i64 = 300;
+const ADJUSTMENT_THRESHOLD_MS: i64 = 300_000;
+
+/// Constant one-way latency from "car stamps timestamp" to "we read
+/// the response", in milliseconds. Empirically measured against an
+/// NTP-set reference clock — the actual delta clustered tightly
+/// around -55ms with low variance regardless of round-trip time.
+/// Tesla stamps the timestamp just before transmitting the response,
+/// so this is essentially the BLE response transit time. Adding it
+/// brings our clock-sync accuracy from ~54ms to ~12ms vs NTP.
+const RESPONSE_LATENCY_COMPENSATION_MS: i64 = 50;
 
 /// Parse the RFC 3339 / ISO 8601 timestamp Tesla emits in state
 /// responses (e.g. `"2026-05-25T04:31:59.107Z"`). Returns unix-secs.
@@ -40,6 +49,33 @@ const ADJUSTMENT_THRESHOLD_SECS: i64 = 300;
 /// We don't use chrono here to avoid adding a heavy dep for one
 /// fixed-format parse. The format Tesla uses is rigid: YYYY-MM-DD
 /// 'T' HH:MM:SS '.' fff 'Z' (UTC, always). Anything else returns None.
+/// Like `parse_rfc3339_secs` but preserves the fractional-second
+/// precision Tesla emits (e.g. `.794Z` → 794 milliseconds). Needed
+/// because second-rounding alone introduces up to 999ms of error,
+/// which dominates the actual ~50ms BLE latency we're trying to
+/// compensate for.
+pub fn parse_rfc3339_ms(s: &str) -> Option<i64> {
+    let secs = parse_rfc3339_secs(s)?;
+    let frac_ms = if let Some(dot_pos) = s.find('.') {
+        // `s` ends with 'Z' (parse_rfc3339_secs guarantees), so the
+        // fractional part is between '.' and that 'Z'.
+        let frac_str = &s[dot_pos + 1..s.len() - 1];
+        match frac_str.parse::<u32>() {
+            Ok(n) => match frac_str.len() {
+                1 => (n as i64) * 100,
+                2 => (n as i64) * 10,
+                3 => n as i64,
+                // Microsecond/nanosecond precision — truncate to ms.
+                len => (n as i64) / 10_i64.pow((len - 3) as u32),
+            },
+            Err(_) => 0,
+        }
+    } else {
+        0
+    };
+    Some(secs * 1000 + frac_ms)
+}
+
 pub fn parse_rfc3339_secs(s: &str) -> Option<i64> {
     // Expected length: "2026-05-25T04:31:59.107Z" = 24 chars typically.
     // Accept either with or without fractional seconds, both ending Z.
@@ -78,52 +114,52 @@ pub fn parse_rfc3339_secs(s: &str) -> Option<i64> {
 /// it to vehicle time. Optionally persist to RTC.
 ///
 /// Args:
-///   * `vehicle_ts_secs` — the timestamp Tesla sent us
+///   * `vehicle_ts_ms` — the timestamp Tesla sent us, in ms-since-epoch
+///     (includes the fractional seconds Tesla provides, e.g. `.794Z`)
 ///   * `request_started_at` — monotonic Instant from before we sent
-///     the BLE request. Kept around for diagnostic logging (RTT) even
-///     though we don't apply it as a correction — see comment below.
+///     the BLE request, used for diagnostic RTT logging
 ///
 /// Returns true if we adjusted the clock; false if delta was below
 /// threshold (normal case once everything's synced).
 pub fn maybe_set_clock_from_vehicle(
-    vehicle_ts_secs: i64,
+    vehicle_ts_ms: i64,
     request_started_at: Instant,
 ) -> bool {
-    let local_secs = SystemTime::now()
+    let local_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    // Empirically (validated against NTP-set reference time), Tesla
-    // stamps the response timestamp just before transmitting it —
-    // NOT at the midpoint of processing. So the actual one-way
-    // latency from car-stamp to our-receive is small (~50 ms in
-    // measurements), already small enough that our second-resolution
-    // clock_settime ignores it. The earlier half-RTT correction
-    // overshoot by 700-2000 ms; using the raw timestamp lands
-    // within ~50-100 ms of NTP-set time. We still measure RTT for
-    // diagnostic logging.
+    // Empirically (validated against NTP-set reference clock, see
+    // README), Tesla stamps the response timestamp just before
+    // transmitting — NOT at the midpoint of processing. The one-way
+    // latency from "car stamps" to "we receive" is a consistent
+    // ~50ms regardless of RTT. Adding it brings us from ~54ms avg
+    // error (no comp) down to ~12ms avg error (with comp).
     let rtt_ms = request_started_at.elapsed().as_millis() as i64;
-    let corrected_target = vehicle_ts_secs;
+    let corrected_target_ms = vehicle_ts_ms + RESPONSE_LATENCY_COMPENSATION_MS;
 
-    let delta = corrected_target - local_secs;
-    if delta.abs() < ADJUSTMENT_THRESHOLD_SECS {
+    let delta_ms = corrected_target_ms - local_ms;
+    if delta_ms.abs() < ADJUSTMENT_THRESHOLD_MS {
         // Already close enough — leave it alone. Avoids fighting
         // NTP / RTC adjustments that are doing their job.
         return false;
     }
 
     info!(
-        "system clock differs from vehicle by {}s (local={}, vehicle={}, rtt={}ms); \
+        "system clock differs from vehicle by {}ms (local={}ms, vehicle={}ms, rtt={}ms); \
          adjusting to vehicle time",
-        delta, local_secs, corrected_target, rtt_ms
+        delta_ms, local_ms, corrected_target_ms, rtt_ms
     );
 
-    // Actually set the system clock. Requires CAP_SYS_TIME; the
-    // telemetry daemon runs as root so this works.
+    // Actually set the system clock with millisecond precision via
+    // tv_nsec. Requires CAP_SYS_TIME; the telemetry daemon runs as
+    // root so this works.
+    let secs = corrected_target_ms / 1000;
+    let ms_remainder = corrected_target_ms % 1000;
     let ts = libc::timespec {
-        tv_sec: corrected_target as libc::time_t,
-        tv_nsec: 0,
+        tv_sec: secs as libc::time_t,
+        tv_nsec: (ms_remainder * 1_000_000) as i64,
     };
     let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
     if rc != 0 {

@@ -83,12 +83,14 @@ impl ShiftState {
 #[derive(Default, Clone, Copy)]
 pub struct ResponseMeta {
     /// Tesla's wall-clock timestamp from the response body, parsed
-    /// from the RFC 3339 `timestamp` field. None when not present or
-    /// unparseable. Used by `clock_sync::maybe_set_clock_from_vehicle`.
-    pub vehicle_ts_secs: Option<i64>,
+    /// from the RFC 3339 `timestamp` field to ms-since-epoch
+    /// precision (Tesla includes fractional seconds like `.794Z` —
+    /// we preserve them so clock-sync doesn't introduce ~500ms of
+    /// rounding error). None when not present or unparseable.
+    /// Used by `clock_sync::maybe_set_clock_from_vehicle`.
+    pub vehicle_ts_ms: Option<i64>,
     /// Monotonic Instant from just before we sent the BLE request.
-    /// Used to compute RTT for latency-compensating the clock
-    /// adjustment (we add half the RTT to the vehicle timestamp).
+    /// Used for diagnostic RTT logging when clock-sync fires.
     pub request_started_at: Option<std::time::Instant>,
 }
 
@@ -324,9 +326,9 @@ pub async fn sample_tires(vin: &str, adapter: &str) -> Result<TiresResult> {
 /// compute round-trip-time for latency compensation.
 fn build_meta(parsed: &Value, started: std::time::Instant) -> ResponseMeta {
     let ts = pick_string(parsed, &["timestamp"])
-        .and_then(|s| crate::clock_sync::parse_rfc3339_secs(&s));
+        .and_then(|s| crate::clock_sync::parse_rfc3339_ms(&s));
     ResponseMeta {
-        vehicle_ts_secs: ts,
+        vehicle_ts_ms: ts,
         request_started_at: Some(started),
     }
 }
