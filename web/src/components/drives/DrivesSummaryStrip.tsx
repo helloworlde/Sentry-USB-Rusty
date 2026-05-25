@@ -1,9 +1,5 @@
 import { Activity, Clock, Gauge, MapPin, Sparkles } from "lucide-react"
-import {
-  formatDuration,
-  formatMiles,
-  formatPercent,
-} from "@/lib/drive-format"
+import { formatDuration, formatPercent } from "@/lib/drive-format"
 import type {
   DatePreset,
   DateRange,
@@ -27,10 +23,28 @@ function rangeLabel(range: DateRange): string {
   return PRESET_LABELS[range.preset] ?? "Last 7 days"
 }
 
+/** Aggregate distance with thousands separators + 1 decimal, honouring
+ *  the user's metric preference. Distinct from formatDistance() which
+ *  uses 2 decimals — at scale (e.g. 1,234.5 mi over a month) one
+ *  decimal reads cleaner. */
+function formatAggregateDistance(
+  mi: number,
+  km: number,
+  metric: boolean,
+): string {
+  const value = metric ? km : mi
+  const unit = metric ? "km" : "mi"
+  return `${value.toLocaleString(undefined, {
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1,
+  })} ${unit}`
+}
+
 interface DrivesSummaryStripProps {
   stats: DrivesFilteredStats
   range: DateRange
   loading: boolean
+  metric: boolean
 }
 
 /**
@@ -45,6 +59,7 @@ export function DrivesSummaryStrip({
   stats,
   range,
   loading,
+  metric,
 }: DrivesSummaryStripProps) {
   // While the initial fetch is in flight render a skeleton row so the
   // header doesn't pop in. On subsequent refreshes (refresh after
@@ -78,7 +93,11 @@ export function DrivesSummaryStrip({
       <StatCell
         icon={<Gauge className="h-3.5 w-3.5" />}
         label="Distance"
-        value={formatMiles(stats.totalDistanceMi, 1)}
+        value={formatAggregateDistance(
+          stats.totalDistanceMi,
+          stats.totalDistanceKm,
+          metric,
+        )}
       />
       <Divider />
       <StatCell

@@ -140,6 +140,7 @@ export default function Drives() {
           stats={list.filteredStats}
           range={list.range}
           loading={list.loading}
+          metric={metric}
         />
       </div>
 
