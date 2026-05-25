@@ -433,7 +433,6 @@ export default function Dashboard() {
           // eslint-disable-next-line react-hooks/refs -- same as above
           processEta={processProgress ? computeETA(processProgress.current, processProgress.total, processHistoryRef.current) : null}
         />
-        <KeepAwakeTile />
         {isAwayActive && <AwayModeTile />}
       </div>
 
@@ -729,15 +728,37 @@ function ActivityTile({
   archiveEta: string | null
   processEta: string | null
 }) {
+  // Keep-Awake is rendered as a sub-section inside the Activity card
+  // (used to be its own tile next door, but the dead space below
+  // Activity made the grid look unbalanced). The hook is only
+  // consumed here now.
+  const keepAwake = useKeepAwake()
+  const keepAwakeVisible = keepAwake.mode != null
+
   const phase = archiveProgress
     ? ("archiving" as const)
     : processing
     ? ("processing" as const)
     : null
-  const badge = phase ? (
+  const phasePill = phase ? (
     <Pill kind={phase === "archiving" ? "accent" : "sky"}>
       <LiveDot /> {phase}
     </Pill>
+  ) : null
+
+  // When Keep Awake is showing, the stats row gets crowded so the
+  // FSD link migrates to the top-right header action slot. When
+  // Keep Awake is hidden, FSD stays inline at the end of the stats
+  // row — same look as before this card merged.
+  const fsdLink = driveStats && driveStats.fsd_engaged_ms > 0 ? (
+    <Link
+      to="/fsd"
+      className="flex items-center gap-1 text-[10px] text-emerald-400 transition-colors hover:text-emerald-300"
+    >
+      <Zap className="h-3 w-3" />
+      FSD {driveStats.fsd_percent}%
+      <ChevronRight className="h-3 w-3 text-slate-600" />
+    </Link>
   ) : null
 
   return (
@@ -745,7 +766,8 @@ function ActivityTile({
       icon={<Zap className="h-4 w-4" />}
       halo="violet"
       title="Activity"
-      badge={badge}
+      badge={phasePill}
+      action={keepAwakeVisible ? fsdLink : null}
     >
       {driveStats ? (
         driveStats.processed_count === 0 && driveStats.drives_count === 0 ? (
@@ -775,15 +797,8 @@ function ActivityTile({
                 </span>{" "}
                 <span className="text-slate-500">{metric ? "km" : "mi"}</span>
               </span>
-              {driveStats.fsd_engaged_ms > 0 && (
-                <Link
-                  to="/fsd"
-                  className="ml-auto flex items-center gap-1 text-[10px] text-emerald-400 transition-colors hover:text-emerald-300"
-                >
-                  <Zap className="h-3 w-3" />
-                  FSD {driveStats.fsd_percent}%
-                  <ChevronRight className="h-3 w-3 text-slate-600" />
-                </Link>
+              {!keepAwakeVisible && fsdLink && (
+                <span className="ml-auto">{fsdLink}</span>
               )}
             </div>
 
@@ -814,6 +829,13 @@ function ActivityTile({
         <>
           <div className="h-3 w-1/2 animate-pulse rounded bg-slate-800" />
           <div className="h-1.5 w-full animate-pulse rounded-full bg-slate-800" />
+        </>
+      )}
+
+      {keepAwakeVisible && (
+        <>
+          <TileDivider />
+          <KeepAwakeInline keepAwake={keepAwake} />
         </>
       )}
     </StatusTile>
@@ -867,18 +889,27 @@ const KEEP_AWAKE_DURATIONS = [
   { label: "2h", value: 120 },
 ]
 
-function KeepAwakeTile() {
-  const { status, mode, start, stop } = useKeepAwake()
+/**
+ * Keep-Awake sub-section rendered inline inside the Activity tile
+ * (below the clips/drives/distance stats row and a tile divider).
+ * Same visual + behavioural state machine as the old standalone
+ * KeepAwakeTile: animated icon when active/pending, value reflects
+ * remaining time or mode state, action button is Start (with
+ * duration dropdown) when manual + idle, Stop when active/pending,
+ * nothing otherwise.
+ *
+ * Caller (ActivityTile) gates rendering on `mode != null` so this
+ * component can assume the feature is configured.
+ */
+function KeepAwakeInline({ keepAwake }: { keepAwake: ReturnType<typeof useKeepAwake> }) {
+  const { status, mode, start, stop } = keepAwake
   const [showDurations, setShowDurations] = useState(false)
-
-  if (!mode) return null
 
   const isActive = status.state === "active"
   const isPending = status.state === "pending"
   const isIdle = status.state === "idle"
   const remainingMin = status.remaining_sec ? Math.ceil(status.remaining_sec / 60) : 0
 
-  const halo: Halo = isActive ? "rose" : isPending ? "amber" : "blue"
   const value = isActive
     ? `${remainingMin}m`
     : isPending
@@ -894,60 +925,69 @@ function KeepAwakeTile() {
     ? "Activates on interaction"
     : "Tap to start"
 
-  return (
-    <StatusTile
-      icon={
-        isActive ? (
-          <HeartPulse className="h-4 w-4 animate-pulse" />
-        ) : isPending ? (
-          <Timer className="h-4 w-4 animate-pulse" />
-        ) : (
-          <HeartPulse className="h-4 w-4" />
-        )
-      }
-      halo={halo}
-      title="Keep Awake"
-      action={
-        mode === "manual" && isIdle ? (
-          <div className="relative">
-            <button
-              onClick={() => setShowDurations(!showDurations)}
-              className="rounded-lg bg-blue-500/20 px-2.5 py-1 text-[11px] font-medium text-blue-400 transition-colors hover:bg-blue-500/30"
-            >
-              Start
-            </button>
-            {showDurations && (
-              <div className="absolute right-0 top-full z-10 mt-1 w-28 rounded-lg border border-white/10 bg-slate-900 p-1 shadow-xl">
-                {KEEP_AWAKE_DURATIONS.map((opt) => (
-                  <button
-                    key={opt.value}
-                    onClick={() => {
-                      start(opt.value)
-                      setShowDurations(false)
-                    }}
-                    className="w-full rounded-md px-3 py-1.5 text-left text-xs text-slate-300 hover:bg-white/5"
-                  >
-                    {opt.label}
-                  </button>
-                ))}
-              </div>
-            )}
+  const iconColor = isActive
+    ? "text-rose-400"
+    : isPending
+    ? "text-amber-400"
+    : "text-blue-400"
+
+  const actionBtn =
+    mode === "manual" && isIdle ? (
+      <div className="relative">
+        <button
+          onClick={() => setShowDurations(!showDurations)}
+          className="rounded-lg bg-blue-500/20 px-2.5 py-1 text-[11px] font-medium text-blue-400 transition-colors hover:bg-blue-500/30"
+        >
+          Start
+        </button>
+        {showDurations && (
+          <div className="absolute right-0 top-full z-10 mt-1 w-28 rounded-lg border border-white/10 bg-slate-900 p-1 shadow-xl">
+            {KEEP_AWAKE_DURATIONS.map((opt) => (
+              <button
+                key={opt.value}
+                onClick={() => {
+                  start(opt.value)
+                  setShowDurations(false)
+                }}
+                className="w-full rounded-md px-3 py-1.5 text-left text-xs text-slate-300 hover:bg-white/5"
+              >
+                {opt.label}
+              </button>
+            ))}
           </div>
-        ) : isActive || isPending ? (
-          <button
-            onClick={stop}
-            className="rounded-lg bg-red-500/15 px-2.5 py-1 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/25"
-          >
-            Stop
-          </button>
-        ) : null
-      }
-    >
-      <div className="flex items-baseline gap-2">
-        <span className="text-lg font-semibold text-slate-100">{value}</span>
+        )}
+      </div>
+    ) : isActive || isPending ? (
+      <button
+        onClick={stop}
+        className="rounded-lg bg-red-500/15 px-2.5 py-1 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/25"
+      >
+        Stop
+      </button>
+    ) : null
+
+  return (
+    <div>
+      <div className="flex items-center gap-2">
+        <span className={`inline-flex ${iconColor}`}>
+          {isActive ? (
+            <HeartPulse className="h-3.5 w-3.5 animate-pulse" />
+          ) : isPending ? (
+            <Timer className="h-3.5 w-3.5 animate-pulse" />
+          ) : (
+            <HeartPulse className="h-3.5 w-3.5" />
+          )}
+        </span>
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+          Keep Awake
+        </span>
+        {actionBtn && <span className="ml-auto">{actionBtn}</span>}
+      </div>
+      <div className="mt-1 flex items-baseline gap-2">
+        <span className="text-base font-semibold text-slate-100">{value}</span>
       </div>
       <p className="t-xs">{sub}</p>
-    </StatusTile>
+    </div>
   )
 }
 
