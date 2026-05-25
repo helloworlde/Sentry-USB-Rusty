@@ -71,14 +71,18 @@ fn build_request(keypair: &KeyPair, domain: Domain) -> Vec<u8> {
 }
 
 fn parse_response(bytes: &[u8], domain: Domain) -> Result<SessionInfoResponse> {
+    debug!("session-info RX hex: {}", hex::encode(bytes));
     let routable =
         RoutableMessage::decode(bytes).context("decode outer Routable")?;
+    debug!("session-info RX decoded: {:#?}", routable);
     let raw = match routable.payload {
         Some(routable_message::Payload::SessionInfo(b)) => b,
         Some(other) => bail!("expected session_info, got {:?}", other),
         None => bail!(
-            "response has no payload (signedMessageStatus={:?})",
-            routable.signed_message_status
+            "response has no payload (signed_message_status={:?}, to={:?}, from={:?})",
+            routable.signed_message_status,
+            routable.to_destination,
+            routable.from_destination
         ),
     };
     let parsed =
