@@ -27,12 +27,6 @@ export async function setDriveTags(id: string | number, tags: string[]): Promise
   if (!res.ok) throw new Error(`set tags ${id}: ${res.status}`)
 }
 
-export async function fetchTags(): Promise<string[]> {
-  const res = await fetch("/api/drives/tags")
-  if (!res.ok) throw new Error(`tags: ${res.status}`)
-  return res.json()
-}
-
 export async function triggerProcessNew(): Promise<void> {
   const res = await fetch("/api/drives/process", { method: "POST" })
   if (!res.ok) {

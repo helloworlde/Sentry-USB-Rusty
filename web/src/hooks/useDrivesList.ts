@@ -3,7 +3,7 @@ import { useSearchParams } from "react-router-dom"
 import type { DriveSummary, RouteOverview } from "@/types/drives"
 import { fetchDrives, fetchRouteOverviews } from "@/api/drives"
 
-export const PAGE_SIZE = 5
+const PAGE_SIZE = 5
 
 export type DateRange =
   | { kind: "preset"; preset: DatePreset }

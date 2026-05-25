@@ -109,7 +109,7 @@ export interface StorageBreakdown {
   free_space: number
 }
 
-export interface FSDDayStats {
+interface FSDDayStats {
   date: string
   dayName: string
   disengagements: number
