@@ -204,18 +204,52 @@ pub async fn ble_enabled_set(
     }
 }
 
-/// Return the lowest-numbered `hci*` device that isn't `hci0`, if
-/// any exists. `hci0` is always the Pi's onboard radio; any other
-/// entry under `/sys/class/bluetooth/` is necessarily an external
-/// USB dongle. Used by the first-time-enable auto-select to pick
-/// the better radio without bothering the user.
+/// Classify a BT adapter as "onboard" (Pi built-in radio) or
+/// "external" (USB dongle) by reading the manufacturer ID from
+/// /sys/class/bluetooth/<id>/manufacturer. The kernel writes the
+/// decimal Bluetooth SIG company ID there.
+///
+/// Pi onboard radios are always Cypress (305) on Pi 4 / Pi 5 /
+/// Zero 2W, or Broadcom (15) on older Pis. Anything else — Realtek
+/// (93), Intel (2), CSR (10), etc. — is necessarily a USB dongle.
+///
+/// We can't classify by hci index: a USB dongle plugged in early
+/// can grab hci0 and push the onboard radio to hci1. That
+/// mislabeling has already caused at least one round of "the
+/// onboard radio has issues" testing that was actually hitting the
+/// external dongle the whole time.
+pub fn adapter_source(id: &str) -> &'static str {
+    let path = format!("/sys/class/bluetooth/{id}/manufacturer");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        // Unreadable → safest fallback is "external": the auto-select
+        // logic for first-time enable will then pick this adapter and
+        // the UI will show it as a USB dongle, which is at worst
+        // visually wrong but won't accidentally claim "this is the
+        // built-in radio" for an unknown device.
+        Err(_) => return "external",
+    };
+    match raw.trim().parse::<u32>().unwrap_or(0) {
+        15 | 305 => "onboard",
+        _ => "external",
+    }
+}
+
+/// Return the first detected external (non-Pi-onboard) BT adapter,
+/// if any. Used by the first-time-enable auto-select to pick the
+/// USB dongle without bothering the user, on the assumption that if
+/// the user has a dongle plugged in they want to use it. Classifies
+/// by silicon vendor rather than hci index — see `adapter_source`.
 fn first_external_adapter() -> Option<String> {
     let entries = std::fs::read_dir("/sys/class/bluetooth").ok()?;
     let mut ids: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("hci") && name != "hci0" && !name.contains(':') {
+            if name.starts_with("hci")
+                && !name.contains(':')
+                && adapter_source(&name) == "external"
+            {
                 Some(name)
             } else {
                 None
@@ -649,10 +683,13 @@ pub async fn ble_force_poll(
 /// }
 /// ```
 ///
-/// `source` heuristic: `onboard` for hci0 (always the Pi's built-in
-/// chip), `external` for hci1+. Not perfect (you could in theory
-/// disable hci0 via rfkill) but matches reality for every realistic
-/// Pi setup.
+/// `source` is classified by the silicon vendor (read from
+/// `/sys/class/bluetooth/<id>/manufacturer`) — `onboard` for
+/// Cypress/Broadcom (the Pi built-in chips), `external` for
+/// anything else. Index-based labeling (`hci0 = onboard`) is
+/// unreliable: a USB dongle plugged in early can grab hci0 and
+/// push the onboard radio to hci1, leading to "the onboard radio
+/// has issues" reports that actually point at the dongle.
 pub async fn ble_adapters(
     State(_s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -676,7 +713,7 @@ pub async fn ble_adapters(
             ))
             .ok()
             .map(|s| s.trim().to_string());
-            let source = if id == "hci0" { "onboard" } else { "external" };
+            let source = adapter_source(&id);
             adapters.push(serde_json::json!({
                 "id": id,
                 "source": source,
