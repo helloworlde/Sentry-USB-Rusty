@@ -76,12 +76,17 @@ fn build_request() -> Vec<u8> {
 /// Decode the Routable wrapper, then the VCSEC FromVCSECMessage,
 /// then extract the VehicleStatus.
 fn parse_response(bytes: &[u8]) -> Result<VehicleStatus> {
+    debug!("RX hex: {}", hex::encode(bytes));
     let routable =
         RoutableMessage::decode(bytes).context("decode outer Routable")?;
+    debug!("RX decoded: {:#?}", routable);
     let inner = match routable.payload {
         Some(routable_message::Payload::ProtobufMessageAsBytes(b)) => b,
         Some(other) => bail!("unexpected payload variant: {:?}", other),
-        None => bail!("response has no payload"),
+        None => bail!(
+            "response has no payload (signedMessageStatus={:?})",
+            routable.signed_message_status
+        ),
     };
     let vcsec_msg =
         FromVcsecMessage::decode(inner.as_slice()).context("decode FromVCSECMessage")?;

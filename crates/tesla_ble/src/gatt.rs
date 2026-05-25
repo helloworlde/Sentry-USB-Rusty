@@ -81,7 +81,12 @@ impl Connection {
         // — Tesla's preferred max.
         const MTU: usize = 247;
         let chunks = chunks_for_mtu(&framed, MTU);
-        debug!("sending {} bytes in {} chunk(s)", framed.len(), chunks.len());
+        debug!(
+            "TX framed ({} bytes in {} chunk(s)): {}",
+            framed.len(),
+            chunks.len(),
+            hex::encode(&framed)
+        );
         for chunk in chunks {
             self.peripheral
                 .write(&self.tx_char, chunk, WriteType::WithoutResponse)
@@ -93,6 +98,7 @@ impl Connection {
         timeout(wait, async {
             loop {
                 if let Some(payload) = try_unframe(&mut self.rx_buffer)? {
+                    debug!("unframed payload ({} bytes): {}", payload.len(), hex::encode(&payload));
                     return Ok::<_, anyhow::Error>(payload);
                 }
                 let Some(n) = self.rx_stream.next().await else {
@@ -102,6 +108,7 @@ impl Connection {
                     debug!("ignoring notification on other char {}", n.uuid);
                     continue;
                 }
+                debug!("RX chunk ({} bytes): {}", n.value.len(), hex::encode(&n.value));
                 self.rx_buffer.extend_from_slice(&n.value);
             }
         })
