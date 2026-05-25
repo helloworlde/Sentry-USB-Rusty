@@ -104,6 +104,12 @@ enum Command {
         state: VehicleDataState,
         reply: oneshot::Sender<Result<Vec<u8>>>,
     },
+    /// Unauthenticated body-controller-state query. Runs through the
+    /// held GATT connection (not a new one) so it doesn't fight the
+    /// authenticated queries for bluez or kick the persistent slot.
+    BodyController {
+        reply: oneshot::Sender<Result<crate::proto::vcsec::VehicleStatus>>,
+    },
     Shutdown,
 }
 
@@ -141,6 +147,10 @@ impl DomainSession {
 struct SessionState {
     keypair: KeyPair,
     vin: String,
+    /// Configured `BLE_ADAPTER` from sentryusb.conf — None means
+    /// "let btleplug pick the first one." Mirrors the config field
+    /// the api crate reads.
+    adapter_name: Option<String>,
     conn: Option<Connection>,
     domains: HashMap<Domain, DomainSession>,
     /// Current reconnect backoff. Doubles on each failed connect.
@@ -153,11 +163,21 @@ impl PersistentSession {
     /// Spawn the background session task and return a handle.
     /// Doesn't itself trigger a connection — the first `query()`
     /// call kicks that off.
-    pub fn start(keypair: KeyPair, vin: String) -> Self {
+    ///
+    /// `adapter_name` accepts a string like `"hci1"` to force a
+    /// specific BLE adapter (matches the `BLE_ADAPTER` config in
+    /// sentryusb.conf). `None` or an empty string lets btleplug
+    /// pick the first one it finds.
+    pub fn start(
+        keypair: KeyPair,
+        vin: String,
+        adapter_name: Option<String>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let state = SessionState {
             keypair,
             vin,
+            adapter_name,
             conn: None,
             domains: HashMap::new(),
             backoff: RECONNECT_BACKOFF_MIN,
@@ -195,6 +215,22 @@ impl PersistentSession {
     /// error.
     pub async fn shutdown(&self) {
         let _ = self.cmd_tx.send(Command::Shutdown).await;
+    }
+
+    /// Unauthenticated body-controller-state query. Runs through
+    /// the held GATT connection — no new scan + connect, no
+    /// competition with the authenticated state queries that share
+    /// the same persistent session. Used by the telemetry sampler's
+    /// Quiet-mode poll (sleep-safe; doesn't wake the car).
+    pub async fn body_controller_state(
+        &self,
+    ) -> Result<crate::proto::vcsec::VehicleStatus> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::BodyController { reply: tx })
+            .await
+            .context("PersistentSession background task has stopped")?;
+        rx.await.context("session task dropped the reply channel")?
     }
 
     // -------------------------------------------------------------
@@ -265,20 +301,12 @@ async fn run_session_task(
                 reply,
             } => {
                 let result = query_with_refresh_retry(&mut state, domain, vds).await;
-                if result.is_err() {
-                    // Transport-level failures should force a fresh
-                    // connect on the next query. Domain-fault failures
-                    // already cleared their domain state inside
-                    // try_query_once.
-                    if state.conn.is_some() && matches!(result.as_ref(), Err(e) if is_transport_error(e)) {
-                        warn!("PersistentSession: connection lost ({:?}), dropping for reconnect", result.as_ref().err());
-                        if let Some(conn) = state.conn.take() {
-                            conn.close().await;
-                        }
-                        state.domains.clear();
-                        state.connected_at = None;
-                    }
-                }
+                handle_transport_error_if_any(&mut state, &result).await;
+                let _ = reply.send(result);
+            }
+            Command::BodyController { reply } => {
+                let result = handle_body_controller(&mut state).await;
+                handle_transport_error_if_any(&mut state, &result).await;
                 let _ = reply.send(result);
             }
             Command::Shutdown => break,
@@ -532,12 +560,52 @@ async fn try_query_once(
     Ok(QueryOutcome::Plaintext(plaintext))
 }
 
+/// Drops the held connection if `result` looks like a transport
+/// failure (link dropped, BLE write to a closed handle, etc.). Next
+/// command triggers a fresh scan + connect. Protocol-level faults
+/// (INVALID_SIGNATURE, etc.) are handled separately inside the
+/// query/body_controller handlers and don't drop the connection.
+async fn handle_transport_error_if_any<T>(
+    state: &mut SessionState,
+    result: &Result<T>,
+) {
+    if let Err(e) = result {
+        if state.conn.is_some() && is_transport_error(e) {
+            warn!(
+                "PersistentSession: connection lost ({:?}), dropping for reconnect",
+                e
+            );
+            if let Some(conn) = state.conn.take() {
+                conn.close().await;
+            }
+            state.domains.clear();
+            state.connected_at = None;
+        }
+    }
+}
+
+/// Run a body-controller-state query through the held connection.
+/// Mirrors `crate::body_controller::query` but uses the persistent
+/// session's connection so we don't open a competing one and
+/// trigger the bluez races that the per-call body-controller path
+/// kept hitting.
+async fn handle_body_controller(
+    state: &mut SessionState,
+) -> Result<crate::proto::vcsec::VehicleStatus> {
+    ensure_connected(state).await?;
+    let conn = state
+        .conn
+        .as_mut()
+        .context("ensure_connected returned without a connection")?;
+    crate::body_controller::query(conn).await
+}
+
 async fn ensure_connected(state: &mut SessionState) -> Result<()> {
     if state.conn.is_some() {
         return Ok(());
     }
 
-    let adapter = scan::first_adapter()
+    let adapter = scan::adapter_by_name(state.adapter_name.as_deref())
         .await
         .context("locating BLE adapter")?;
     // 30s scan window matches what the one-shot examples use; covers

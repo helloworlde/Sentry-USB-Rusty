@@ -34,6 +34,49 @@ pub async fn first_adapter() -> Result<Adapter> {
         .context("no BLE adapter available — is bluez running?")
 }
 
+/// Pick a specific adapter by hci name (e.g. `"hci1"`). Falls back to
+/// `first_adapter()` if `name` is `None`, empty, or doesn't match any
+/// available adapter — the fallback is logged but not an error,
+/// because the wrong adapter on a misconfigured system is still
+/// better than refusing to sample at all.
+pub async fn adapter_by_name(name: Option<&str>) -> Result<Adapter> {
+    let target = name.map(str::trim).filter(|s| !s.is_empty());
+    let Some(target) = target else {
+        return first_adapter().await;
+    };
+    let manager = Manager::new()
+        .await
+        .context("creating btleplug Manager")?;
+    let adapters = manager
+        .adapters()
+        .await
+        .context("listing BLE adapters")?;
+    for adapter in &adapters {
+        // btleplug's adapter_info() returns a string like
+        // "hci0 (00:11:22:...)" — we only care about the leading
+        // hci index, so substring-match.
+        let info = adapter
+            .adapter_info()
+            .await
+            .unwrap_or_else(|_| String::new());
+        if info.contains(target) {
+            return Ok(adapter.clone());
+        }
+    }
+    info!(
+        "configured BLE_ADAPTER={} not found among {:?}; falling back to first",
+        target,
+        // adapter_info is async so we can't easily list inside the
+        // log line without another loop; the count is the cheap
+        // diagnostic.
+        adapters.len()
+    );
+    adapters
+        .into_iter()
+        .next()
+        .context("no BLE adapter available — is bluez running?")
+}
+
 /// Scan until the given VIN's beacon is found or `timeout_dur` elapses.
 pub async fn scan_for_vin(
     adapter: &Adapter,

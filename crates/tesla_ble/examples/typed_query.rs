@@ -34,7 +34,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let keypair = KeyPair::load(&key_path)?;
-    let session = PersistentSession::start(keypair, vin);
+    // None = let btleplug pick the first adapter (host default).
+    // Tests that need a specific adapter would pass Some("hci1").
+    let session = PersistentSession::start(keypair, vin, None);
 
     println!("\n--- climate ---");
     match session.get_climate().await {

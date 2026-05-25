@@ -15,8 +15,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use sentryusb_tesla_ble::{
-    body_controller, gatt::Connection, keys::KeyPair, manager::PersistentSession,
-    proto::car_server, scan,
+    keys::KeyPair, manager::PersistentSession, proto::car_server,
 };
 use tracing::{info, warn};
 
@@ -189,26 +188,16 @@ pub async fn sample_tires_ble(session: &PersistentSession) -> Result<TiresResult
 }
 
 /// `body-controller-state` over BLE. Stays unauthenticated — works
-/// against a sleeping car without waking it. Doesn't go through
-/// PersistentSession because it doesn't need a session; opens a
-/// short-lived raw connection, asks, closes.
-///
-/// We could route this through PersistentSession too if we ever wire
-/// in an unauthenticated-query API, but for now the body controller
-/// is the one path that's fine going through the per-call pattern —
-/// the sampler's Quiet mode only polls it every ~15 min, so per-call
-/// connect cost (~1-2 s) doesn't matter.
-pub async fn sample_body_controller_ble(vin: &str) -> Result<BodyControllerSample> {
+/// against a sleeping car without waking it. Now routed through the
+/// PersistentSession's held GATT connection instead of opening its
+/// own throwaway connection, which used to fight the persistent
+/// session for bluez and caused framing-desync errors + multi-second
+/// outliers on the body-controller poll itself.
+pub async fn sample_body_controller_ble(
+    session: &PersistentSession,
+) -> Result<BodyControllerSample> {
     let start = Instant::now();
-
-    // Throwaway connection for one query. Drops the slot when this
-    // function returns.
-    let adapter = scan::first_adapter().await?;
-    let target = scan::scan_for_vin(&adapter, vin, std::time::Duration::from_secs(30)).await?;
-    let mut conn = Connection::open(target.peripheral).await?;
-    let result = body_controller::query(&mut conn).await;
-    conn.close().await;
-
+    let result = session.body_controller_state().await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     match &result {
         Ok(_) => info!("body-controller poll: ok({}ms) via in-process BLE", elapsed_ms),
@@ -236,39 +225,50 @@ pub async fn sample_body_controller_ble(vin: &str) -> Result<BodyControllerSampl
     })
 }
 
-/// Bundles a `PersistentSession` with the VIN it was opened for so
-/// the sampler can detect a VIN change between ticks and recreate
-/// the session cleanly. Stored as `Option<SessionHandle>` in main.
+/// Bundles a `PersistentSession` with the VIN + adapter it was
+/// opened for, so the sampler can detect a config change between
+/// ticks and recreate the session cleanly. Stored as
+/// `Option<SessionHandle>` in main.
 pub struct SessionHandle {
     pub session: PersistentSession,
     pub vin: String,
+    pub adapter: Option<String>,
 }
 
-/// Ensure `handle` is a `PersistentSession` for `vin`. Lazily spawns
-/// the session on first call, recreates it if the VIN changed. The
-/// keypair is loaded from the standard /root/.ble path each time the
-/// session is created.
+/// Ensure `handle` is a `PersistentSession` for the given VIN +
+/// adapter. Lazily spawns the session on first call, recreates it
+/// if EITHER the VIN or the configured adapter changed. The
+/// keypair is loaded from the standard /root/.ble path each time
+/// the session is created.
 pub fn ensure_session_for(
     handle: &mut Option<SessionHandle>,
     vin: &str,
+    adapter: Option<&str>,
 ) -> Result<()> {
+    let want_adapter = adapter
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
     if let Some(existing) = handle {
-        if existing.vin == vin {
+        if existing.vin == vin && existing.adapter == want_adapter {
             return Ok(());
         }
-        info!("VIN changed ({} -> {}), recreating PersistentSession",
-              short_vin(&existing.vin), short_vin(vin));
-        // Drop the old session by replacing; Drop on PersistentSession
-        // is no-op since the background task is owned by the runtime.
-        // We just signal shutdown best-effort first.
-        // (Async shutdown can't run from a sync helper; the task will
-        // exit naturally when the channel is dropped via Drop on the
-        // Sender.)
+        info!(
+            "PersistentSession config changed (vin {}->{}, adapter {:?}->{:?}); recreating",
+            short_vin(&existing.vin),
+            short_vin(vin),
+            existing.adapter,
+            want_adapter
+        );
+        // Dropping the existing handle closes the mpsc Sender; the
+        // background task notices and shuts down naturally.
     }
     let keypair = KeyPair::load(std::path::Path::new("/root/.ble/key_private.pem"))?;
     *handle = Some(SessionHandle {
-        session: PersistentSession::start(keypair, vin.to_string()),
+        session: PersistentSession::start(keypair, vin.to_string(), want_adapter.clone()),
         vin: vin.to_string(),
+        adapter: want_adapter,
     });
     Ok(())
 }

@@ -205,13 +205,19 @@ pub async fn ble_enabled_set(
 }
 
 /// Classify a BT adapter as "onboard" (Pi built-in radio) or
-/// "external" (USB dongle) by reading the manufacturer ID from
-/// /sys/class/bluetooth/<id>/manufacturer. The kernel writes the
-/// decimal Bluetooth SIG company ID there.
+/// "external" (USB dongle).
 ///
-/// Pi onboard radios are always Cypress (305) on Pi 4 / Pi 5 /
-/// Zero 2W, or Broadcom (15) on older Pis. Anything else — Realtek
-/// (93), Intel (2), CSR (10), etc. — is necessarily a USB dongle.
+/// Primary signal is the device symlink under
+/// `/sys/class/bluetooth/<id>/device` — points at a USB path
+/// (e.g. `4-1:1.0`) for dongles and at `serial0-0` for the Pi's
+/// UART-attached onboard radio. This works on every Pi OS kernel
+/// regardless of rfkill state.
+///
+/// The `manufacturer` sysfs file is checked as a secondary signal
+/// because it's not populated on all kernels (Pi OS in particular
+/// often leaves it missing) — but when present it carries the
+/// Bluetooth SIG company ID, which uniquely identifies Cypress
+/// (305) and Broadcom (15) Pi chips.
 ///
 /// We can't classify by hci index: a USB dongle plugged in early
 /// can grab hci0 and push the onboard radio to hci1. That
@@ -219,20 +225,34 @@ pub async fn ble_enabled_set(
 /// onboard radio has issues" testing that was actually hitting the
 /// external dongle the whole time.
 pub fn adapter_source(id: &str) -> &'static str {
-    let path = format!("/sys/class/bluetooth/{id}/manufacturer");
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        // Unreadable → safest fallback is "external": the auto-select
-        // logic for first-time enable will then pick this adapter and
-        // the UI will show it as a USB dongle, which is at worst
-        // visually wrong but won't accidentally claim "this is the
-        // built-in radio" for an unknown device.
-        Err(_) => return "external",
-    };
-    match raw.trim().parse::<u32>().unwrap_or(0) {
-        15 | 305 => "onboard",
-        _ => "external",
+    // 1. Device symlink — works on all Pi OS versions regardless of
+    //    rfkill state.
+    //      Pi onboard BT → `../../../serial0-0` (UART)
+    //      USB dongle    → `../../../4-1:1.0`   (bus-port:intf.alt)
+    //    The `:` in the USB form is the giveaway — bare hyphens
+    //    appear in `serial0-0` too, so we can't rely on those.
+    if let Ok(target) = std::fs::read_link(format!("/sys/class/bluetooth/{id}/device")) {
+        let s = target.to_string_lossy();
+        if s.contains("serial") || s.contains("uart") || s.contains("tty") {
+            return "onboard";
+        }
+        if s.contains("usb") || s.contains(':') {
+            return "external";
+        }
     }
+    // 2. Manufacturer file — only present on some kernels, but
+    //    definitive when it is. Cypress (305) and Broadcom (15) are
+    //    Pi onboard chips.
+    if let Ok(raw) = std::fs::read_to_string(format!("/sys/class/bluetooth/{id}/manufacturer")) {
+        match raw.trim().parse::<u32>().unwrap_or(0) {
+            15 | 305 => return "onboard",
+            v if v > 0 => return "external",
+            _ => {}
+        }
+    }
+    // 3. Default: treat unknowns as external. Safer than mislabeling
+    //    something as the built-in radio.
+    "external"
 }
 
 /// Return the first detected external (non-Pi-onboard) BT adapter,

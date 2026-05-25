@@ -386,7 +386,7 @@ async fn tick(
     // string compare. The first call does the heavy lifting (key
     // load + scan + GATT connect + handshake) inside the first
     // sample_*_ble call below.
-    if let Err(e) = sample_ble::ensure_session_for(ble_session, &cfg.vin) {
+    if let Err(e) = sample_ble::ensure_session_for(ble_session, &cfg.vin, Some(&cfg.adapter)) {
         warn!("could not start PersistentSession (will retry next tick): {e:#}");
         return Duration::from_secs(5);
     }
@@ -459,7 +459,7 @@ async fn tick(
         if acquired {
             // Always probe body-controller first — it's the
             // canonical source of user_presence and is sleep-safe.
-            let presence_now = match sample_ble::sample_body_controller_ble(&cfg.vin).await {
+            let presence_now = match sample_ble::sample_body_controller_ble(session).await {
                 Ok(bc) => {
                     let p = bc.user_presence;
                     persist(conn, bc.sample);

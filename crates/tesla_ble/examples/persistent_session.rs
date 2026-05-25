@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Loaded key, starting persistent session for VIN {}…{}",
              &vin[..3], &vin[vin.len()-4..]);
 
-    let session = PersistentSession::start(keypair, vin);
+    let session = PersistentSession::start(keypair, vin, None);
 
     // Iterate climate → charge → drive → tire-pressure on each tick.
     // Same workload shape the telemetry sampler runs.
