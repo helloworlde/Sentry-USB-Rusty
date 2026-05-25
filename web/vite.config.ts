@@ -31,6 +31,24 @@ export default defineConfig({
         },
       },
     },
+    // Vite's default modulepreload walks every transitively-reachable
+    // async chunk and bakes a <link rel="modulepreload"> for each.
+    // That defeats lazy-loading for heavy vendors: leaflet/xterm/
+    // recharts get preloaded on every page just because *some* lazy
+    // route eventually pulls them in. Strip those from the initial
+    // preload list — they'll still be fetched on-demand when the
+    // lazy chunk that needs them is loaded (one extra RTT at
+    // navigation time, but only for users who actually visit that
+    // chunk's route).
+    modulePreload: {
+      resolveDependencies: (_filename, deps) =>
+        deps.filter(
+          (d) =>
+            !d.includes('vendor-charts') &&
+            !d.includes('vendor-maps') &&
+            !d.includes('vendor-term'),
+        ),
+    },
   },
   server: {
     proxy: {

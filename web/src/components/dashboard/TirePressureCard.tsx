@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react"
-import { Disc, Loader2 } from "lucide-react"
+import { useMemo } from "react"
+import { Disc } from "lucide-react"
 import {
   CartesianGrid,
   Legend,
@@ -86,7 +86,7 @@ const TIRE_COLORS = {
   rr: "#facc15", // yellow-400   — rear-right (warm contrast against the greens)
 } as const
 
-interface TirePoint {
+export interface TirePoint {
   ts: number
   fl?: number
   fr?: number
@@ -94,52 +94,27 @@ interface TirePoint {
   rr?: number
 }
 
-interface TireHistoryResponse {
+export interface TireHistoryResponse {
   points: TirePoint[]
   days: number
 }
 
 interface TirePressureCardProps {
-  // Days of history to request from the backend. The card itself is
-  // currently fixed at 30 days but the prop lets callers adjust without
-  // touching this component, and matches the backend's `?days=` shape.
+  // Data is owned by the Dashboard so the *parent* decides whether
+  // this card mounts at all — that lets us skip pulling in recharts
+  // (380 KB) for users who have no tire telemetry. The card itself
+  // is now pure rendering.
+  data: TireHistoryResponse
   days?: number
 }
 
-export function TirePressureCard({ days = 30 }: TirePressureCardProps) {
-  const [data, setData] = useState<TireHistoryResponse | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    let cancelled = false
-    setLoading(true)
-    setError(null)
-    fetch(`/api/telemetry/tire-history?days=${days}`)
-      .then((r) =>
-        r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)),
-      )
-      .then((d: TireHistoryResponse) => {
-        if (cancelled) return
-        setData(d)
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return
-        setError(e instanceof Error ? e.message : String(e))
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [days])
+export function TirePressureCard({ data, days = 30 }: TirePressureCardProps) {
 
   // Latest reading per tire for the header strip — rendered inline
   // beside the title so the card stays compact for the dashboard
   // grid.
   const latest = useMemo(() => {
-    const points = data?.points ?? []
+    const points = data.points
     const out: Partial<Record<"fl" | "fr" | "rl" | "rr", number>> = {}
     for (let i = points.length - 1; i >= 0; i--) {
       const p = points[i]
@@ -180,27 +155,10 @@ export function TirePressureCard({ days = 30 }: TirePressureCardProps) {
         </div>
       </div>
 
-      {loading && (
-        <div className="flex h-72 items-center justify-center gap-2 text-sm text-slate-500">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          Loading tire history…
-        </div>
-      )}
-      {!loading && error && (
-        <div className="flex h-72 items-center justify-center text-sm text-rose-300">
-          Failed to load tire history: {error}
-        </div>
-      )}
-      {!loading && !error && (data?.points.length ?? 0) === 0 && (
-        <div className="flex h-72 items-center justify-center text-sm text-slate-500">
-          No tire-pressure samples in the last {days} days.
-        </div>
-      )}
-      {!loading && !error && (data?.points.length ?? 0) > 0 && (
-        <div className="h-72 w-full" aria-label="Tire pressure chart">
+      <div className="h-72 w-full" aria-label="Tire pressure chart">
           <ResponsiveContainer>
             <LineChart
-              data={data!.points}
+              data={data.points}
               margin={{ top: 8, right: 20, bottom: 24, left: 0 }}
             >
               <CartesianGrid
@@ -323,8 +281,7 @@ export function TirePressureCard({ days = 30 }: TirePressureCardProps) {
               />
             </LineChart>
           </ResponsiveContainer>
-        </div>
-      )}
+      </div>
     </div>
   )
 }

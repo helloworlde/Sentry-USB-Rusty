@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, lazy, Suspense } from "react"
 import { Link } from "react-router-dom"
 import {
   Thermometer,
@@ -29,7 +29,17 @@ import { StatusTile, Row, TileDivider } from "@/components/ui/StatusTile"
 import { BannerStack, type BannerItem } from "@/components/ui/Banner"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 import type { Halo } from "@/components/ui/StatusTile"
-import { TirePressureCard } from "@/components/dashboard/TirePressureCard"
+import type { TireHistoryResponse } from "@/components/dashboard/TirePressureCard"
+
+// Lazy so recharts (380 KB raw / 111 KB gz) stays out of the
+// Dashboard's initial dependency graph for users without tire
+// telemetry. Dashboard probes the tire-history endpoint first; only
+// when samples exist does the card mount and pull vendor-charts in.
+const TirePressureCard = lazy(() =>
+  import("@/components/dashboard/TirePressureCard").then((m) => ({
+    default: m.TirePressureCard,
+  })),
+)
 
 function getTempHalo(milliC: number): Halo {
   if (milliC <= 0) return "blue"
@@ -125,6 +135,10 @@ export default function Dashboard() {
   const [useFahrenheit, setUseFahrenheit] = useState(false)
   const [metric, setMetric] = useState(false)
   const [rtcWarning, setRtcWarning] = useState<string | null>(null)
+  // null = still probing, then either the response or `{points: []}`.
+  // The card stays unmounted until points.length > 0, so vendor-charts
+  // never loads for users without Tesla BLE telemetry.
+  const [tireHistory, setTireHistory] = useState<TireHistoryResponse | null>(null)
 
   const archiveHistoryRef = useRef<ProgressSample[]>([])
   const processHistoryRef = useRef<ProgressSample[]>([])
@@ -219,6 +233,15 @@ export default function Dashboard() {
         }
       })
       .catch(() => {})
+
+    // Tire history: probe once at mount. The card only mounts (and
+    // pulls in recharts) when the response has samples. Empty
+    // response = the user hasn't paired BLE telemetry; we just hide
+    // the card to keep the dashboard clean.
+    fetch("/api/telemetry/tire-history?days=30")
+      .then((r) => (r.ok ? r.json() : { points: [], days: 30 }))
+      .then((d: TireHistoryResponse) => { if (mounted) setTireHistory(d) })
+      .catch(() => { if (mounted) setTireHistory({ points: [], days: 30 }) })
 
     // Status drives the live-tile values (CPU, mem, temp). 2s is fast
     // enough that a glance still feels real-time and halves the
@@ -376,11 +399,21 @@ export default function Dashboard() {
         {isAwayActive && <AwayModeTile />}
       </div>
 
-      {/* TirePressureCard renders below the tile grid because it needs
-          the full row width for the multi-line history chart. The card
-          self-fetches /api/telemetry/tire-history; it'll show an empty
-          state when the BLE telemetry sampler hasn't run yet. */}
-      <TirePressureCard />
+      {/* TirePressureCard mounts only when tire data exists — keeps
+          recharts (380 KB) out of the bundle for users without
+          telemetry. Suspense fallback is a slim skeleton so the
+          layout doesn't pop when the chart chunk arrives. */}
+      {tireHistory && tireHistory.points.length > 0 && (
+        <Suspense
+          fallback={
+            <div className="glass-card flex h-72 items-center justify-center p-4 text-sm text-slate-500">
+              Loading tire history…
+            </div>
+          }
+        >
+          <TirePressureCard data={tireHistory} />
+        </Suspense>
+      )}
     </div>
   )
 }
