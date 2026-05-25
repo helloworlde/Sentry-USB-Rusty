@@ -144,10 +144,13 @@ export function CarStatusCard({
           corner via absolute positioning, so it sits in the corner
           regardless of the Parked row's height. Only renders when
           a chime is active so users without the feature don't see
-          an empty placeholder. Click → /lockchime. */}
+          an empty placeholder. Click → /community?view=chimes
+          which lands directly on the lock-chime tab inside
+          Community (the LockChime page is mounted as a sub-view
+          of Community, not its own route). */}
       {lockChimeName && (
         <Link
-          to="/lockchime"
+          to="/community?view=chimes"
           title={`Active lock chime: ${lockChimeName}`}
           className="absolute right-3 top-3 inline-flex max-w-[180px] items-center gap-1.5 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/15"
         >

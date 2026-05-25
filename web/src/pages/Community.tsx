@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback } from "react"
 import { Users, Paintbrush, Volume2, Shield, X, Loader2 } from "lucide-react"
-import { Link } from "react-router-dom"
+import { Link, useSearchParams } from "react-router-dom"
 import CommunityWraps from "./CommunityWraps"
 import LockChime from "./LockChime"
 import { useCommunityPrefs } from "@/hooks/useCommunityPrefs"
@@ -11,7 +11,15 @@ type CommunityView = "wraps" | "chimes"
 
 export default function Community() {
   const { mode, loading } = useCommunityPrefs()
-  const [view, setView] = useState<CommunityView>("wraps")
+  const [searchParams] = useSearchParams()
+  // Initial view honours ?view= so deep-links from elsewhere (e.g.
+  // the Dashboard's active-lock-chime chip) can land directly on
+  // the chimes tab instead of wraps. After mount the user can
+  // freely flip via the toggle; we don't sync state back to the
+  // URL — that's just a starting hint, not the source of truth.
+  const initialView: CommunityView =
+    searchParams.get("view") === "chimes" ? "chimes" : "wraps"
+  const [view, setView] = useState<CommunityView>(initialView)
   const [adminPasscode, setAdminPasscode] = useState<string | null>(null)
   const [showPasscodePrompt, setShowPasscodePrompt] = useState(false)
   const clickCountRef = useRef(0)

@@ -266,17 +266,29 @@ export default function Dashboard() {
     }
 
     // Most recent drive's end-time → used by CarStatusCard to render
-    // "Parked Xh Ym". The list endpoint is already cached server-side
-    // and returns drives newest-first, so we only need the first row.
+    // "Parked Xh Ym". /api/drives returns the cached list in
+    // insertion order (NOT newest-first), so we have to find the
+    // entry with the latest endTime ourselves — `drives[0]` would
+    // give the oldest drive and produce a "Parked 600d 9h"-style
+    // bogus duration.
     async function fetchLatestDrive() {
       try {
         const res = await fetch("/api/drives")
         if (!res.ok) return
         const drives = (await res.json()) as Array<{ endTime?: string }>
         if (!mounted) return
-        if (Array.isArray(drives) && drives.length > 0 && drives[0].endTime) {
-          setLatestDriveEnd(drives[0].endTime)
+        if (!Array.isArray(drives) || drives.length === 0) return
+        let latest: string | null = null
+        let latestMs = -Infinity
+        for (const d of drives) {
+          if (!d.endTime) continue
+          const ms = new Date(d.endTime).getTime()
+          if (Number.isFinite(ms) && ms > latestMs) {
+            latestMs = ms
+            latest = d.endTime
+          }
         }
+        if (latest) setLatestDriveEnd(latest)
       } catch {
         /* non-critical */
       }
