@@ -148,18 +148,23 @@ jobs:
         # (no per-CPU tuning for armv6; one binary covers Pi Zero W and Pi 1).
         #
         # `mold -run` wraps the build so mold intercepts every linker
-        # invocation in the subprocess tree — including the cross-
-        # compiler's `aarch64-linux-gnu-gcc -> ld` call. `-fuse-ld=mold`
-        # on RUSTFLAGS doesn't work here because cross-compilers don't
-        # find `ld.mold` in their search paths. Output binary is
-        # byte-identical to a GNU-ld link; runtime unchanged. Saves
-        # ~30-60 s per CI run across the matrix.
+        # invocation in the subprocess tree (no GCC `-fuse-ld=mold` flag
+        # needed — cross-compilers can't find `ld.mold` in their search
+        # paths anyway). Used only for the aarch64 jobs because mold
+        # 1.x on Ubuntu 22.04 doesn't support the 32-bit ARM
+        # `armelf_linux_eabi` emulation. armv7/armv6 keep GNU ld; the
+        # aarch64 trio dominates total CI wallclock so the bulk of the
+        # link-time win still lands.
         run: |
           if [ -n "${{ matrix.cpu }}" ]; then
               export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }}"
           fi
-          mold -run cargo build --release --target ${{ matrix.target }} -p sentryusb
-          mold -run cargo build --release --target ${{ matrix.target }} -p sentryusb-tesla-telemetry
+          case "${{ matrix.target }}" in
+            aarch64-*) BUILD_WRAPPER="mold -run" ;;
+            *)         BUILD_WRAPPER="" ;;
+          esac
+          $BUILD_WRAPPER cargo build --release --target ${{ matrix.target }} -p sentryusb
+          $BUILD_WRAPPER cargo build --release --target ${{ matrix.target }} -p sentryusb-tesla-telemetry
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
