@@ -1193,14 +1193,14 @@ pub struct TireHistoryQuery {
 
 /// GET /api/telemetry/tire-history
 ///
-/// Per-tire pressure samples for the last `days` days (default 30),
-/// down-sampled to one row per hour bucket (the latest non-null sample
-/// in each bucket). Rendered as the Dashboard's TirePressureCard.
+/// Per-tire pressure samples for the last `days` days (default 30).
+/// Rendered as the Dashboard's TirePressureCard.
 ///
-/// The 5-minute BLE sampler cadence (`TIRES_INTERVAL` in the telemetry
-/// crate) means a 30-day window contains ~8.6k samples uncompressed;
-/// the hourly down-sample cuts that to ~720 — small enough to ship
-/// over the wire and to render smoothly in recharts.
+/// No down-sampling: TPMS sensors only broadcast while the car is
+/// driving, so even with the 5-minute sampler cadence
+/// (`TIRES_INTERVAL` in the telemetry crate) a typical 30-day window
+/// stays well under a thousand points — small enough to ship raw and
+/// render smoothly in recharts.
 ///
 /// Response shape:
 /// ```json
@@ -1224,20 +1224,13 @@ pub async fn tire_history(
     let cutoff = now - (days as i64) * 86_400;
 
     let result = state.drives.store.with_locked_conn(|conn| {
-        // Window function picks the latest non-null sample per hour
-        // bucket. Filter on "at least one tire populated" so we don't
-        // emit empty rows for samples that only carried e.g. battery.
         let mut stmt = conn.prepare(
-            "WITH bucketed AS ( \
-                SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi, \
-                  ROW_NUMBER() OVER (PARTITION BY (ts / 3600) ORDER BY ts DESC) AS rn \
-                FROM telemetry_samples \
-                WHERE ts >= ?1 \
-                  AND (tire_fl_psi IS NOT NULL OR tire_fr_psi IS NOT NULL \
-                       OR tire_rl_psi IS NOT NULL OR tire_rr_psi IS NOT NULL) \
-             ) \
-             SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
-             FROM bucketed WHERE rn = 1 ORDER BY ts ASC",
+            "SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
+             FROM telemetry_samples \
+             WHERE ts >= ?1 \
+               AND (tire_fl_psi IS NOT NULL OR tire_fr_psi IS NOT NULL \
+                    OR tire_rl_psi IS NOT NULL OR tire_rr_psi IS NOT NULL) \
+             ORDER BY ts ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
             Ok((
