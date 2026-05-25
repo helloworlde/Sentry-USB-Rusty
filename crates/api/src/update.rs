@@ -375,6 +375,54 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
         }
     }
 
+    // ── BLE-action one-shot CLI ──
+    //
+    // Replaces the tesla-control shell-outs in run/awake_start
+    // (wake / sentry-mode / charge-port). Pulled from the same
+    // release as the main binary so action wire format stays in
+    // lockstep with whatever crypto/protocol changes ship together.
+    // Same best-effort pattern as the telemetry fetch above —
+    // missing artifact (older release) is a no-op rather than an
+    // update failure.
+    let action_url = if let Some(v) = &target_version {
+        format!(
+            "https://github.com/{}/releases/download/{}/sentryusb-ble-action-{}",
+            repo, v, suffix
+        )
+    } else {
+        format!(
+            "https://github.com/{}/releases/latest/download/sentryusb-ble-action-{}",
+            repo, suffix
+        )
+    };
+    let head_ok_action = sentryusb_shell::run_with_timeout(
+        std::time::Duration::from_secs(15),
+        "curl",
+        &["-sfI", "--max-time", "10", &action_url],
+    )
+    .await
+    .is_ok();
+    if head_ok_action {
+        let action_tmp = "/tmp/sentryusb-ble-action-update";
+        if sentryusb_shell::run_with_timeout(
+            std::time::Duration::from_secs(120),
+            "curl",
+            &["-fsSL", &action_url, "-o", action_tmp],
+        )
+        .await
+        .is_ok()
+        {
+            let _ = sentryusb_shell::run("mkdir", &["-p", "/root/bin"]).await;
+            let _ = sentryusb_shell::run("chmod", &["+x", action_tmp]).await;
+            let _ = sentryusb_shell::run(
+                "mv",
+                &[action_tmp, "/root/bin/sentryusb-ble-action"],
+            )
+            .await;
+            // No service to restart — awake_start invokes it on demand.
+        }
+    }
+
     // Determine the tag to record. Use the requested target if any (it
     // matches the binary we just installed); otherwise resolve /latest.
     let tag = match target_version {

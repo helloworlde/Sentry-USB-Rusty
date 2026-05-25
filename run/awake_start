@@ -202,9 +202,13 @@ else
       if [[ -n "${TESLA_BLE_VIN:+x}" ]] && ble_is_enabled
       # use Tesla BLE API to nudge the car
       then
-        # GATT daemon is already disabled for the session — call tesla-control
-        # directly with exclusive hci0 access (no stop/start cycling).
-        if ! BLE_response=$(/root/bin/tesla-control -ble -key-file /root/.ble/key_private.pem -vin "${TESLA_BLE_VIN^^}" charge-port-close 2>&1)
+        # In-process bluez-based BLE — see crates/tesla_ble. Reads
+        # VIN + BLE_ADAPTER from /root/sentryusb.conf, signs +
+        # sends one charge-port-close, exits. Replaces the
+        # tesla-control shell-out that previously needed
+        # exclusive raw-HCI access (which is why we used to have
+        # to stop the iOS GATT daemon for the whole session).
+        if ! BLE_response=$(/root/bin/sentryusb-ble-action charge-port-close 2>&1)
         then
           # check false-negative BLE responses
           if [[ ( "$BLE_response" != *"already closed"* ) && ( "$BLE_response" != *"cable connected"* ) ]]
@@ -413,8 +417,10 @@ else
       elif [[ -n "${TESLA_BLE_VIN:+x}" ]] && ble_is_enabled
       # Use Tesla BLE API to enable Sentry Mode
       then
-        # GATT daemon already disabled above — call tesla-control directly.
-        if /root/bin/tesla-control -ble -key-file /root/.ble/key_private.pem -vin "${TESLA_BLE_VIN^^}" sentry-mode on
+        # In-process bluez-based BLE — see crates/tesla_ble. Same
+        # rationale as the charge-port-close call above: shared
+        # radio with the iOS GATT daemon instead of monopolizing it.
+        if /root/bin/sentryusb-ble-action sentry-on
         then
           log "Tesla BLE: Sentry Mode enabled [$(nudge_label)]."
         else

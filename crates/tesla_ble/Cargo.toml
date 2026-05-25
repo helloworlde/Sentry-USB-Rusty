@@ -10,6 +10,13 @@ edition = "2024"
 name = "sentryusb_tesla_ble"
 path = "src/lib.rs"
 
+# Standalone CLI used by run/awake_start to issue keep-awake BLE
+# actions (wake, sentry-mode on/off, charge-port-open/close).
+# Replaces the corresponding `tesla-control` shell-outs.
+[[bin]]
+name = "sentryusb-ble-action"
+path = "src/bin/sentryusb_ble_action.rs"
+
 [[example]]
 name = "scan"
 path = "examples/scan.rs"

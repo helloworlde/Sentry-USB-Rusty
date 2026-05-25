@@ -104,6 +104,17 @@ enum Command {
         state: VehicleDataState,
         reply: oneshot::Sender<Result<Vec<u8>>>,
     },
+    /// Generic signed request — caller supplies the inner payload
+    /// bytes already encoded (e.g. a VCSEC RKEAction or a car_server
+    /// VehicleControl action). Used by keep-awake actions
+    /// (wake-vehicle, sentry-mode, charge-port) so they reuse the
+    /// same sign + send + decrypt + refresh-and-retry pipeline as
+    /// state queries.
+    SignedRequest {
+        domain: Domain,
+        inner: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>>>,
+    },
     /// Unauthenticated body-controller-state query. Runs through the
     /// held GATT connection (not a new one) so it doesn't fight the
     /// authenticated queries for bluez or kick the persistent slot.
@@ -217,6 +228,37 @@ impl PersistentSession {
         let _ = self.cmd_tx.send(Command::Shutdown).await;
     }
 
+    /// Issue a generic signed request with caller-supplied inner
+    /// payload bytes. Used by keep-awake actions
+    /// (`actions::wake_vehicle`, `set_sentry_mode`, etc.) that need
+    /// the AES-GCM signing pipeline but produce different inner
+    /// protobufs than the state queries.
+    pub async fn send_signed(
+        &self,
+        domain: Domain,
+        inner: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::SignedRequest {
+                domain,
+                inner,
+                reply: tx,
+            })
+            .await
+            .context("PersistentSession background task has stopped")?;
+        rx.await.context("session task dropped the reply channel")?
+    }
+
+    /// Convenience wrapper around `send_signed` for the typed action
+    /// helpers in `crate::actions`.
+    pub async fn send_action(
+        &self,
+        action: crate::actions::ActionPayload,
+    ) -> Result<Vec<u8>> {
+        self.send_signed(action.domain, action.inner).await
+    }
+
     /// Unauthenticated body-controller-state query. Runs through
     /// the held GATT connection — no new scan + connect, no
     /// competition with the authenticated state queries that share
@@ -300,7 +342,23 @@ async fn run_session_task(
                 state: vds,
                 reply,
             } => {
-                let result = query_with_refresh_retry(&mut state, domain, vds).await;
+                let inner = state_query::build_get_state_request(vds);
+                let result = signed_request_with_refresh_retry(
+                    &mut state, domain, inner,
+                )
+                .await;
+                handle_transport_error_if_any(&mut state, &result).await;
+                let _ = reply.send(result);
+            }
+            Command::SignedRequest {
+                domain,
+                inner,
+                reply,
+            } => {
+                let result = signed_request_with_refresh_retry(
+                    &mut state, domain, inner,
+                )
+                .await;
                 handle_transport_error_if_any(&mut state, &result).await;
                 let _ = reply.send(result);
             }
@@ -327,20 +385,20 @@ async fn run_session_task(
 /// the retry still hits the same "needs refresh" outcome, something
 /// deeper is wrong and we surface the error instead of looping
 /// forever.
-async fn query_with_refresh_retry(
+async fn signed_request_with_refresh_retry(
     state: &mut SessionState,
     domain: Domain,
-    vds: VehicleDataState,
+    inner: Vec<u8>,
 ) -> Result<Vec<u8>> {
-    match try_query_once(state, domain, vds).await {
+    match try_signed_request_once(state, domain, &inner).await {
         Ok(QueryOutcome::Plaintext(bytes)) => Ok(bytes),
         Ok(QueryOutcome::SessionRefresh(info)) => {
             apply_session_refresh(state, domain, info)?;
             info!(
-                "PersistentSession: retrying {:?} after SessionInfo refresh",
-                vds
+                "PersistentSession: retrying signed request to {:?} after SessionInfo refresh",
+                domain
             );
-            match try_query_once(state, domain, vds).await {
+            match try_signed_request_once(state, domain, &inner).await {
                 Ok(QueryOutcome::Plaintext(bytes)) => Ok(bytes),
                 Ok(QueryOutcome::SessionRefresh(_)) => {
                     bail!("car requested SessionInfo refresh twice in a row — giving up")
@@ -390,10 +448,10 @@ fn apply_session_refresh(
     Ok(())
 }
 
-async fn try_query_once(
+async fn try_signed_request_once(
     state: &mut SessionState,
     domain: Domain,
-    vds: VehicleDataState,
+    inner: &[u8],
 ) -> Result<QueryOutcome> {
     ensure_connected(state).await?;
     ensure_domain_session(state, domain).await?;
@@ -409,12 +467,11 @@ async fn try_query_once(
 
     let counter = ds.counter + 1;
     let expires_at = ds.estimated_car_clock().saturating_add(EXPIRES_WINDOW);
-    let inner = state_query::build_get_state_request(vds);
 
     let parts = auth::sign(
         &ds.key,
         &state.keypair.pub_uncompressed,
-        &inner,
+        inner,
         domain,
         state.vin.as_bytes(),
         &ds.epoch,
@@ -425,7 +482,12 @@ async fn try_query_once(
 
     let envelope = auth::build_signed_routable_message(&parts, domain, QUERY_FLAGS);
 
-    debug!("PersistentSession: TX domain={:?} vds={:?} counter={}", domain, vds, counter);
+    debug!(
+        "PersistentSession: TX domain={:?} inner_len={} counter={}",
+        domain,
+        inner.len(),
+        counter
+    );
     let resp_bytes = conn.round_trip(&envelope, QUERY_TIMEOUT).await?;
 
     // Counter advances on the wire whether the car accepts or rejects
