@@ -168,7 +168,19 @@ struct SessionState {
     backoff: Duration,
     /// When the manager started or last reconnected — for logging.
     connected_at: Option<Instant>,
+    /// Successful queries served since the current connection was
+    /// established. Reset to 0 on every reconnect. Used by the
+    /// periodic status log so operators can see at a glance that
+    /// the slot is being held (counter climbs steadily) vs being
+    /// re-grabbed (counter resets often).
+    queries_since_connect: u32,
 }
+
+/// Log a connection-status summary every this many successful
+/// queries. At Active-mode 15s cycles that's roughly every 6 minutes
+/// — enough to confirm in journalctl that the slot is held without
+/// flooding the log.
+const STATUS_LOG_EVERY_N_QUERIES: u32 = 25;
 
 impl PersistentSession {
     /// Spawn the background session task and return a handle.
@@ -193,6 +205,7 @@ impl PersistentSession {
             domains: HashMap::new(),
             backoff: RECONNECT_BACKOFF_MIN,
             connected_at: None,
+            queries_since_connect: 0,
         };
         tokio::spawn(run_session_task(state, cmd_rx));
         Self { cmd_tx }
@@ -390,7 +403,7 @@ async fn signed_request_with_refresh_retry(
     domain: Domain,
     inner: Vec<u8>,
 ) -> Result<Vec<u8>> {
-    match try_signed_request_once(state, domain, &inner).await {
+    let result = match try_signed_request_once(state, domain, &inner).await {
         Ok(QueryOutcome::Plaintext(bytes)) => Ok(bytes),
         Ok(QueryOutcome::SessionRefresh(info)) => {
             apply_session_refresh(state, domain, info)?;
@@ -407,7 +420,11 @@ async fn signed_request_with_refresh_retry(
             }
         }
         Err(e) => Err(e),
+    };
+    if result.is_ok() {
+        note_successful_query(state);
     }
+    result
 }
 
 /// One of two normal outcomes from a signed query.
@@ -642,6 +659,7 @@ async fn handle_transport_error_if_any<T>(
             }
             state.domains.clear();
             state.connected_at = None;
+            state.queries_since_connect = 0;
         }
     }
 }
@@ -659,7 +677,11 @@ async fn handle_body_controller(
         .conn
         .as_mut()
         .context("ensure_connected returned without a connection")?;
-    crate::body_controller::query(conn).await
+    let result = crate::body_controller::query(conn).await;
+    if result.is_ok() {
+        note_successful_query(state);
+    }
+    result
 }
 
 async fn ensure_connected(state: &mut SessionState) -> Result<()> {
@@ -697,8 +719,31 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
     state.conn = Some(conn);
     state.backoff = RECONNECT_BACKOFF_MIN;
     state.connected_at = Some(Instant::now());
+    state.queries_since_connect = 0;
     info!("PersistentSession: connected (held until link drops)");
     Ok(())
+}
+
+/// Increment the per-connection query counter and, every
+/// `STATUS_LOG_EVERY_N_QUERIES`, emit a status line summarizing how
+/// long the current connection has been held + how many queries it
+/// has served. Operators can grep this to confirm the persistent
+/// slot is being held vs being re-grabbed each cycle.
+fn note_successful_query(state: &mut SessionState) {
+    state.queries_since_connect = state.queries_since_connect.saturating_add(1);
+    let n = state.queries_since_connect;
+    if n == 1 || n % STATUS_LOG_EVERY_N_QUERIES == 0 {
+        let uptime = state
+            .connected_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        info!(
+            "PersistentSession: held for {}m{}s, {} queries served on this connection",
+            uptime / 60,
+            uptime % 60,
+            n
+        );
+    }
 }
 
 async fn ensure_domain_session(state: &mut SessionState, domain: Domain) -> Result<()> {

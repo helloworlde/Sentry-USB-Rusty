@@ -1,3 +1,11 @@
+// aes-gcm 0.10 still ships `Nonce::from_slice` even though it's been
+// marked deprecated upstream while the crate migrates to generic-array
+// 1.x. The replacement (`Nonce::clone_from_slice`) makes a copy and
+// the alternative (constructing a GenericArray manually) is verbose;
+// silencing here keeps the crypto code readable. Revisit when we
+// bump aes-gcm to 0.11+ which exposes a non-deprecated builder.
+#![allow(deprecated)]
+
 //! Push 2 of Phase 2: AES-128-GCM signing for authenticated commands.
 //!
 //! Once `session::request_session_info` has returned a vehicle pubkey,

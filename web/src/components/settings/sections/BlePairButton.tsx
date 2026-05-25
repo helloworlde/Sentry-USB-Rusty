@@ -1224,6 +1224,7 @@ function TelemetryOutputPanel({
               <Row label="Rear right" value={fmtPsi(sample.tire_rr_psi)} />
             </>
           )}
+          {/* Keep-awake (archive cycle) — pause message regardless of source. */}
           {isStale && radioOwner === "keep_awake" && (
             <p className="pt-1 text-[10px] text-amber-400/80">
               {archiving
@@ -1231,18 +1232,30 @@ function TelemetryOutputPanel({
                 : "Paused while another part of the Pi is using Bluetooth. Live readings will resume in a moment."}
             </p>
           )}
-          {isStale && radioOwner !== "keep_awake" && (
+          {/* Sample source determines tone:
+              * `body_controller` = car is asleep / Quiet-mode polling.
+                Stale data here is EXPECTED — the sampler is letting the
+                car sleep instead of waking it for fresh readings. Show
+                the gray informational note instead of the orange
+                "may have moved" warning, which implies something's wrong.
+              * `state` = full Active-mode poll. If THIS is stale, the
+                sampler should be polling more frequently — usually it
+                means the car was awake recently but isn't anymore, or
+                a transient BLE issue. The orange "may have moved"
+                phrasing is appropriate. */}
+          {sample.source === "body_controller" && radioOwner !== "keep_awake" && (
+            <p className="pt-1 text-[10px] text-slate-500">
+              Your car is asleep, so these are the last known values from {ageLabel}.
+              They won't update until your car wakes up (driving, door, or
+              Sentry trigger). Press <strong>Poll now</strong> above to ask
+              the car for a fresh reading immediately.
+            </p>
+          )}
+          {sample.source !== "body_controller" && isStale && radioOwner !== "keep_awake" && (
             <p className="pt-1 text-[10px] text-amber-400/70">
               These values are from {ageLabel} — your car may have moved or
               charged since. The Tesla app uses a different connection (LTE)
               so small differences are normal.
-            </p>
-          )}
-          {sample.source === "body_controller" && (
-            <p className="pt-1 text-[10px] text-slate-600">
-              Your car is asleep right now, so we're showing the last known
-              values. Live updates resume when you start driving, open the
-              door, or Sentry Mode triggers.
             </p>
           )}
         </div>

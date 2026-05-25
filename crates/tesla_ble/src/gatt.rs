@@ -18,7 +18,6 @@ use crate::uuids;
 pub struct Connection {
     peripheral: Peripheral,
     tx_char: Characteristic,
-    rx_char: Characteristic,
     rx_stream: futures::stream::BoxStream<'static, ValueNotification>,
     rx_buffer: Vec<u8>,
 }
@@ -64,7 +63,6 @@ impl Connection {
         let mut conn = Self {
             peripheral,
             tx_char,
-            rx_char,
             rx_stream,
             rx_buffer: Vec::with_capacity(512),
         };

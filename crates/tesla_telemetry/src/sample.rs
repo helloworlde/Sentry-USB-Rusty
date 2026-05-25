@@ -1,3 +1,13 @@
+// Push 6a cut the sampler over to `sample_ble.rs` (in-process Rust
+// via PersistentSession). The shell-out functions in this module are
+// no longer called — they stay only because Result types
+// (DriveResult / ClimateResult / ChargeResult / TiresResult / Sample)
+// are still re-used by the new path, and ripping the file out before
+// Push 6c would force a bigger atomic change. `#[allow(dead_code)]`
+// silences the "never used" warnings on the helpers that aren't
+// re-exported.
+#![allow(dead_code)]
+
 //! Shells out to `tesla-control` and parses the JSON output into
 //! the columns of `telemetry_samples`.
 //!
