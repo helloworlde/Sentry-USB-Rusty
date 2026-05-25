@@ -43,6 +43,9 @@ pub async fn get_ble_debug(State(s): State<AppState>) -> Response {
     section(&mut out, "Recent sampler journal (filtered)");
     write_journal(&mut out, 60).await;
 
+    section(&mut out, "Per-minute history (last ~6 hours, /mutable/sentryusb-ble.log)");
+    write_history(&mut out);
+
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -302,6 +305,32 @@ fn format_age(ts: Option<i64>, now: i64) -> String {
             }
         }
         None => "<never>".into(),
+    }
+}
+
+/// Append the tail of /mutable/sentryusb-ble.log — the per-minute
+/// status log written by the sampler's `diag_log` background task.
+/// Lets the user scroll back through hours of state without keeping
+/// a browser tab open.
+fn write_history(out: &mut String) {
+    const HISTORY_PATH: &str = "/mutable/sentryusb-ble.log";
+    // Tail ~400 lines (≈6+ hours at one line/min). Cheap to read
+    // since the file rotates at 5 MB.
+    match std::fs::read_to_string(HISTORY_PATH) {
+        Ok(raw) => {
+            let mut lines: Vec<&str> = raw.lines().collect();
+            const MAX: usize = 400;
+            let start = lines.len().saturating_sub(MAX);
+            for line in lines.drain(start..) {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        Err(_) => {
+            out.push_str(
+                "(no history yet — file appears on first sampler tick after install)\n",
+            );
+        }
     }
 }
 

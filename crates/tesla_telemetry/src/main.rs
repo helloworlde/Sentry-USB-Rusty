@@ -19,6 +19,7 @@
 mod clock_sync;
 mod config;
 mod db;
+mod diag_log;
 mod lock;
 mod sample;
 mod sample_ble;
@@ -243,6 +244,15 @@ async fn main() -> Result<()> {
     wait_for_clock_sync(Duration::from_secs(30)).await;
 
     let conn = db::open()?;
+
+    // Background diagnostic logger — writes one line per minute to
+    // /mutable/sentryusb-ble.log so the operator can scroll back
+    // through "what was the car state at 3pm while I was away"
+    // from the Logs → Bluetooth UI tab. Fully independent of the
+    // sampler's main loop; opens its own read-only DB handle each
+    // tick. Lives as long as the process does.
+    diag_log::spawn(sentryusb_drives::DEFAULT_DB_PATH.into());
+
     let mut held_radio = false;
     // Counts consecutive state polls showing shift_state = Park.
     // When it crosses PARK_CONFIRMATIONS_BEFORE_QUIET, the next tick

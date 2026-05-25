@@ -28,6 +28,7 @@ tracing-subscriber = { workspace = true }
 
 rusqlite = { version = "0.32", features = ["bundled"] }
 libc = "0.2"
+chrono = { workspace = true }
 
 sentryusb-config = { path = "../config", package = "sentryusb-config" }
 sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
