@@ -61,6 +61,26 @@ else
   }
 
   ble_disable_gatt_daemon() {
+    # Fast path: telemetry daemon IPC. If the daemon is running and
+    # listening on its action socket, sentryusb-ble-action will
+    # pipe each keep-awake command in via the socket and the daemon
+    # will dispatch through its already-warm PersistentSession.
+    # That means we don't have to stop the iOS GATT daemon, we
+    # don't have to stop telemetry, we don't even have to grab the
+    # BLE lock — the daemon serializes everything internally via
+    # its own mpsc channel. This is the win that makes telemetry
+    # keep updating during a long archive cycle.
+    if [ -S /tmp/sentryusb-telemetry.sock ]; then
+      log "Tesla BLE: telemetry IPC socket present — routing keep-awake actions through running daemon (no service stops needed)"
+      return
+    fi
+
+    # Fallback path: no telemetry daemon listening. Either BLE
+    # telemetry is disabled in settings, or the daemon crashed.
+    # Run the original direct-BLE prep — stop everything that
+    # touches the radio, take the lock as keep_awake, leave it
+    # held until ble-action finishes opening its own connection.
+
     # If lock exists, check if it's stale OR owned by someone else
     # before trusting it as ours.
     if [ -e "$BLE_LOCK" ]; then

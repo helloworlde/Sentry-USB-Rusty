@@ -16,6 +16,7 @@
 //!     BLE off in settings stops sampling within ~15 s without a
 //!     daemon restart.
 
+mod action_socket;
 mod clock_sync;
 mod config;
 mod db;
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rusqlite::Connection;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::config::BleConfig;
@@ -289,6 +291,15 @@ async fn main() -> Result<()> {
     // tick. Lives as long as the process does.
     diag_log::spawn(sentryusb_drives::DEFAULT_DB_PATH.into());
 
+    // IPC bridge for external BLE actions (currently just
+    // sentryusb-ble-action invoked by run/awake_start). Lets
+    // keep-awake nudges piggyback on our already-warm
+    // PersistentSession instead of having to stop us first to grab
+    // the radio. Channel is bounded but small — keep-awake actions
+    // arrive ~once per archive cycle, never concurrently.
+    let (action_tx, mut action_rx) = mpsc::channel::<action_socket::ActionRequest>(8);
+    action_socket::spawn(action_tx);
+
     let mut held_radio = false;
     // Counts consecutive state polls showing shift_state = Park.
     // When it crosses PARK_CONFIRMATIONS_BEFORE_QUIET, the next tick
@@ -384,6 +395,19 @@ async fn main() -> Result<()> {
                 parked_polls = 0;
                 // Loop continues immediately — next tick runs at
                 // the top of the loop without sleeping.
+            }
+            Some(req) = action_rx.recv() => {
+                // IPC: an external process (e.g. sentryusb-ble-action
+                // from run/awake_start) wants us to do a one-shot BLE
+                // action through our existing PersistentSession.
+                // Serializes naturally with the rest of the select —
+                // any in-flight tick completes first, then we handle
+                // this, then the next tick fires.
+                handle_action_request(
+                    req,
+                    &mut held_radio,
+                    &mut ble_session,
+                ).await;
             }
             sleep = tick(
                 &conn,
@@ -1078,6 +1102,124 @@ fn persist(conn: &Connection, sample: Sample) {
 async fn stop_ios_gatt() {
     debug!("stopping sentryusb-ble for telemetry session");
     let _ = sentryusb_shell::run("systemctl", &["stop", "sentryusb-ble"]).await;
+}
+
+/// Service one IPC action request from `sentryusb-ble-action`. Does
+/// the same radio + iOS-daemon prep as a normal Active-mode tick:
+/// acquires the BLE radio lock if we don't already hold it, stops
+/// the iOS GATT daemon for exclusive hci0, then dispatches the
+/// action through the long-lived PersistentSession.
+///
+/// We deliberately do NOT release the radio after a successful
+/// action — the very next tick will probably want it anyway, and
+/// thrashing the iOS daemon down/up on every keep-awake nudge
+/// would defeat the whole point of routing this through us.
+async fn handle_action_request(
+    req: action_socket::ActionRequest,
+    held_radio: &mut bool,
+    ble_session: &mut Option<sample_ble::SessionHandle>,
+) {
+    let verb = req.verb.clone();
+    info!("action_socket: IPC request received — verb={}", verb);
+
+    // Load config: respects the same enable/VIN gate as the rest of
+    // the daemon. If BLE is off in settings, refuse the action so
+    // ble-action can fall back (or just propagate the error to
+    // awake_start, which probably shouldn't have called us anyway).
+    let cfg = match crate::config::BleConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = req.reply.send(Err(anyhow::anyhow!(
+                "load BLE config: {e}"
+            )));
+            return;
+        }
+    };
+    if !cfg.enabled {
+        let _ = req.reply.send(Err(anyhow::anyhow!(
+            "BLE is disabled in settings"
+        )));
+        return;
+    }
+    if cfg.vin.is_empty() {
+        let _ = req.reply.send(Err(anyhow::anyhow!(
+            "TESLA_BLE_VIN not configured"
+        )));
+        return;
+    }
+
+    // Resolve the verb to a typed ActionPayload before doing any
+    // BLE work — saves the cost of the radio handoff for a typo.
+    let action = match action_socket::parse_verb(&verb) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = req.reply.send(Err(e));
+            return;
+        }
+    };
+
+    // Lazy-spawn or reuse the PersistentSession on the configured
+    // VIN/adapter — exactly the same call the tick loop uses.
+    if let Err(e) = sample_ble::ensure_session_for(
+        ble_session,
+        &cfg.vin,
+        Some(&cfg.adapter),
+    ) {
+        let _ = req.reply.send(Err(anyhow::anyhow!(
+            "PersistentSession start failed: {e:#}"
+        )));
+        return;
+    }
+
+    // Acquire the radio + stop iOS GATT if not already held. Same
+    // logic the Active-mode tick uses; copy-pasted here rather
+    // than refactored out because the surrounding context (which
+    // failure cases are recoverable, when to return early) is
+    // different enough that a shared helper would obscure more
+    // than it would deduplicate.
+    if !*held_radio {
+        match lock::try_acquire(OWNER) {
+            Ok(true) => {
+                *held_radio = true;
+                stop_ios_gatt().await;
+            }
+            Ok(false) => {
+                let _ = req.reply.send(Err(anyhow::anyhow!(
+                    "radio held by {:?} — cannot service action right now",
+                    lock::current_owner()
+                )));
+                return;
+            }
+            Err(e) => {
+                let _ = req.reply.send(Err(anyhow::anyhow!(
+                    "could not acquire radio lock: {e}"
+                )));
+                return;
+            }
+        }
+    }
+
+    let session = &ble_session
+        .as_ref()
+        .expect("ensure_session_for left session populated")
+        .session;
+
+    let started = Instant::now();
+    let result = session.send_action(action).await;
+    let elapsed_ms = started.elapsed().as_millis();
+    match &result {
+        Ok(bytes) => info!(
+            "action_socket: verb={} ok ({}ms, {} bytes decrypted response)",
+            verb,
+            elapsed_ms,
+            bytes.len()
+        ),
+        Err(e) => warn!(
+            "action_socket: verb={} failed after {}ms: {:#}",
+            verb, elapsed_ms, e
+        ),
+    }
+    let _ = req.reply.send(result.map(|_| ()));
 }
 
 /// Restart the iOS GATT daemon and clear our radio-lock entry.

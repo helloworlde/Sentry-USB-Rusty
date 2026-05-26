@@ -1,17 +1,27 @@
 //! One-shot CLI for keep-awake BLE actions.
 //!
 //! Replaces the `tesla-control wake|sentry-mode|charge-port-open|...`
-//! shell-outs in `run/awake_start`. Each invocation:
-//!   1. Loads VIN + BLE_ADAPTER from /root/sentryusb.conf
-//!   2. Loads the keypair from /root/.ble/key_private.pem
-//!   3. Spawns a PersistentSession, runs ONE signed action, exits
+//! shell-outs in `run/awake_start`. Each invocation tries two paths,
+//! in this order:
 //!
-//! Per-invocation connection overhead is the same as the previous
-//! tesla-control path (~1-2s including scan + handshake). The
-//! long-running PersistentSession optimization isn't relevant for
-//! awake_start's nudge cycle — each nudge is one command minutes
-//! apart, so there's no benefit to keeping a session warm between
-//! them.
+//!   1. **IPC fast-path** — connect to the running telemetry
+//!      daemon's Unix socket at `/tmp/sentryusb-telemetry.sock`,
+//!      send `"<verb>\n"`, read `"OK\n"` or `"ERR ...\n"`. The
+//!      daemon dispatches the action through its already-warm
+//!      PersistentSession. Zero new BLE connections, no slot
+//!      handoff, telemetry polling never pauses. This is the
+//!      preferred path whenever BLE telemetry is enabled.
+//!
+//!   2. **Direct-BLE fallback** — open our own PersistentSession,
+//!      do the action, exit. Same path as before this binary
+//!      learned about the IPC socket. Covers users who don't run
+//!      the telemetry daemon (BLE telemetry disabled in settings),
+//!      and cold paths where the daemon crashed and hasn't been
+//!      restarted yet.
+//!
+//! Per-invocation overhead:
+//!   * IPC path: ~50-300ms (daemon already has a connection)
+//!   * Direct path: ~1-2s (scan + handshake + command)
 //!
 //! Usage:
 //!   sentryusb-ble-action <verb>
@@ -40,10 +50,14 @@ use sentryusb_tesla_ble::{
     keys::KeyPair,
     manager::PersistentSession,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tracing::{error, info};
 
 const KEY_FILE: &str = "/root/.ble/key_private.pem";
 const CONFIG_FILE: &str = "/root/sentryusb.conf";
+/// Must match `action_socket::SOCKET_PATH` in the telemetry daemon.
+const IPC_SOCKET: &str = "/tmp/sentryusb-telemetry.sock";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -65,6 +79,35 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Try the IPC fast-path first. If the telemetry daemon is up,
+    // it'll service the action via its already-warm session and
+    // return in <300ms — without competing for the BLE slot. If the
+    // socket isn't there (telemetry disabled) or the connect fails
+    // (daemon crashed), fall back to direct BLE so users without
+    // the telemetry daemon keep working.
+    match try_via_ipc(verb.as_str()).await {
+        Ok(()) => {
+            info!("action via daemon IPC: {} OK", verb);
+            return ExitCode::SUCCESS;
+        }
+        Err(IpcError::Unavailable(reason)) => {
+            // Expected on systems where telemetry isn't running.
+            // Not a warning — this is the design's intended fallback.
+            info!(
+                "telemetry IPC unavailable ({}), falling back to direct BLE",
+                reason
+            );
+        }
+        Err(IpcError::DaemonRejected(msg)) => {
+            // Daemon is up but refused the action (e.g. BLE disabled
+            // in settings, VIN missing, radio held by something
+            // else). These would also fail on the direct path, so
+            // exit with the error rather than thrashing the radio.
+            error!("daemon refused action: {}", msg);
+            return ExitCode::from(3);
+        }
+    }
+
     let action = match verb.as_str() {
         "wake" => actions::wake_vehicle(),
         "sentry-on" => actions::set_sentry_mode(true),
@@ -93,6 +136,94 @@ async fn main() -> ExitCode {
                 ExitCode::from(3)
             }
         }
+    }
+}
+
+/// Two-axis result for the IPC attempt:
+///   * `Unavailable` → no daemon listening; fall back to direct BLE
+///   * `DaemonRejected` → daemon is up but said no; surface the
+///                       error instead of retrying via direct
+///                       (same failure mode would just repeat)
+#[derive(Debug)]
+enum IpcError {
+    Unavailable(String),
+    DaemonRejected(String),
+}
+
+/// Connect to the telemetry daemon's Unix socket, send the verb,
+/// read the response. Tight timeouts on every step so a hung
+/// daemon doesn't make us wait minutes before falling back.
+async fn try_via_ipc(verb: &str) -> Result<(), IpcError> {
+    // Connect with a 1s timeout. The daemon either accepts
+    // immediately (it's already in its accept() loop) or doesn't
+    // exist — any failure means "not available, fall back."
+    let stream = match tokio::time::timeout(
+        Duration::from_millis(1000),
+        UnixStream::connect(IPC_SOCKET),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(IpcError::Unavailable(format!(
+                "connect to {}: {}",
+                IPC_SOCKET, e
+            )));
+        }
+        Err(_) => {
+            return Err(IpcError::Unavailable(format!(
+                "connect to {} timed out",
+                IPC_SOCKET
+            )));
+        }
+    };
+
+    let (read_half, mut write_half) = stream.into_split();
+
+    // Send the verb as one line.
+    let cmd = format!("{}\n", verb);
+    if let Err(e) = write_half.write_all(cmd.as_bytes()).await {
+        return Err(IpcError::Unavailable(format!(
+            "writing verb: {}",
+            e
+        )));
+    }
+
+    // Read one line of response. 90s wall-clock — generous because
+    // the daemon's own 60s per-request timeout plus connect /
+    // handshake overhead can push this close to that, but bounded
+    // so a stuck daemon doesn't wedge us forever.
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    let read_result = tokio::time::timeout(
+        Duration::from_secs(90),
+        reader.read_line(&mut line),
+    )
+    .await;
+    match read_result {
+        Ok(Ok(0)) => Err(IpcError::Unavailable(
+            "daemon closed connection without response".into(),
+        )),
+        Ok(Ok(_)) => {
+            let line = line.trim();
+            if line == "OK" {
+                Ok(())
+            } else if let Some(rest) = line.strip_prefix("ERR ") {
+                Err(IpcError::DaemonRejected(rest.to_string()))
+            } else {
+                Err(IpcError::DaemonRejected(format!(
+                    "unexpected response: {:?}",
+                    line
+                )))
+            }
+        }
+        Ok(Err(e)) => Err(IpcError::Unavailable(format!(
+            "read response: {}",
+            e
+        ))),
+        Err(_) => Err(IpcError::Unavailable(
+            "daemon response timed out after 90s".into(),
+        )),
     }
 }
 
