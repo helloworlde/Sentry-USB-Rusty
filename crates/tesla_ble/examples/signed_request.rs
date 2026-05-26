@@ -167,8 +167,11 @@ async fn main() -> anyhow::Result<()> {
     println!("  envelope:    {} bytes", envelope.len());
 
     // --- Send + observe the response ---
+    // Accept-everything validator — examples are diagnostic tools
+    // where we want to surface even malformed responses to the
+    // operator rather than silently retry past them.
     let resp_bytes = conn
-        .round_trip(&envelope, Duration::from_secs(10))
+        .round_trip(&envelope, Duration::from_secs(10), |_| true)
         .await
         .context("signed round-trip")?;
 

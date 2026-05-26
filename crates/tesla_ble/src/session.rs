@@ -38,8 +38,14 @@ pub async fn request_session_info(
         payload.len(),
         domain
     );
+    // Validator: must decode as a RoutableMessage. Same rationale
+    // as the other round_trip callers; the session-info handshake
+    // runs right after a fresh connect when stale notifications
+    // are most likely to be in the BLE pipeline.
     let response = conn
-        .round_trip(&payload, Duration::from_secs(10))
+        .round_trip(&payload, Duration::from_secs(10), |b| {
+            RoutableMessage::decode(b).is_ok()
+        })
         .await
         .context("session-info round-trip")?;
     debug!("session-info: RX {} bytes", response.len());

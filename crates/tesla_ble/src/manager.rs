@@ -585,7 +585,17 @@ async fn try_signed_request_once(
         inner.len(),
         counter
     );
-    let resp_bytes = conn.round_trip(&envelope, QUERY_TIMEOUT).await?;
+    // Validator: must decode as a RoutableMessage. Catches the
+    // framing-desync pattern we saw on bluez 5.82 post-reconnect —
+    // late notifications would land mid-frame and produce a payload
+    // with a valid length prefix but garbage protobuf content.
+    // Discarding at the transport layer means manager.rs only ever
+    // sees frames that survive a proto-level smoke test.
+    let resp_bytes = conn
+        .round_trip(&envelope, QUERY_TIMEOUT, |b| {
+            RoutableMessage::decode(b).is_ok()
+        })
+        .await?;
 
     // Counter advances on the wire whether the car accepts or rejects
     // the message — by the time the car responds, our `counter` value
@@ -593,8 +603,24 @@ async fn try_signed_request_once(
     // counter+1.
     ds.counter = counter;
 
-    let rm = RoutableMessage::decode(resp_bytes.as_slice())
-        .context("decoding response RoutableMessage")?;
+    // The transport validator filters most garbage frames, but a
+    // belt-and-suspenders decode here catches anything that slipped
+    // through. Include the head bytes in the error context so a
+    // tester's bundle shows what shape we couldn't parse —
+    // previously this error fired with no diagnostic data and we
+    // had no way to characterize the bytes.
+    let rm = match RoutableMessage::decode(resp_bytes.as_slice()) {
+        Ok(rm) => rm,
+        Err(e) => {
+            let head = hex::encode(&resp_bytes[..resp_bytes.len().min(64)]);
+            bail!(
+                "decoding response RoutableMessage ({} bytes, head: {}…): {}",
+                resp_bytes.len(),
+                head,
+                e
+            );
+        }
+    };
 
     let fault = rm
         .signed_message_status

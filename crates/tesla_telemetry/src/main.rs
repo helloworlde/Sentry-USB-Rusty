@@ -1063,9 +1063,35 @@ async fn stop_ios_gatt() {
 
 /// Restart the iOS GATT daemon and clear our radio-lock entry.
 /// Called on radio release transitions and SIGTERM.
+///
+/// Ordering matters here: the lock file release happens FIRST and
+/// synchronously, because that's the bit other processes
+/// (keep_awake, archiveloop) need before they can take the radio.
+/// The systemctl-start shell-out happens second under a tight
+/// 5-second cap — systemctl can occasionally block much longer
+/// (dependency resolution, bluez settling, etc.), and on the
+/// SIGTERM path we'd rather skip the iOS-daemon restart than risk
+/// systemd SIGKILL'ing us mid-shutdown. The next sampler instance's
+/// own teardown logic (or systemd's restart policy) will eventually
+/// bring sentryusb-ble back up either way.
 async fn release_radio() {
-    let _ = sentryusb_shell::run("systemctl", &["start", "sentryusb-ble"]).await;
+    // Lock file first — fast, deterministic, the actual "release"
+    // semantic other processes depend on.
     if let Err(e) = lock::release(OWNER) {
         warn!("failed to release radio lock: {e}");
+    }
+    // Then iOS daemon restart, bounded so we never sit here for
+    // 30+ seconds during shutdown.
+    let result = sentryusb_shell::run_with_timeout(
+        Duration::from_secs(5),
+        "systemctl",
+        &["start", "sentryusb-ble"],
+    )
+    .await;
+    if let Err(e) = result {
+        warn!(
+            "systemctl start sentryusb-ble didn't complete within 5s — \
+             skipping (next sampler instance or systemd will bring it back): {e}"
+        );
     }
 }

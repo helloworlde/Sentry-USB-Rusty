@@ -180,14 +180,41 @@ impl Connection {
 
     /// Send a framed payload (handles chunking) and wait for the next
     /// complete response frame to come back. Times out after `wait`.
-    pub async fn round_trip(&mut self, payload: &[u8], wait: Duration) -> Result<Vec<u8>> {
+    ///
+    /// `accept` is a caller-supplied check: every unframed candidate
+    /// is run through it; if it returns false, the frame is discarded
+    /// and we keep listening for the next one. This is how callers
+    /// implement "drop frames that don't look like my expected
+    /// response shape" (e.g. RoutableMessage::decode succeeds). Pass
+    /// `|_| true` to accept everything.
+    ///
+    /// Real failure modes the validator catches:
+    ///   * Late BLE notifications that snuck in after our previous
+    ///     query completed and now read as a "frame" between our
+    ///     TX and the actual response.
+    ///   * Framing desync from a dropped/reordered BLE notification —
+    ///     the unframed payload is garbage bytes that happen to satisfy
+    ///     the 2-byte length prefix but won't decode as our protocol.
+    ///   * Unsolicited messages from the car we don't know how to
+    ///     interpret (anything other than the broadcast pattern that
+    ///     the BROADCAST_FRAME_PREFIX special-case already handles).
+    pub async fn round_trip<F>(
+        &mut self,
+        payload: &[u8],
+        wait: Duration,
+        accept: F,
+    ) -> Result<Vec<u8>>
+    where
+        F: Fn(&[u8]) -> bool,
+    {
         // Drain anything queued before we TX, otherwise the first
         // `next()` after our send could return a stale frame from
         // a prior unrelated request and we'd parse that as our
-        // response. 50ms quiet window — enough to consume any
-        // stragglers from the previous round_trip without adding
-        // meaningful latency.
-        self.drain_until_quiet(Duration::from_millis(50)).await;
+        // response. 100ms quiet window (was 50ms) — slightly more
+        // headroom for stragglers that arrive just after the previous
+        // round_trip returned. Cheap latency cost (≈50ms per query)
+        // for fewer desyncs.
+        self.drain_until_quiet(Duration::from_millis(100)).await;
 
         let framed = frame(payload);
         // Tesla supports MTU up to 247; we'd negotiate that during
@@ -212,7 +239,34 @@ impl Connection {
         // Receive until we have a complete framed payload.
         timeout(wait, async {
             loop {
-                if let Some(payload) = try_unframe(&mut self.rx_buffer)? {
+                let unframed = match try_unframe(&mut self.rx_buffer) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // try_unframe fails when the length prefix says
+                        // something insane (> 1024). That's a hard sign
+                        // of buffer desync — bytes from one frame are
+                        // being interpreted as a length prefix of
+                        // another. Clear the buffer so the NEXT chunk
+                        // arriving has a chance of being a clean
+                        // length prefix, log the head bytes for
+                        // diagnostics, and bubble up so the caller
+                        // retries with a fresh round_trip (which will
+                        // run a full drain).
+                        let head_hex = hex::encode(
+                            &self.rx_buffer[..self.rx_buffer.len().min(64)],
+                        );
+                        warn!(
+                            "framing desync: try_unframe rejected {} buffer bytes \
+                             (head: {}…) — clearing buffer and surfacing error so \
+                             caller retries clean",
+                            self.rx_buffer.len(),
+                            head_hex,
+                        );
+                        self.rx_buffer.clear();
+                        return Err(e);
+                    }
+                };
+                if let Some(payload) = unframed {
                     // Tesla never sends RoutableMessages this small —
                     // the minimum useful response has at least a
                     // to_destination + uuid + status, which is well
@@ -241,6 +295,21 @@ impl Connection {
                         debug!(
                             "discarding VCSEC BROADCAST notification ({} bytes): {} — \
                              not a response to our request, continuing to RX",
+                            payload.len(),
+                            hex::encode(&payload[..payload.len().min(48)])
+                        );
+                        continue;
+                    }
+                    // Caller-supplied shape check. If the bytes don't
+                    // look like the protocol message the caller is
+                    // expecting (e.g. RoutableMessage::decode fails),
+                    // discard the frame and keep RX'ing. This catches
+                    // framing desyncs that happen to produce a
+                    // valid-LENGTH-but-garbage-CONTENT payload — the
+                    // common pattern we saw on bluez 5.82 post-reconnect.
+                    if !accept(&payload) {
+                        debug!(
+                            "validator rejected frame ({} bytes), continuing to RX: head={}",
                             payload.len(),
                             hex::encode(&payload[..payload.len().min(48)])
                         );

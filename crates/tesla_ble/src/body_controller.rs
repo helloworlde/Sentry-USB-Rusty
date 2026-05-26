@@ -25,8 +25,14 @@ use crate::proto::vcsec::{
 pub async fn query(conn: &mut Connection) -> Result<VehicleStatus> {
     let payload = build_request();
     info!("body-controller-state: TX {} bytes", payload.len());
+    // Validator: must decode as a RoutableMessage. Same rationale
+    // as the manager.rs signed-query path — discards desynced
+    // frames at the transport layer so the response parser only
+    // sees frames that survived a proto-level smoke test.
     let response_bytes = conn
-        .round_trip(&payload, Duration::from_secs(10))
+        .round_trip(&payload, Duration::from_secs(10), |b| {
+            RoutableMessage::decode(b).is_ok()
+        })
         .await
         .context("BLE round-trip")?;
     info!("body-controller-state: RX {} bytes", response_bytes.len());

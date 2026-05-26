@@ -103,17 +103,19 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sentryusb-telemetry
-# Send SIGTERM and give the process up to 12s to release the radio
-# lock and restart sentryusb-ble before SIGKILL. The signal handler
-# in main.rs does both before returning.
+# Send SIGTERM and give the process up to 20s to release the radio
+# lock and restart sentryusb-ble before SIGKILL.
 #
-# 12s (was 8s): observed a real shutdown that timed out at 8s during
-# a daemon update — the BLE side was mid-handshake or mid-query when
-# SIGTERM arrived and couldn't unwind cleanly in time, so systemd
-# SIGKILL'd it. SIGKILL leaves the radio lock + bluez state hanging
-# until the new daemon's own ExecStartPre cleanup catches up.
+# 20s (was 12s, originally 8s): an actual update on a tester's Pi
+# showed the 12s budget still SIGKILL'd because the SIGTERM signal
+# took ~11s to even reach the tokio handler — tokio was blocked
+# inside a BLE round-trip whose underlying btleplug + bluez D-Bus
+# call doesn't fully respect cancellation. The 20s budget keeps
+# the worst-case "SIGTERM arrived mid-BLE-query" path clean.
+# Pairs with the bounded shell-out in release_radio (main.rs) so
+# the handler itself never blocks more than a few seconds.
 KillSignal=SIGTERM
-TimeoutStopSec=12
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target
