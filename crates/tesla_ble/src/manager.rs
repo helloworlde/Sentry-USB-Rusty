@@ -387,7 +387,46 @@ impl PersistentSession {
         crate::responses::parse_drive(&bytes)
     }
 
+    /// `state drive` — same wire call as `get_drive` but returns the
+    /// FULL `VehicleData` (specifically, both `drive_state` AND
+    /// `location_state`) rather than just drive_state.
+    ///
+    /// Why both: Tesla's `state drive` responses bundle a snapshot of
+    /// LocationState alongside DriveState, with the
+    /// reverse-geocoded `location_name` field populated. Standalone
+    /// `state location` queries return raw GPS coords but NOT
+    /// location_name — Tesla appears to only emit the human-readable
+    /// address as a side effect of drive-state retrieval. Confirmed
+    /// empirically with a tester's `tesla-control state drive` capture
+    /// showing `locationState: { locationName: "..." }` while
+    /// `tesla-control state location` for the same vehicle returned
+    /// only lat/lon/heading.
+    ///
+    /// Use this instead of `get_drive` when you also want the address.
+    /// Same BLE round-trip cost — Tesla returns LocationState whether
+    /// we ask for it or not.
+    pub async fn get_drive_with_location(
+        &self,
+    ) -> Result<(
+        crate::proto::car_server::DriveState,
+        Option<crate::proto::car_server::LocationState>,
+    )> {
+        let bytes = self
+            .query(Domain::Infotainment, VehicleDataState::Drive)
+            .await?;
+        let vd = crate::responses::parse_vehicle_data(&bytes)?;
+        let drive = vd
+            .drive_state
+            .context("response missing drive_state")?;
+        Ok((drive, vd.location_state))
+    }
+
     /// `state location`. GPS coords (when authorized).
+    ///
+    /// NOTE: This does NOT return `location_name` — that field is only
+    /// populated in the LocationState bundled into `state drive`
+    /// responses. Use `get_drive_with_location` if you need the
+    /// address. Kept around for future GPS-coordinate usage.
     pub async fn get_location(&self) -> Result<crate::proto::car_server::LocationState> {
         let bytes = self
             .query(Domain::Infotainment, VehicleDataState::Location)

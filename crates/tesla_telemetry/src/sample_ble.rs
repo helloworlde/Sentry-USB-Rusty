@@ -21,8 +21,7 @@ use tracing::{info, warn};
 
 use crate::sample::{
     BodyControllerSample, ChargeResult, ChargingState, ClimateResult, ClosuresResult,
-    DriveResult, LocationResult, ResponseMeta, Sample, SentryMode, ShiftState, TiresResult,
-    now_secs,
+    DriveResult, ResponseMeta, Sample, SentryMode, ShiftState, TiresResult, now_secs,
 };
 
 /// 1 bar = 14.5038 psi (NIST). Tesla reports TPMS in bar on the wire.
@@ -97,16 +96,21 @@ fn map_sentry_mode(sm: &car_server::closures_state::SentryModeState) -> SentryMo
     }
 }
 
-/// `state drive` over BLE. Carries the two signals that matter for
-/// drive tracking: shift state (phase machine) and odometer (mile
-/// counter). `location_name` is always None here — it lives in
-/// `state location` instead and is fetched by the dedicated
-/// `sample_location_ble` sub-sampler.
+/// `state drive` over BLE. Carries three signals:
+///   * shift_state (phase-machine input)
+///   * odometer (mile counter)
+///   * location_name (reverse-geocoded address)
+///
+/// All three live in Tesla's `state drive` response — odometer + shift
+/// in the DriveState sub-message, location_name in a bundled
+/// LocationState sub-message. Tesla returns location_name ONLY in
+/// drive responses (not in standalone `state location` queries which
+/// return raw GPS coords without the name), so this is the path
+/// that keeps the displayed address fresh.
 pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult> {
     let started = Instant::now();
-    let drive = session.get_drive().await?;
+    let (drive, location) = session.get_drive_with_location().await?;
     let elapsed = started.elapsed().as_millis();
-    info!("state-poll: drive=ok({}ms) via in-process BLE", elapsed);
 
     let shift_state = drive.shift_state.as_ref().map(map_shift_state);
     let odometer_mi = drive
@@ -116,10 +120,33 @@ pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult
             let car_server::drive_state::OptionalOdometerInHundredthsOfAMile::OdometerInHundredthsOfAMile(h) = o;
             (*h as f64) / 100.0
         });
+    // Extract location_name from the bundled LocationState (Tesla
+    // includes this in every drive response when it has a fresh
+    // reverse-geocoded name to give us). May be None when the car
+    // is parked-and-unchanged — that's expected.
+    let location_name = location.and_then(|l| {
+        l.optional_location_name.as_ref().map(|v| {
+            let car_server::location_state::OptionalLocationName::LocationName(n) = v;
+            n.clone()
+        })
+    });
     let meta = build_meta(drive.timestamp.as_ref(), started);
 
+    // Log address freshness so a bundle shows whether Tesla is
+    // returning it on this poll vs leaving it out.
+    match &location_name {
+        Some(n) => info!(
+            "state-poll: drive=ok({}ms) location=\"{}\" via in-process BLE",
+            elapsed, n
+        ),
+        None => info!(
+            "state-poll: drive=ok({}ms) location=<absent> via in-process BLE",
+            elapsed
+        ),
+    }
+
     Ok(DriveResult {
-        location_name: None,
+        location_name,
         odometer_mi,
         shift_state,
         meta,
@@ -203,52 +230,14 @@ pub async fn sample_charge_ble(session: &PersistentSession) -> Result<ChargeResu
     })
 }
 
-/// `state location` over BLE. The ONLY source of `location_name`
-/// (the reverse-geocoded address string the UI displays). `state
-/// drive` doesn't carry it — that was the bug behind "address never
-/// updates" for the entire post-cutover window: tesla-control's JSON
-/// happened to bundle location_name into the drive response, so the
-/// shell-out path got it for free; the typed in-process path asks
-/// for only what each `state X` returns and `state drive` omits it.
-///
-/// GPS coordinates (latitude/longitude/heading/etc.) are also in
-/// LocationState but we don't surface them anywhere yet — adding
-/// them is a few lines whenever we have a UI surface for them.
-pub async fn sample_location_ble(session: &PersistentSession) -> Result<LocationResult> {
-    let started = Instant::now();
-    let location = session.get_location().await?;
-    let elapsed = started.elapsed().as_millis();
-
-    let location_name = location.optional_location_name.as_ref().map(|v| {
-        let car_server::location_state::OptionalLocationName::LocationName(n) = v;
-        n.clone()
-    });
-    // Include the value in the log so a bundle can show whether Tesla
-    // actually returns location_name on each poll vs returning a
-    // LocationState with no optional_location_name set. Tesla appears
-    // to omit the field for parked-and-unchanged vehicles, which
-    // looks like "location never updates" from the UI side (the
-    // sampler writes None → DB row has NULL → "latest non-null"
-    // query returns the prior value). Knowing whether the field
-    // was Some/None lets us decide whether to push the user to
-    // expect that behaviour or to retry / hit a different state.
-    match &location_name {
-        Some(n) => info!(
-            "state-poll: location=ok({}ms) name=\"{}\" via in-process BLE",
-            elapsed, n
-        ),
-        None => info!(
-            "state-poll: location=ok({}ms) name=<absent> via in-process BLE",
-            elapsed
-        ),
-    }
-    let meta = build_meta(location.timestamp.as_ref(), started);
-
-    Ok(LocationResult {
-        location_name,
-        meta,
-    })
-}
+// sample_location_ble was removed: standalone `state location`
+// queries return GPS coords but NOT location_name (Tesla only
+// emits the reverse-geocoded name in the LocationState bundled
+// into `state drive` responses, confirmed via wire capture).
+// sample_drive_ble now extracts the address directly. Keeping this
+// note so the next person who thinks "I'll add a location poll"
+// doesn't repeat the dead-end. If we want GPS coords later,
+// session.get_location() still works — just don't expect a name.
 
 /// `state closures` over BLE. Only field we currently care about is
 /// `sentry_mode_state`, which the phase machine uses to decide
