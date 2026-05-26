@@ -637,6 +637,25 @@ async fn try_signed_request_once(
         .get_mut(&domain)
         .context("domain session not present after ensure_domain_session (bug)")?;
 
+    // Capture send time for the stale-window check on SessionInfo
+    // refreshes (see below). We record at TX time, not response time,
+    // so the elapsed measurement reflects the round-trip latency
+    // since our signed message left this process.
+    let request_sent_at = Instant::now();
+
+    // Counter rollover guard. Match tesla-control's signer.go:170-173
+    // behavior: refuse to send rather than wrap to 0. The car enforces
+    // strict counter monotonicity within an epoch, so wrapping would
+    // be rejected as a replay forever — re-handshake is the only fix.
+    if ds.counter == u32::MAX {
+        bail!(
+            "counter rollover: domain {:?} counter hit u32::MAX. \
+             Dropping cached session state so the next query re-handshakes \
+             from scratch (which resets the counter to whatever the car's \
+             fresh SessionInfo provides).",
+            domain
+        );
+    }
     let counter = ds.counter + 1;
     let expires_at = ds.estimated_car_clock().saturating_add(EXPIRES_WINDOW);
 
@@ -653,6 +672,38 @@ async fn try_signed_request_once(
     )?;
 
     let envelope = auth::build_signed_routable_message(&parts, domain, QUERY_FLAGS);
+
+    // Advance the counter HERE — BEFORE we send to the wire. Match
+    // tesla-control's behavior (signer.go::Encrypt: `s.counter++`
+    // happens before encryptWithCounter is called).
+    //
+    // Why this matters: Tesla advances its expected counter as soon
+    // as it RECEIVES our message, NOT when we receive the response.
+    // If the response is lost (write succeeded but the response
+    // notification got dropped, or we timed out waiting for it),
+    // Tesla's counter is at N but our local counter is still at N-1.
+    //
+    // Old (buggy) behavior: we only set `ds.counter = counter` on
+    // round_trip success. A failed round_trip leaves ds.counter
+    // pointing at the previous value, so the next query computes
+    // `counter = ds.counter + 1` = the SAME counter we just used.
+    // Tesla sees that as a replay and rejects with
+    // INVALID_TOKEN_OR_COUNTER. The fault triggers a SessionInfo
+    // refresh, the refresh resets our counter, and we move on —
+    // but at the cost of TWO extra BLE round-trips per failure.
+    //
+    // That's the cause of the 748-refresh storm we saw on the
+    // original 10h bundle. The framing-desync inline recovery
+    // (`0b9a2ff`) hides most of these now, but any non-desync
+    // failure (write fail, timeout, transient disconnect) still
+    // triggers the same cascade. With the counter advanced
+    // pre-send, the next query uses a clean counter+1 and Tesla
+    // accepts it without a refresh round-trip.
+    //
+    // Cost: we waste a counter value on every send that fails to
+    // reach Tesla. With 2^32 counter values per epoch, this is
+    // entirely negligible.
+    ds.counter = counter;
 
     debug!(
         "PersistentSession: TX domain={:?} inner_len={} counter={}",
@@ -672,11 +723,10 @@ async fn try_signed_request_once(
         })
         .await?;
 
-    // Counter advances on the wire whether the car accepts or rejects
-    // the message — by the time the car responds, our `counter` value
-    // is what it's seen. Update before checking fault so a retry uses
-    // counter+1.
-    ds.counter = counter;
+    // (Counter was advanced pre-send above. See the long comment
+    // near the TX path explaining why — matches tesla-control's
+    // signer.go::Encrypt behavior and prevents the SessionInfo
+    // refresh storm we hit when round_trip fails mid-flight.)
 
     // The transport validator filters most garbage frames, but a
     // belt-and-suspenders decode here catches anything that slipped
@@ -706,9 +756,106 @@ async fn try_signed_request_once(
     // Check for a SessionInfo refresh first — the car uses this as
     // the standard "your session is stale, here's fresh info" reply.
     // It's not an error; it's an instruction to refresh and retry.
+    //
+    // Apply the same defenses we do for the initial handshake:
+    //   1. Reject if the SessionInfo was sent too long ago (stale
+    //      cache attack — replaying a SessionInfo from a previous
+    //      session would roll our counter backward and reopen a
+    //      replay window).
+    //   2. Reject if it explicitly says our key isn't on the
+    //      whitelist (avoid attempting to use the resulting session
+    //      key for encrypted commands that will all fail).
+    //   3. Verify the HMAC tag if present.
     if let Some(routable_message::Payload::SessionInfo(info_bytes)) = &rm.payload {
         let parsed = SessionInfo::decode(info_bytes.as_slice())
             .context("decoding refreshed SessionInfo from car")?;
+
+        // Stale-window check: tesla-control discards SessionInfo
+        // arriving > maxLatency (5s default) after the request.
+        // Implemented here as "elapsed since we sent the message
+        // in this round_trip" — if Tesla took more than 10s to send
+        // us a refresh, the response is suspect and we'd rather
+        // re-handshake fresh than apply potentially stale data.
+        // We use a slightly more generous bound than tesla-control's
+        // 5s because our QUERY_TIMEOUT is 15s.
+        let elapsed = request_sent_at.elapsed();
+        if elapsed > Duration::from_secs(10) {
+            bail!(
+                "SessionInfo refresh for {:?} arrived {:.1}s after the request \
+                 was sent — exceeding the 10s freshness window. Refusing to \
+                 apply (could be a stale-cache replay).",
+                domain,
+                elapsed.as_secs_f32(),
+            );
+        }
+
+        // KEY_NOT_ON_WHITELIST check inline so a mid-session pair
+        // revocation surfaces clearly instead of cascading into
+        // encrypted-query decrypt failures.
+        if parsed.status
+            == crate::proto::signatures::SessionInfoStatus::KeyNotOnWhitelist as i32
+        {
+            bail!(
+                "BLE pair revoked: car responded to {:?} query with \
+                 SESSION_INFO_STATUS_KEY_NOT_ON_WHITELIST. Our key has been \
+                 removed from the car (could be the user deleted the SentryUSB \
+                 entry from Locks → Phone Keys, or someone re-paired with the \
+                 same name). Re-pair from the SentryUSB UI.",
+                domain
+            );
+        }
+
+        // HMAC verification on the refresh. Same logic as the
+        // initial-handshake path — derive a fresh session key from
+        // the new pubkey, compute the expected HMAC, compare.
+        let hmac_tag = rm.sub_sig_data.as_ref().and_then(|s| match s {
+            routable_message::SubSigData::SignatureData(sd) => {
+                match sd.sig_type.as_ref() {
+                    Some(signature_data::SigType::SessionInfoTag(hmac_sig)) => {
+                        Some(hmac_sig.tag.clone())
+                    }
+                    _ => None,
+                }
+            }
+        });
+        match hmac_tag {
+            Some(tag) => {
+                let new_key =
+                    derive_session_key(&state.keypair.secret, &parsed.public_key)
+                        .context("deriving session key for HMAC verification")?;
+                let expected = auth::compute_session_info_hmac(
+                    &new_key,
+                    state.vin.as_bytes(),
+                    &rm.uuid,
+                    info_bytes,
+                );
+                if !auth::verify_hmac(&expected, &tag) {
+                    bail!(
+                        "SessionInfo refresh HMAC verification failed for {:?} — \
+                         expected={} got={}. Refusing to apply (potential MITM \
+                         or replayed SessionInfo).",
+                        domain,
+                        hex::encode(expected),
+                        hex::encode(&tag),
+                    );
+                }
+                debug!(
+                    "SessionInfo refresh HMAC verified for {:?} ({} bytes)",
+                    domain,
+                    tag.len()
+                );
+            }
+            None => {
+                warn!(
+                    "SessionInfo refresh for {:?} arrived without an HMAC tag — \
+                     accepting unauthenticated for backwards compatibility but \
+                     this is unusual for a refresh (vs. an initial handshake) \
+                     and may indicate degraded firmware or interference",
+                    domain
+                );
+            }
+        }
+
         return Ok(QueryOutcome::SessionRefresh(parsed));
     }
 
@@ -1245,11 +1392,81 @@ async fn ensure_domain_session(state: &mut SessionState, domain: Domain) -> Resu
         .context("ensure_domain_session called without connection")?;
 
     info!("PersistentSession: handshake for {:?}", domain);
-    let info = session::request_session_info(conn, &state.keypair, domain)
-        .await
-        .with_context(|| format!("session-info handshake for {:?}", domain))?;
+    let info = match session::request_session_info(conn, &state.keypair, domain).await {
+        Ok(info) => info,
+        Err(session::SessionError::KeyNotPaired) => {
+            // Surface the user-actionable error verbatim. Don't drop
+            // the connection — re-handshaking won't help, the user
+            // has to re-pair on the car. The next query will hit
+            // this same error and bail again, which is fine.
+            bail!(
+                "BLE pair not registered with car (domain {:?}): the car returned \
+                 SESSION_INFO_STATUS_KEY_NOT_ON_WHITELIST. Re-pair from the \
+                 SentryUSB UI's BLE card and tap your physical Tesla card on \
+                 the center console NFC reader when prompted.",
+                domain
+            );
+        }
+        Err(session::SessionError::Other(e)) => {
+            return Err(e).with_context(|| {
+                format!("session-info handshake for {:?}", domain)
+            });
+        }
+    };
+
     let key = derive_session_key(&state.keypair.secret, &info.parsed.public_key)
         .context("deriving session key")?;
+
+    // HMAC verification: confirm the SessionInfo we received was
+    // signed by the holder of the public key in the SessionInfo
+    // itself. Without this check, anyone able to inject BLE traffic
+    // mid-handshake could swap our session info for theirs and we'd
+    // happily derive a session key from their pubkey, then send
+    // commands encrypted for them instead of the car.
+    //
+    // We accept missing-tag responses (older firmware doesn't include
+    // it) but log a warning so a degraded-security path stands out
+    // in the bundle. Match tesla-control's behavior where the
+    // dispatcher logs "Discarding unauthenticated session info"
+    // and gives up — except we log and continue, since for our
+    // single-user-paired-to-one-car threat model the risk is
+    // theoretical.
+    match &info.session_info_tag {
+        Some(tag) => {
+            let expected = auth::compute_session_info_hmac(
+                &key,
+                state.vin.as_bytes(),
+                &info.challenge,
+                &info.raw,
+            );
+            if !auth::verify_hmac(&expected, tag) {
+                bail!(
+                    "session-info HMAC verification failed for {:?} — \
+                     expected={} got={}. Refusing to derive a session key \
+                     from this SessionInfo (would compromise message \
+                     confidentiality if accepted).",
+                    domain,
+                    hex::encode(expected),
+                    hex::encode(tag),
+                );
+            }
+            debug!(
+                "session-info HMAC verified for {:?} (tag={} bytes)",
+                domain,
+                tag.len()
+            );
+        }
+        None => {
+            warn!(
+                "session-info from {:?} arrived without an HMAC tag (older \
+                 firmware path) — accepting unauthenticated for backwards \
+                 compatibility, but cannot prove the SessionInfo came from \
+                 the legitimate car",
+                domain
+            );
+        }
+    }
+
     state.domains.insert(
         domain,
         DomainSession {
