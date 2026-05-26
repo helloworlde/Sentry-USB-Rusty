@@ -17,12 +17,14 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use chrono::Local;
 
 use crate::router::AppState;
 
 const CAM_DISK_PATH: &str = "/backingfiles/cam_disk.bin";
+const HISTORY_PATH: &str = "/mutable/sentryusb-ble.log";
 
 pub async fn get_ble_debug(State(s): State<AppState>) -> Response {
     let mut out = String::with_capacity(4096);
@@ -313,7 +315,6 @@ fn format_age(ts: Option<i64>, now: i64) -> String {
 /// Lets the user scroll back through hours of state without keeping
 /// a browser tab open.
 fn write_history(out: &mut String) {
-    const HISTORY_PATH: &str = "/mutable/sentryusb-ble.log";
     // Tail ~400 lines (≈6+ hours at one line/min). Cheap to read
     // since the file rotates at 5 MB.
     match std::fs::read_to_string(HISTORY_PATH) {
@@ -385,5 +386,475 @@ async fn write_journal(out: &mut String, lines: usize) {
         Err(e) => {
             out.push_str(&format!("journalctl failed to spawn: {}\n", e));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bundle endpoint — `GET /api/logs/bluetooth/bundle`
+//
+// Same conceptual content as the on-screen dashboard, plus all the
+// SSH-only stuff a support session usually needs: full (unfiltered)
+// journal for the sampler service, current-boot bluetooth-stack
+// journal, dmesg BLE lines, hciconfig output, rfkill state, sysfs LE
+// connection parameters (so we can confirm the supervision-timeout
+// tune actually took), pairing-key fingerprint, and the entire
+// per-minute history file. Returned as one downloadable text blob so
+// a tester just clicks "Download" and pastes the file back.
+// ---------------------------------------------------------------------------
+
+/// GET /api/logs/bluetooth/bundle — comprehensive single-file BLE
+/// diagnostic dump. Content-Disposition makes the browser save it
+/// with a timestamped filename instead of rendering it.
+pub async fn get_ble_bundle(State(s): State<AppState>) -> Response {
+    let mut out = String::with_capacity(64 * 1024);
+    let now = unix_now();
+
+    bundle_header(&mut out);
+
+    section(&mut out, "Service status (full)");
+    write_systemctl_status_full(&mut out).await;
+
+    section(&mut out, "Adapter status");
+    write_adapter_status(&mut out);
+
+    section(&mut out, "BLE LE parameters (sysfs)");
+    write_le_params(&mut out);
+
+    section(&mut out, "hciconfig -a");
+    write_hciconfig(&mut out).await;
+
+    section(&mut out, "rfkill list");
+    write_rfkill(&mut out).await;
+
+    section(&mut out, "Tesla pairing state");
+    write_pairing_state(&mut out);
+
+    section(&mut out, "Radio lock state");
+    write_lock_state(&mut out);
+
+    section(&mut out, "sentryusb.conf BLE_* keys");
+    write_conf_keys(&mut out);
+
+    section(&mut out, "Car observation");
+    write_observation(&mut out, now);
+
+    section(&mut out, "Sample database (last 1 hour)");
+    write_sample_db_extended(&mut out, &s, now).await;
+
+    section(&mut out, "dmesg (BLE/bluetooth lines)");
+    write_dmesg_ble(&mut out).await;
+
+    section(&mut out, "bluetoothd journal (current boot)");
+    write_bluetoothd_journal(&mut out).await;
+
+    section(&mut out, "Full sampler journal (unfiltered, last ~5000 lines)");
+    write_journal_full(&mut out, 5000).await;
+
+    section(&mut out, "Per-minute history (full file)");
+    write_history_full(&mut out);
+
+    let filename = format!(
+        "sentryusb-ble-bundle-{}.txt",
+        Local::now().format("%Y%m%d-%H%M%S")
+    );
+
+    // HeaderMap (not the tuple/array form) because Content-Disposition
+    // carries a dynamic filename — the static-str tuple form won't
+    // accept a String.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&format!(
+        "attachment; filename=\"{}\"",
+        filename
+    )) {
+        headers.insert(header::CONTENT_DISPOSITION, v);
+    }
+    (StatusCode::OK, headers, out).into_response()
+}
+
+fn bundle_header(out: &mut String) {
+    let now = Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string();
+    let hostname = std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
+    let uptime = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().map(|x| x.to_string()))
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|secs| {
+            let s = secs as u64;
+            format!("{}d {}h {}m", s / 86400, (s % 86400) / 3600, (s % 3600) / 60)
+        })
+        .unwrap_or_else(|| "<unknown>".into());
+    out.push_str(&format!(
+        "SentryUSB BLE diagnostic bundle\n\
+         generated: {}\n\
+         hostname:  {}\n\
+         uptime:    {}\n",
+        now, hostname, uptime
+    ));
+}
+
+async fn write_systemctl_status_full(out: &mut String) {
+    match tokio::process::Command::new("systemctl")
+        .args(["status", "sentryusb-telemetry", "--no-pager"])
+        .output()
+        .await
+    {
+        Ok(o) => {
+            out.push_str(&String::from_utf8_lossy(&o.stdout));
+            let err = String::from_utf8_lossy(&o.stderr);
+            if !err.trim().is_empty() {
+                out.push_str("\n[stderr]\n");
+                out.push_str(&err);
+            }
+        }
+        Err(e) => out.push_str(&format!("systemctl failed: {}\n", e)),
+    }
+}
+
+/// Verify the bluez LE parameter tune (set in the
+/// sentryusb-telemetry.service ExecStartPre) actually applied. If
+/// supervision_timeout still reads 72 (720ms default) instead of
+/// 600 (6s), debugfs wasn't writable or the path was wrong — the
+/// supervision-timeout fix didn't take effect for this user.
+fn write_le_params(out: &mut String) {
+    let mut any = false;
+    if let Ok(entries) = std::fs::read_dir("/sys/kernel/debug/bluetooth") {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("hci") {
+                continue;
+            }
+            any = true;
+            out.push_str(&format!("[{}]\n", name));
+            for key in [
+                "supervision_timeout",
+                "conn_min_interval",
+                "conn_max_interval",
+                "conn_latency",
+                "adv_min_interval",
+                "adv_max_interval",
+            ] {
+                let path = entry.path().join(key);
+                let val = std::fs::read_to_string(&path)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "<unreadable>".into());
+                out.push_str(&format!("  {:<22} = {}\n", key, val));
+            }
+        }
+    }
+    if !any {
+        out.push_str(
+            "  /sys/kernel/debug/bluetooth/ is missing (debugfs not mounted?). \
+             The ExecStartPre LE-tune writes are silently skipped in this\n  \
+             environment — supervision_timeout will be the bluez default (~720ms)\n  \
+             which may explain frequent in-drive disconnects.\n",
+        );
+    }
+    out.push_str(
+        "\nExpected after our ExecStartPre tune:\n  \
+         supervision_timeout = 600 (6000ms, was 72/720ms default)\n  \
+         conn_min_interval   = 12  (15ms, was 24/30ms)\n  \
+         conn_max_interval   = 24  (30ms, was 40/50ms)\n  \
+         conn_latency        = 0   (no events skipped)\n",
+    );
+}
+
+async fn write_hciconfig(out: &mut String) {
+    match tokio::process::Command::new("hciconfig").arg("-a").output().await {
+        Ok(o) => out.push_str(&String::from_utf8_lossy(&o.stdout)),
+        Err(e) => out.push_str(&format!("hciconfig failed: {}\n", e)),
+    }
+}
+
+async fn write_rfkill(out: &mut String) {
+    match tokio::process::Command::new("rfkill").arg("list").output().await {
+        Ok(o) => out.push_str(&String::from_utf8_lossy(&o.stdout)),
+        Err(e) => out.push_str(&format!("rfkill failed: {}\n", e)),
+    }
+}
+
+/// Confirm the BLE keypair exists + when it was generated. Doesn't
+/// log the key material itself — just file metadata and a SHA-1
+/// fingerprint of the public key, which is enough to tell whether
+/// the user has re-paired since the issue started OR is missing the
+/// key entirely.
+fn write_pairing_state(out: &mut String) {
+    let priv_path = "/root/.ble/key_private.pem";
+    let pub_path = "/root/.ble/key_public.pem";
+    for (label, path) in [
+        ("private key", priv_path),
+        ("public key", pub_path),
+    ] {
+        match std::fs::metadata(path) {
+            Ok(m) => {
+                let size = m.len();
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let mtime_str = chrono::DateTime::from_timestamp(mtime as i64, 0)
+                    .map(|dt| {
+                        dt.with_timezone(&Local)
+                            .format("%Y-%m-%d %H:%M:%S %Z")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "<unparseable>".into());
+                out.push_str(&format!(
+                    "  {:<12} {} ({} bytes, mtime {})\n",
+                    label, path, size, mtime_str
+                ));
+            }
+            Err(_) => {
+                out.push_str(&format!(
+                    "  {:<12} {} MISSING\n",
+                    label, path
+                ));
+            }
+        }
+    }
+    // Public-key fingerprint — a stable identity marker. SHA-256 of
+    // the SPKI PEM bytes is fine; the user can compare across
+    // re-pairings to see whether the key actually changed. Truncated
+    // to 8 bytes (16 hex chars + colons) — long enough to be
+    // distinct, short enough to read at a glance.
+    if let Ok(pem) = std::fs::read(pub_path) {
+        let digest = ring::digest::digest(&ring::digest::SHA256, &pem);
+        let fp: String = digest
+            .as_ref()
+            .iter()
+            .take(8)
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(":");
+        out.push_str(&format!("  pubkey sha256 (truncated): {}\n", fp));
+    }
+}
+
+fn write_lock_state(out: &mut String) {
+    let lock_path = "/tmp/ble_radio_owner";
+    match std::fs::read_to_string(lock_path) {
+        Ok(contents) => {
+            out.push_str(&format!("  {} contents:\n", lock_path));
+            for line in contents.lines() {
+                out.push_str(&format!("    {}\n", line));
+            }
+            if let Ok(m) = std::fs::metadata(lock_path) {
+                if let Ok(mtime) = m.modified() {
+                    if let Ok(d) = mtime.duration_since(UNIX_EPOCH) {
+                        let age = unix_now() - d.as_secs() as i64;
+                        out.push_str(&format!("  lock age: {}s\n", age.max(0)));
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            out.push_str(&format!("  {}: not held (no owner)\n", lock_path));
+        }
+    }
+}
+
+fn write_conf_keys(out: &mut String) {
+    let path = "/root/sentryusb.conf";
+    match std::fs::read_to_string(path) {
+        Ok(s) => {
+            for line in s.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("export BLE_")
+                    || trimmed.starts_with("export TESLA_BLE_VIN")
+                {
+                    // Mask the VIN — only show first 3 + last 4 chars
+                    // so a screenshot of this bundle doesn't leak the
+                    // full VIN. Same length so the format is stable.
+                    if trimmed.starts_with("export TESLA_BLE_VIN") {
+                        let masked = mask_vin_line(trimmed);
+                        out.push_str(&format!("  {}\n", masked));
+                    } else {
+                        out.push_str(&format!("  {}\n", trimmed));
+                    }
+                }
+            }
+        }
+        Err(e) => out.push_str(&format!("  {} unreadable: {}\n", path, e)),
+    }
+}
+
+/// `export TESLA_BLE_VIN="5YJ3E1EA1KF000001"` -> `... "5YJ...0001"`
+/// Keeps the format recognizable but drops the middle 10 chars that
+/// uniquely identify the vehicle.
+fn mask_vin_line(line: &str) -> String {
+    let parts: Vec<&str> = line.splitn(2, '=').collect();
+    if parts.len() != 2 {
+        return line.to_string();
+    }
+    let value = parts[1].trim_matches(|c| c == '"' || c == '\'');
+    if value.len() < 8 {
+        return line.to_string();
+    }
+    let masked = format!("{}...{}", &value[..3], &value[value.len() - 4..]);
+    format!("{}=\"{}\"", parts[0], masked)
+}
+
+/// Same as write_sample_db but a 1-hour window with per-source counts
+/// + per-10-minute bucket breakdown so a tester can see where the
+/// gap was if the link dropped mid-bundle window.
+async fn write_sample_db_extended(out: &mut String, s: &AppState, now: i64) {
+    let store = s.drives.store.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        store.with_locked_conn(|conn| {
+            let since = now - 3600;
+            let state_n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM telemetry_samples \
+                     WHERE ts >= ?1 AND source='state'",
+                    (since,),
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let bc_n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM telemetry_samples \
+                     WHERE ts >= ?1 AND source='body_controller'",
+                    (since,),
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            // 10-min buckets across the hour, oldest to newest.
+            let mut buckets = Vec::with_capacity(6);
+            for i in 0..6 {
+                let bucket_start = since + i * 600;
+                let bucket_end = bucket_start + 600;
+                let n: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM telemetry_samples \
+                         WHERE ts >= ?1 AND ts < ?2",
+                        (bucket_start, bucket_end),
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                buckets.push(n);
+            }
+            (state_n, bc_n, buckets)
+        })
+    })
+    .await
+    .ok();
+    let (state_n, bc_n, buckets) = res.unwrap_or((0, 0, vec![0; 6]));
+    out.push_str(&format!(
+        "last hour: {} total ({} state, {} body-controller)\n\n",
+        state_n + bc_n,
+        state_n,
+        bc_n,
+    ));
+    out.push_str("per-10-min bucket (oldest → newest):\n");
+    for (i, n) in buckets.iter().enumerate() {
+        let bar = "#".repeat((*n as usize).min(60));
+        out.push_str(&format!("  [-{:>2}min..-{:>2}min] {:>4} {}\n",
+            60 - i * 10,
+            50 - i * 10,
+            n,
+            bar,
+        ));
+    }
+}
+
+/// dmesg lines mentioning bluetooth/BLE/hci. Useful for catching
+/// firmware load failures, link-supervision-timeout events, and
+/// HCI command failures that don't reach our user-space logs.
+async fn write_dmesg_ble(out: &mut String) {
+    match tokio::process::Command::new("dmesg")
+        .args(["-T", "--ctime"])
+        .output()
+        .await
+    {
+        Ok(o) => {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            let patterns = ["Bluetooth", "bluetooth", "BLE", "hci", "btusb"];
+            let mut last: Vec<&str> = raw
+                .lines()
+                .filter(|l| patterns.iter().any(|p| l.contains(p)))
+                .collect();
+            // Cap to last 200 BLE-related lines — older entries are
+            // almost always boot-time firmware load noise.
+            let start = last.len().saturating_sub(200);
+            for line in last.drain(start..) {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        Err(e) => out.push_str(&format!("dmesg failed: {}\n", e)),
+    }
+}
+
+async fn write_bluetoothd_journal(out: &mut String) {
+    match tokio::process::Command::new("journalctl")
+        .args([
+            "-u",
+            "bluetooth",
+            "-b", // current boot only
+            "--no-pager",
+            "--output=short-iso",
+        ])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            out.push_str(&String::from_utf8_lossy(&o.stdout));
+        }
+        Ok(o) => {
+            out.push_str(&format!(
+                "journalctl -u bluetooth exited {}: {}\n",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr).trim(),
+            ));
+        }
+        Err(e) => out.push_str(&format!("journalctl failed: {}\n", e)),
+    }
+}
+
+/// Unfiltered journal tail for the sampler service. The on-screen
+/// view filters to "interesting" patterns; the bundle keeps
+/// everything so we can spot rare panics, RUST_LOG=debug lines, etc.
+async fn write_journal_full(out: &mut String, lines: usize) {
+    match tokio::process::Command::new("journalctl")
+        .args([
+            "-u",
+            "sentryusb-telemetry",
+            "-n",
+            &lines.to_string(),
+            "--no-pager",
+            "--output=short-iso",
+        ])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            out.push_str(&String::from_utf8_lossy(&o.stdout));
+        }
+        Ok(o) => {
+            out.push_str(&format!(
+                "journalctl exited {}: {}\n",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr).trim(),
+            ));
+        }
+        Err(e) => out.push_str(&format!("journalctl failed: {}\n", e)),
+    }
+}
+
+/// Whole per-minute history file (vs the on-screen 400-line tail).
+/// File rotates at 5 MB so this is bounded — typically 100-200 KB.
+fn write_history_full(out: &mut String) {
+    match std::fs::read_to_string(HISTORY_PATH) {
+        Ok(raw) => out.push_str(&raw),
+        Err(_) => out.push_str(
+            "(no history yet — file appears on first sampler tick after install)\n",
+        ),
     }
 }

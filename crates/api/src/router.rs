@@ -58,6 +58,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/files/download-zip", get(crate::files::download_zip))
         .route("/api/files/download-zip-multi", post(crate::files::download_zip_multi))
         // Logs
+        // Bundle endpoint must come BEFORE the /{name} catch-all,
+        // otherwise axum would treat "bluetooth/bundle" as `name=bluetooth/bundle`
+        // and the path validator (which rejects '/' in name) would 400.
+        .route(
+            "/api/logs/bluetooth/bundle",
+            get(crate::ble_debug::get_ble_bundle),
+        )
         .route("/api/logs/{name}", get(crate::logs::get_log))
         // Diagnostics & health
         .route("/api/diagnostics/refresh", post(crate::healthcheck::refresh_diagnostics))

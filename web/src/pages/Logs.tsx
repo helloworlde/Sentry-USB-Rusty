@@ -347,7 +347,37 @@ export default function Logs() {
     }
   }, [activeLog.url, activeTab])
 
-  function handleDownload() {
+  async function handleDownload() {
+    // Bluetooth tab gets a richer, bundled-on-the-server download —
+    // pulls together the full unfiltered journal, sysfs LE params,
+    // hciconfig, rfkill, dmesg BLE lines, pairing state, the entire
+    // per-minute history file, etc. The on-screen view only has the
+    // filtered subset; the bundle is what testers paste back when
+    // we're triaging a drop or slot-contention report. Falls back
+    // to dumping the current content blob if the bundle endpoint
+    // is unreachable.
+    if (activeTab === "bluetooth") {
+      try {
+        const res = await fetch("/api/logs/bluetooth/bundle")
+        if (!res.ok) throw new Error(`bundle endpoint ${res.status}`)
+        // Honour the server's Content-Disposition filename so the
+        // saved file carries a timestamp.
+        const disposition = res.headers.get("Content-Disposition") || ""
+        const match = disposition.match(/filename="([^"]+)"/)
+        const filename = match?.[1] || "sentryusb-ble-bundle.txt"
+        const blob = await res.blob()
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename
+        a.click()
+        URL.revokeObjectURL(url)
+        return
+      } catch (e) {
+        console.warn("BLE bundle download failed, falling back to on-screen content:", e)
+        // fall through to the generic path below
+      }
+    }
     const blob = new Blob([content], { type: "text/plain" })
     const url = URL.createObjectURL(blob)
     const a = document.createElement("a")
@@ -396,10 +426,15 @@ export default function Logs() {
           )}
           <button
             onClick={handleDownload}
+            title={
+              activeTab === "bluetooth"
+                ? "Downloads a comprehensive BLE diagnostic bundle: full journal, sysfs LE params, hciconfig, rfkill, pairing state, dmesg, and the full per-minute history file."
+                : undefined
+            }
             className="glass-card glass-card-hover flex items-center gap-1.5 px-3 py-1.5 text-sm text-slate-400 transition-colors hover:text-slate-200"
           >
             <Download className="h-4 w-4" />
-            Download
+            {activeTab === "bluetooth" ? "Download bundle" : "Download"}
           </button>
         </div>
       </div>
