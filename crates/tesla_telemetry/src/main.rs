@@ -16,6 +16,7 @@
 //!     BLE off in settings stops sampling within ~15 s without a
 //!     daemon restart.
 
+mod action_socket;
 mod clock_sync;
 mod config;
 mod db;
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rusqlite::Connection;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::config::BleConfig;
@@ -70,15 +72,13 @@ const TIRES_INTERVAL: Duration = Duration::from_secs(300);
 /// remote sentry toggle from the Tesla app reaches us within ~1 tick.
 const CLOSURES_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How often to refresh `state location` in Active mode. 60s — same
-/// cadence as climate/charge/closures. Location is the ONLY state
-/// query that returns `location_name` (the human-readable address
-/// the UI shows), so without this sub-sampler the address never
-/// updates after the in-process BLE cutover. 60s is the right
-/// balance: during a drive the address changes every few minutes
-/// at most (it's a reverse-geocoded place name, not raw GPS), and
-/// 60s catches any meaningful change within one cycle.
-const LOCATION_INTERVAL: Duration = Duration::from_secs(60);
+// (LOCATION_INTERVAL was removed: a brief stint adding `state
+// location` as its own sub-sampler ended once a tester's
+// tesla-control wire capture showed Tesla returns location_name in
+// `state drive` responses but NOT in `state location` responses.
+// `sample_drive_ble` now extracts the address from the bundled
+// LocationState in the drive response, so location refreshes at
+// the drive cadence (15s) for free.)
 
 /// Sample cadence for sleep-safe `body-controller-state` calls in
 /// Quiet mode. 30s (down from 60s) halves the worst-case wakeup
@@ -172,10 +172,6 @@ struct Schedule {
     /// poll cycle. Same cadence as climate/charge so the gate's
     /// inputs are roughly co-fresh.
     next_closures: Instant,
-    /// `state location` — the sole source of `location_name` (the
-    /// reverse-geocoded address the UI shows). Without this, the
-    /// displayed address freezes at whatever was in the DB pre-cutover.
-    next_location: Instant,
     /// Consecutive failure counters — used by the fast-retry
     /// pattern. On a successful sub-sample they reset to 0; on
     /// failure they increment and drive a 3s retry until
@@ -186,29 +182,27 @@ struct Schedule {
     charge_failures: u32,
     tires_failures: u32,
     closures_failures: u32,
-    location_failures: u32,
 }
 
 impl Schedule {
     fn new(now: Instant) -> Self {
         Self {
-            // Drive + climate + tires + closures + location fire
-            // immediately on first tick — get a baseline snapshot,
-            // including the sentry_mode + (after the 30s charge
-            // offset) charging_state signals the quiet-mode gate
-            // depends on, and the address for the live-data panel.
+            // Drive + climate + tires + closures fire immediately on
+            // first tick — get a baseline snapshot, including the
+            // sentry_mode + (after the 30s charge offset) charging_state
+            // signals the quiet-mode gate depends on. Location is
+            // bundled into drive responses so it refreshes for free
+            // on the drive cadence.
             next_drive: now,
             next_climate: now,
             next_charge: now + CHARGE_INITIAL_OFFSET,
             next_tires: now,
             next_closures: now,
-            next_location: now,
             drive_failures: 0,
             climate_failures: 0,
             charge_failures: 0,
             tires_failures: 0,
             closures_failures: 0,
-            location_failures: 0,
         }
     }
     fn drive_due(&self, now: Instant) -> bool { now >= self.next_drive }
@@ -216,7 +210,6 @@ impl Schedule {
     fn charge_due(&self, now: Instant) -> bool { now >= self.next_charge }
     fn tires_due(&self, now: Instant) -> bool { now >= self.next_tires }
     fn closures_due(&self, now: Instant) -> bool { now >= self.next_closures }
-    fn location_due(&self, now: Instant) -> bool { now >= self.next_location }
 
     /// Compute the next-due instant for a sub-sampler that just ran.
     /// On success: normal interval. On failure within MAX_FAST_RETRIES:
@@ -254,10 +247,6 @@ impl Schedule {
         self.closures_failures = if success { 0 } else { self.closures_failures.saturating_add(1) };
         self.next_closures = Self::next_after(now, success, self.closures_failures, CLOSURES_INTERVAL);
     }
-    fn mark_location(&mut self, now: Instant, success: bool) {
-        self.location_failures = if success { 0 } else { self.location_failures.saturating_add(1) };
-        self.next_location = Self::next_after(now, success, self.location_failures, LOCATION_INTERVAL);
-    }
 
     /// When should the next tick fire? Min of all next-due timestamps
     /// across every sub-sampler. The main loop sleeps until this
@@ -268,7 +257,6 @@ impl Schedule {
             .min(self.next_charge)
             .min(self.next_tires)
             .min(self.next_closures)
-            .min(self.next_location)
     }
 }
 
@@ -302,6 +290,15 @@ async fn main() -> Result<()> {
     // sampler's main loop; opens its own read-only DB handle each
     // tick. Lives as long as the process does.
     diag_log::spawn(sentryusb_drives::DEFAULT_DB_PATH.into());
+
+    // IPC bridge for external BLE actions (currently just
+    // sentryusb-ble-action invoked by run/awake_start). Lets
+    // keep-awake nudges piggyback on our already-warm
+    // PersistentSession instead of having to stop us first to grab
+    // the radio. Channel is bounded but small — keep-awake actions
+    // arrive ~once per archive cycle, never concurrently.
+    let (action_tx, mut action_rx) = mpsc::channel::<action_socket::ActionRequest>(8);
+    action_socket::spawn(action_tx);
 
     let mut held_radio = false;
     // Counts consecutive state polls showing shift_state = Park.
@@ -398,6 +395,19 @@ async fn main() -> Result<()> {
                 parked_polls = 0;
                 // Loop continues immediately — next tick runs at
                 // the top of the loop without sleeping.
+            }
+            Some(req) = action_rx.recv() => {
+                // IPC: an external process (e.g. sentryusb-ble-action
+                // from run/awake_start) wants us to do a one-shot BLE
+                // action through our existing PersistentSession.
+                // Serializes naturally with the rest of the select —
+                // any in-flight tick completes first, then we handle
+                // this, then the next tick fires.
+                handle_action_request(
+                    req,
+                    &mut held_radio,
+                    &mut ble_session,
+                ).await;
             }
             sleep = tick(
                 &conn,
@@ -712,19 +722,15 @@ async fn tick(
                             }
                             Err(e) => warn!("parked-awake closures refresh failed: {e}"),
                         }
-                        // Location refresh — covers the "car moved
-                        // remotely while parked" case (Autopark,
-                        // valet, towed). 3-min cadence in quiet is
-                        // plenty since by definition the user isn't
-                        // driving when this fires.
-                        match sample_ble::sample_location_ble(session).await {
-                            Ok(l) => {
-                                try_sync_clock(l.meta);
-                                refresh.location_name = l.location_name;
-                                any_ok = true;
-                            }
-                            Err(e) => warn!("parked-awake location refresh failed: {e}"),
-                        }
+                        // (Location not refreshed here: the dedicated
+                        // location poll was a dead end — Tesla only
+                        // returns location_name in `state drive`
+                        // responses, not standalone `state location`.
+                        // Parked-awake mode doesn't call drive
+                        // either, so the address stays at whatever
+                        // the last drive poll captured. That's
+                        // fine for the parked case — by definition
+                        // we're not moving.)
                         *last_parked_awake_refresh = Some(Instant::now());
                     }
 
@@ -902,30 +908,7 @@ async fn tick(
             any_call_ran = true;
         }
 
-        // ── 5. LOCATION (every 60s) ──
-        // The only state query that returns `location_name` (the
-        // reverse-geocoded address). Without this, the displayed
-        // address freezes at whatever was in the DB pre-cutover —
-        // the fix for the long-running "my address never updates"
-        // bug. Cheap call (small payload), 60s is plenty fresh for
-        // a human-readable place name.
-        if schedule.location_due(tick_now) {
-            let success = match sample_ble::sample_location_ble(session).await {
-                Ok(l) => {
-                    try_sync_clock(l.meta);
-                    sample.location_name = l.location_name;
-                    true
-                }
-                Err(e) => {
-                    warn!("sample_location failed: {e}");
-                    false
-                }
-            };
-            schedule.mark_location(tick_now, success);
-            any_call_ran = true;
-        }
-
-        // ── 6. TIRES (every 5 min) ──
+        // ── 5. TIRES (every 5 min) ──
         if schedule.tires_due(tick_now) {
             let success = match sample_ble::sample_tires_ble(session).await {
                 Ok(t) => {
@@ -1119,6 +1102,124 @@ fn persist(conn: &Connection, sample: Sample) {
 async fn stop_ios_gatt() {
     debug!("stopping sentryusb-ble for telemetry session");
     let _ = sentryusb_shell::run("systemctl", &["stop", "sentryusb-ble"]).await;
+}
+
+/// Service one IPC action request from `sentryusb-ble-action`. Does
+/// the same radio + iOS-daemon prep as a normal Active-mode tick:
+/// acquires the BLE radio lock if we don't already hold it, stops
+/// the iOS GATT daemon for exclusive hci0, then dispatches the
+/// action through the long-lived PersistentSession.
+///
+/// We deliberately do NOT release the radio after a successful
+/// action — the very next tick will probably want it anyway, and
+/// thrashing the iOS daemon down/up on every keep-awake nudge
+/// would defeat the whole point of routing this through us.
+async fn handle_action_request(
+    req: action_socket::ActionRequest,
+    held_radio: &mut bool,
+    ble_session: &mut Option<sample_ble::SessionHandle>,
+) {
+    let verb = req.verb.clone();
+    info!("action_socket: IPC request received — verb={}", verb);
+
+    // Load config: respects the same enable/VIN gate as the rest of
+    // the daemon. If BLE is off in settings, refuse the action so
+    // ble-action can fall back (or just propagate the error to
+    // awake_start, which probably shouldn't have called us anyway).
+    let cfg = match crate::config::BleConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = req.reply.send(Err(anyhow::anyhow!(
+                "load BLE config: {e}"
+            )));
+            return;
+        }
+    };
+    if !cfg.enabled {
+        let _ = req.reply.send(Err(anyhow::anyhow!(
+            "BLE is disabled in settings"
+        )));
+        return;
+    }
+    if cfg.vin.is_empty() {
+        let _ = req.reply.send(Err(anyhow::anyhow!(
+            "TESLA_BLE_VIN not configured"
+        )));
+        return;
+    }
+
+    // Resolve the verb to a typed ActionPayload before doing any
+    // BLE work — saves the cost of the radio handoff for a typo.
+    let action = match action_socket::parse_verb(&verb) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = req.reply.send(Err(e));
+            return;
+        }
+    };
+
+    // Lazy-spawn or reuse the PersistentSession on the configured
+    // VIN/adapter — exactly the same call the tick loop uses.
+    if let Err(e) = sample_ble::ensure_session_for(
+        ble_session,
+        &cfg.vin,
+        Some(&cfg.adapter),
+    ) {
+        let _ = req.reply.send(Err(anyhow::anyhow!(
+            "PersistentSession start failed: {e:#}"
+        )));
+        return;
+    }
+
+    // Acquire the radio + stop iOS GATT if not already held. Same
+    // logic the Active-mode tick uses; copy-pasted here rather
+    // than refactored out because the surrounding context (which
+    // failure cases are recoverable, when to return early) is
+    // different enough that a shared helper would obscure more
+    // than it would deduplicate.
+    if !*held_radio {
+        match lock::try_acquire(OWNER) {
+            Ok(true) => {
+                *held_radio = true;
+                stop_ios_gatt().await;
+            }
+            Ok(false) => {
+                let _ = req.reply.send(Err(anyhow::anyhow!(
+                    "radio held by {:?} — cannot service action right now",
+                    lock::current_owner()
+                )));
+                return;
+            }
+            Err(e) => {
+                let _ = req.reply.send(Err(anyhow::anyhow!(
+                    "could not acquire radio lock: {e}"
+                )));
+                return;
+            }
+        }
+    }
+
+    let session = &ble_session
+        .as_ref()
+        .expect("ensure_session_for left session populated")
+        .session;
+
+    let started = Instant::now();
+    let result = session.send_action(action).await;
+    let elapsed_ms = started.elapsed().as_millis();
+    match &result {
+        Ok(bytes) => info!(
+            "action_socket: verb={} ok ({}ms, {} bytes decrypted response)",
+            verb,
+            elapsed_ms,
+            bytes.len()
+        ),
+        Err(e) => warn!(
+            "action_socket: verb={} failed after {}ms: {:#}",
+            verb, elapsed_ms, e
+        ),
+    }
+    let _ = req.reply.send(result.map(|_| ()));
 }
 
 /// Restart the iOS GATT daemon and clear our radio-lock entry.
