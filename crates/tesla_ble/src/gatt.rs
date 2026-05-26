@@ -227,12 +227,44 @@ impl Connection {
         self.drain_until_quiet(Duration::from_millis(100)).await;
 
         let framed = frame(payload);
-        // Tesla supports MTU up to 247; we'd negotiate that during
-        // service discovery. btleplug doesn't currently expose the
-        // negotiated MTU directly, so we conservatively chunk for 247
-        // — Tesla's preferred max.
-        const MTU: usize = 247;
-        let chunks = chunks_for_mtu(&framed, MTU);
+        // Chunk at the BLE default ATT_MTU (23) — 20 byte payload per
+        // ATT write after the 3-byte ATT header. This matches what
+        // tesla-control's go-ble library does when its explicit MTU
+        // exchange fails: see vehicle-command/pkg/connector/ble/ble.go
+        // tryToConnect():
+        //
+        //     txMtu, err := client.ExchangeMTU(maxBLEMTUSize)
+        //     if err != nil {
+        //         conn.blockLength = ble.DefaultMTU - 3 // = 20
+        //     } else {
+        //         conn.blockLength = min(txMtu, ...) - 3
+        //     }
+        //
+        // Why we use the conservative default unconditionally:
+        // btleplug 0.11.x does NOT expose an MTU exchange API at all
+        // (no `peripheral.request_mtu()`, no way to query the
+        // negotiated MTU after connect). On bluez setups where the
+        // stack didn't auto-negotiate a larger MTU during service
+        // discovery — which depends on bluez version, kernel, chip
+        // firmware, and post-pair adapter state — our previous
+        // hardcoded 247 produced WriteWithoutResponse calls of
+        // 80-200+ bytes, which bluez rejects with "Failed to
+        // initiate write" because the data can't fit in a single
+        // ATT_Write_Cmd at the default MTU.
+        //
+        // This was THE root cause of the tester's 323-drop streak:
+        // all "BLE write: Failed to initiate write" within 100ms of
+        // connect. tesla-control on the same hardware/pair worked
+        // because go-ble's WriteCharacteristic path also chunks to
+        // blockLength regardless of MTU exchange outcome.
+        //
+        // 20-byte chunks cost a few extra ATT_Write_Cmds per query
+        // (a ~100 byte session-info request goes from 1 write to 5)
+        // but is universally accepted. Once btleplug exposes MTU
+        // exchange (or we drop to D-Bus to call bluez's RequestMTU
+        // ourselves) we can bump this back up.
+        const ATT_DEFAULT_PAYLOAD: usize = 23;
+        let chunks = chunks_for_mtu(&framed, ATT_DEFAULT_PAYLOAD);
         debug!(
             "TX framed ({} bytes in {} chunk(s)): {}",
             framed.len(),
