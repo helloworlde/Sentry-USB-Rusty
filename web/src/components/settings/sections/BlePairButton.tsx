@@ -185,14 +185,32 @@ export function BlePairButton() {
   // ---------------------------------------------------------------------------
   useEffect(() => {
     const unsub = wsClient.subscribe("ble_status", (data: unknown) => {
-      const d = data as { status: string; error?: string; output?: string }
+      const d = data as {
+        status: string
+        error?: string
+        output?: string
+        /** Set by the pair handler when add-key-request returned
+         *  exit 0 but the post-pair session-info probe couldn't
+         *  reach the car — meaning the BLE adapter is silently
+         *  dropping writes (a known firmware/kernel quirk on some
+         *  Broadcom chips). Distinct from a generic "tesla-control
+         *  errored out" failure so we can render hardware-specific
+         *  guidance. */
+        verify_failed?: boolean
+      }
       if (d.status === "pairing") {
         setBleState("initiating")
         setBleMsg("Sending pairing request to car...")
       } else if (d.status === "error") {
         setBleState("error")
         const errMsg = d.error || "Unknown error"
-        if (errMsg.includes("maximum number of BLE")) {
+        if (d.verify_failed) {
+          // Backend has already composed a detailed message; just
+          // surface it. The car never showed a card prompt because
+          // the adapter never actually delivered the request — no
+          // amount of clicking "tap card" will help here.
+          setBleMsg(errMsg)
+        } else if (errMsg.includes("maximum number of BLE")) {
           setBleMsg("Too many BLE devices active. Turn off Bluetooth on nearby phone keys and try again.")
         } else if (errMsg.includes("timed out")) {
           setBleMsg("BLE connection timed out. Make sure the Pi is near the car and try again.")
