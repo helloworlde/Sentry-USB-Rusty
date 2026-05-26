@@ -34,13 +34,24 @@ Type=simple
 # Clean up our own stale lock at startup (only if we own it AND it's
 # >24h old) so a crash mid-session doesn't leave the radio held forever.
 #
-# All `$` are doubled to `$$` so systemd passes them through to bash
-# instead of trying to expand them itself. systemd's specifier parser
-# treats `$f` as "value of env-var f" — which is unset, so unescaped
-# `$f` expands to empty BEFORE bash sees the line, and the test
-# becomes `[ -e "" ]` (always false). Same trap applied to every
-# ExecStart/ExecStartPre line below.
-ExecStartPre=-/bin/bash -c 'f=/tmp/ble_radio_owner; if [ -e "$$f" ] && [ "$$(head -n1 "$$f" 2>/dev/null)" = "telemetry" ] && [ $$(( $$(date +%s) - $$(stat -c %Y "$$f" 2>/dev/null || echo 0) )) -gt 86400 ]; then rm -f "$$f"; fi; exit 0'
+# Two flavours of escaping needed here:
+#
+#   1. `$` → `$$` — without it, systemd's specifier parser treats
+#      `$f` as "value of env-var f" (unset → empty string) BEFORE
+#      bash sees the line. We hit this earlier with the LE-tune
+#      ExecStartPre below.
+#
+#   2. `%` → `%%` — systemd ALSO uses `%` for its own specifiers
+#      (`%s` = exec name, `%Y` = configuration dir, etc.). A tester's
+#      bundle showed our `date +%s` getting silently rewritten to
+#      `date +/bin/bash` and `stat -c %Y` to `stat -c /etc/systemd/system`
+#      before bash ran. Net effect: the stale-lock cleanup was a
+#      no-op everywhere even when it should have fired (the `[ ... -gt
+#      86400 ]` arithmetic test got non-integer values and the `if`
+#      short-circuited). Didn't corrupt anything but did mean stale
+#      locks weren't being cleaned up. Doubled `%` here so bash sees
+#      the literal `%s` / `%Y` it needs.
+ExecStartPre=-/bin/bash -c 'f=/tmp/ble_radio_owner; if [ -e "$$f" ] && [ "$$(head -n1 "$$f" 2>/dev/null)" = "telemetry" ] && [ $$(( $$(date +%%s) - $$(stat -c %%Y "$$f" 2>/dev/null || echo 0) )) -gt 86400 ]; then rm -f "$$f"; fi; exit 0'
 # Tune bluez LE link parameters for in-car BLE stability.
 #
 # The Tesla-side BLE link drops every 10-20 min on a moving car with
