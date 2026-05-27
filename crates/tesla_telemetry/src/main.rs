@@ -272,6 +272,26 @@ async fn main() -> Result<()> {
 
     info!("sentryusb-tesla-telemetry starting");
 
+    // Migration recovery: previous versions stopped sentryusb-ble.service
+    // during Active mode to claim exclusive hci0. Existing installs that
+    // are upgrading FROM that behavior may have sentryusb-ble in a
+    // stopped state right now (we stopped it on the last cycle before
+    // the upgrade, and never started it again because we got killed).
+    //
+    // One-shot start ensures the iOS GATT daemon is running by the time
+    // we hand control to the main loop. From here on out we don't touch
+    // sentryusb-ble at all — they coexist via BLE multi-role.
+    //
+    // Best-effort with a short timeout so a hung systemctl doesn't
+    // block startup; sentryusb-ble.service has Restart=always anyway
+    // so systemd will recover on the next start attempt regardless.
+    let _ = sentryusb_shell::run_with_timeout(
+        Duration::from_secs(5),
+        "systemctl",
+        &["start", "sentryusb-ble"],
+    )
+    .await;
+
     // Brief startup wait for the system clock to come up — either via
     // RTC (immediate) or NTP (seconds, if WiFi is reachable). Just
     // long enough to dodge the very first cold-boot tick; the
@@ -1116,13 +1136,40 @@ fn persist(conn: &Connection, sample: Sample) {
     }
 }
 
-/// Stop the iOS GATT daemon (`sentryusb-ble.service`) so this
-/// daemon has exclusive `hci0` access. Best-effort — if systemctl
-/// fails, log and continue; the tesla-control call will surface a
-/// real BLE error if there's actual contention.
+/// No-op kept for call-site stability while we transition away
+/// from "telemetry exclusively owns hci0".
+///
+/// History: this function used to `systemctl stop sentryusb-ble`
+/// before every Active-mode poll cycle, claiming exclusive hci0
+/// access for our central-role traffic. Then release_radio() would
+/// `systemctl start sentryusb-ble` to hand it back. In Active +
+/// Quiet alternation the cycle is ~30-60s, so sentryusb-ble was
+/// being stopped and started every 30-60s for hours — and the
+/// iOS SentryUSB app saw the GATT server vanish + come back every
+/// time.
+///
+/// The reasoning was defensive. In practice, BLE since 4.0 supports
+/// LE multi-role: one HCI controller can simultaneously act as a
+/// central (us connecting to Tesla) AND a peripheral (sentryusb-ble
+/// advertising for the iOS app), AND host multiple concurrent LE
+/// connections. All the chips we ship on (BCM4345C0, Realtek
+/// RTL8761B/BU, CSR8510) support this. bluez also supports multiple
+/// D-Bus clients fine.
+///
+/// So they should just coexist. This function is now a no-op; the
+/// radio LOCK (between our Rust processes — telemetry, ble-action,
+/// pair) still coordinates serial access where it matters, but
+/// sentryusb-ble runs continuously and the iOS app stays connected.
+///
+/// Pair flow (crates/api/src/system.rs) still stops sentryusb-ble
+/// briefly during pairing — that path uses tesla-control which DOES
+/// want exclusive bluez access for the add-key-request handshake.
+/// That's narrow and time-bounded, not continuous like Active mode.
 async fn stop_ios_gatt() {
-    debug!("stopping sentryusb-ble for telemetry session");
-    let _ = sentryusb_shell::run("systemctl", &["stop", "sentryusb-ble"]).await;
+    debug!(
+        "stop_ios_gatt: no-op (sentryusb-ble + telemetry coexist via BLE multi-role; \
+         see fn doc for history)"
+    );
 }
 
 /// Service one IPC action request from `sentryusb-ble-action`. Does
@@ -1257,23 +1304,24 @@ async fn handle_action_request(
 /// own teardown logic (or systemd's restart policy) will eventually
 /// bring sentryusb-ble back up either way.
 async fn release_radio() {
-    // Lock file first — fast, deterministic, the actual "release"
-    // semantic other processes depend on.
+    // Just release the lock — that's the synchronization
+    // semantic between OUR Rust processes (telemetry, ble-action,
+    // pair). sentryusb-ble doesn't check this lock and isn't
+    // affected by it.
+    //
+    // We used to ALSO `systemctl start sentryusb-ble` here to undo
+    // the corresponding stop in stop_ios_gatt(). Now that
+    // stop_ios_gatt() is a no-op (sentryusb-ble runs continuously
+    // and coexists via BLE multi-role), there's nothing to start —
+    // the iOS daemon is already running.
+    //
+    // Bonus: the previous `systemctl start` had a 5s timeout that
+    // routinely fired ("systemctl start sentryusb-ble didn't
+    // complete within 5s — skipping") because sentryusb-ble.service
+    // has an ExecStartPre that waits up to 30s for org.bluez to
+    // settle. Removing the call entirely eliminates that whole
+    // warning class.
     if let Err(e) = lock::release(OWNER) {
         warn!("failed to release radio lock: {e}");
-    }
-    // Then iOS daemon restart, bounded so we never sit here for
-    // 30+ seconds during shutdown.
-    let result = sentryusb_shell::run_with_timeout(
-        Duration::from_secs(5),
-        "systemctl",
-        &["start", "sentryusb-ble"],
-    )
-    .await;
-    if let Err(e) = result {
-        warn!(
-            "systemctl start sentryusb-ble didn't complete within 5s — \
-             skipping (next sampler instance or systemd will bring it back): {e}"
-        );
     }
 }
