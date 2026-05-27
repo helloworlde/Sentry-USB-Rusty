@@ -419,10 +419,23 @@ pub async fn install_required_packages(emitter: &SetupEmitter) -> Result<bool> {
     emitter.progress(&format!("Installing: {}", to_install.join(", ")));
     let mut args = vec!["-y", "install"];
     args.extend(&to_install);
-    sentryusb_shell::run_with_timeout(
+    let install = || sentryusb_shell::run_with_timeout(
         Duration::from_secs(300),
         "apt-get", &args,
-    ).await.context("failed to install required packages")?;
+    );
+    if install().await.is_err() {
+        // deb.debian.org is a Fastly CDN: the index we fetched a few
+        // minutes ago and the pool we're fetching .debs from now can
+        // disagree across cache shards / mirror rotations, so the
+        // first install can 404 on a version the index still
+        // references. Refresh the index once and retry.
+        emitter.progress("Refreshing package index and retrying...");
+        let _ = sentryusb_shell::run_with_timeout(
+            Duration::from_secs(300),
+            "apt-get", &["update"],
+        ).await;
+        install().await.context("failed to install required packages")?;
+    }
 
     Ok(true)
 }
