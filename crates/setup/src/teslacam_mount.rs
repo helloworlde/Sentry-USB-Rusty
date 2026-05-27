@@ -46,10 +46,10 @@ pub async fn configure_web_mount(emitter: &SetupEmitter) -> Result<bool> {
 
     // Install runtime packages for the network status APIs. The bind mount
     // itself requires no userspace tooling beyond `mount(8)` (built-in).
-    sentryusb_shell::run_with_timeout(
+    crate::apt::apt_install(
+        |m| emitter.progress(m),
+        &["net-tools", "wireless-tools", "ethtool"],
         Duration::from_secs(300),
-        "apt-get",
-        &["-y", "install", "net-tools", "wireless-tools", "ethtool"],
     ).await.context("failed to install networking runtime packages")?;
 
     // Nginx fight — SentryUSB owns port 80.
@@ -93,9 +93,10 @@ pub async fn configure_web_mount(emitter: &SetupEmitter) -> Result<bool> {
             "/var/www/html/fs  /root/bin/auto.www --timeout=0\n",
         )?;
         // `zip` is used by the web UI to offer bulk download of music dirs.
-        let _ = sentryusb_shell::run_with_timeout(
+        let _ = crate::apt::apt_install(
+            |m| emitter.progress(m),
+            &["zip"],
             Duration::from_secs(180),
-            "apt-get", &["-y", "install", "zip"],
         ).await;
     }
 

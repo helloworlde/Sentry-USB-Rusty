@@ -208,8 +208,10 @@ async fn ensure_exfat_tools(use_exfat: bool, emitter: &SetupEmitter) -> Result<b
 
     // Install exfatprogs if needed
     if sentryusb_shell::run("which", &["mkfs.exfat"]).await.is_err() {
-        if sentryusb_shell::run_with_timeout(
-            Duration::from_secs(600), "apt-get", &["-y", "install", "exfatprogs"],
+        if crate::apt::apt_install(
+            |m| emitter.progress(m),
+            &["exfatprogs"],
+            Duration::from_secs(600),
         ).await.is_err() {
             emitter.progress("WARNING: could not install exfatprogs — falling back to FAT32");
             return Ok(false);
@@ -220,11 +222,13 @@ async fn ensure_exfat_tools(use_exfat: bool, emitter: &SetupEmitter) -> Result<b
 }
 
 /// Ensure dosfstools is available.
-async fn ensure_vfat_tools() -> Result<()> {
+async fn ensure_vfat_tools(emitter: &SetupEmitter) -> Result<()> {
     if sentryusb_shell::run("which", &["mkfs.vfat"]).await.is_err() {
-        sentryusb_shell::run_with_timeout(
-            Duration::from_secs(600), "apt-get", &["-y", "install", "dosfstools"],
-        ).await?;
+        crate::apt::apt_install(
+            |m| emitter.progress(m),
+            &["dosfstools"],
+            Duration::from_secs(600),
+        ).await.context("failed to install dosfstools")?;
     }
     Ok(())
 }
@@ -267,7 +271,7 @@ pub async fn create_disk_images(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
     emitter.progress("Creating disk images...");
 
     let use_exfat = ensure_exfat_tools(use_exfat_cfg, emitter).await?;
-    ensure_vfat_tools().await?;
+    ensure_vfat_tools(emitter).await?;
 
     // Space check. teslausb auto-shrinks because it has no UI to ask
     // the user; we have a UI, so we reject explicitly with a clear

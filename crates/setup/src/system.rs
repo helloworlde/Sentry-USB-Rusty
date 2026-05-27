@@ -78,9 +78,10 @@ pub async fn configure_avahi(env: &SetupEnv, emitter: &SetupEmitter) -> Result<b
     emitter.progress("Configuring Avahi mDNS service...");
 
     if needs_install {
-        sentryusb_shell::run_with_timeout(
+        crate::apt::apt_install(
+            |m| emitter.progress(m),
+            &["avahi-daemon"],
             Duration::from_secs(600),
-            "apt-get", &["-y", "install", "avahi-daemon"],
         ).await.context("failed to install avahi-daemon")?;
     }
 
@@ -417,25 +418,11 @@ pub async fn install_required_packages(emitter: &SetupEmitter) -> Result<bool> {
 
     emitter.begin_phase("required_packages", "Installing required packages");
     emitter.progress(&format!("Installing: {}", to_install.join(", ")));
-    let mut args = vec!["-y", "install"];
-    args.extend(&to_install);
-    let install = || sentryusb_shell::run_with_timeout(
+    crate::apt::apt_install(
+        |m| emitter.progress(m),
+        &to_install,
         Duration::from_secs(300),
-        "apt-get", &args,
-    );
-    if install().await.is_err() {
-        // deb.debian.org is a Fastly CDN: the index we fetched a few
-        // minutes ago and the pool we're fetching .debs from now can
-        // disagree across cache shards / mirror rotations, so the
-        // first install can 404 on a version the index still
-        // references. Refresh the index once and retry.
-        emitter.progress("Refreshing package index and retrying...");
-        let _ = sentryusb_shell::run_with_timeout(
-            Duration::from_secs(300),
-            "apt-get", &["update"],
-        ).await;
-        install().await.context("failed to install required packages")?;
-    }
+    ).await.context("failed to install required packages")?;
 
     Ok(true)
 }

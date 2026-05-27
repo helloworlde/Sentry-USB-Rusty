@@ -22,12 +22,14 @@ pub async fn partitions_exist() -> bool {
 }
 
 /// Ensure xfsprogs is installed.
-async fn ensure_xfs_tools() -> Result<()> {
+async fn ensure_xfs_tools(emitter: &SetupEmitter) -> Result<()> {
     if sentryusb_shell::run("which", &["mkfs.xfs"]).await.is_err() {
         info!("Installing xfsprogs...");
-        sentryusb_shell::run_with_timeout(
+        emitter.progress("Installing xfsprogs...");
+        crate::apt::apt_install(
+            |m| emitter.progress(m),
+            &["xfsprogs"],
             Duration::from_secs(600),
-            "apt-get", &["-y", "install", "xfsprogs"],
         ).await.context("failed to install xfsprogs")?;
     }
     Ok(())
@@ -235,7 +237,7 @@ pub async fn setup_sd_card(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
 
     emitter.begin_phase("partitions", "Disk partitioning");
 
-    ensure_xfs_tools().await?;
+    ensure_xfs_tools(emitter).await?;
 
     emitter.progress("Creating backingfiles and mutable partitions on SD card...");
 

@@ -145,9 +145,10 @@ async fn ensure_rsync(emitter: &SetupEmitter) -> Result<()> {
         return Ok(());
     }
     emitter.progress("Installing rsync...");
-    sentryusb_shell::run_with_timeout(
+    crate::apt::apt_install(
+        |m| emitter.progress(m),
+        &["rsync"],
         Duration::from_secs(600),
-        "apt-get", &["-y", "install", "rsync"],
     ).await.context("failed to install rsync")?;
     Ok(())
 }
@@ -233,18 +234,20 @@ where
     // Install bluez
     if sentryusb_shell::run("dpkg", &["-s", "bluez"]).await.is_err() {
         progress("Installing bluez...");
-        sentryusb_shell::run_with_timeout(
+        crate::apt::apt_install(
+            &progress,
+            &["bluez"],
             Duration::from_secs(600),
-            "apt-get", &["-y", "install", "bluez"],
         ).await?;
     }
 
     // Install pi-bluetooth if available
     if sentryusb_shell::run("bash", &["-c", "apt-cache search pi-bluetooth | grep -q pi-bluetooth"]).await.is_ok() {
         if sentryusb_shell::run("dpkg", &["-s", "pi-bluetooth"]).await.is_err() {
-            let _ = sentryusb_shell::run_with_timeout(
+            let _ = crate::apt::apt_install(
+                &progress,
+                &["pi-bluetooth"],
                 Duration::from_secs(600),
-                "apt-get", &["-y", "install", "pi-bluetooth"],
             ).await;
         }
     }

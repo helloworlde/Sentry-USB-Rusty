@@ -5,6 +5,7 @@
 //! setup process, reporting progress via a callback so the web UI can stream
 //! live updates over WebSocket.
 
+pub mod apt;
 pub mod emitter;
 pub mod env;
 pub mod partition;

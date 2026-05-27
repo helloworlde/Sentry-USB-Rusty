@@ -24,9 +24,10 @@ pub async fn configure_automount(emitter: &SetupEmitter) -> Result<bool> {
     emitter.begin_phase("automount", "Snapshot automount");
     emitter.progress("Installing autofs...");
 
-    sentryusb_shell::run_with_timeout(
+    crate::apt::apt_install(
+        |m| emitter.progress(m),
+        &["autofs"],
         Duration::from_secs(300),
-        "apt-get", &["-y", "install", "autofs"],
     ).await.context("failed to install autofs")?;
 
     // The Raspbian Stretch autofs package didn't ship /etc/auto.master.d.

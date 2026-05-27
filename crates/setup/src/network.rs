@@ -46,9 +46,10 @@ pub async fn configure_ap(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> 
     {
         // Make sure `iw` is installed — it would otherwise get swept up by
         // autoremove when alsa-utils is removed in the readonly phase.
-        let _ = sentryusb_shell::run_with_timeout(
+        let _ = crate::apt::apt_install(
+            |m| emitter.progress(m),
+            &["iw"],
             Duration::from_secs(120),
-            "apt-get", &["-y", "install", "iw"],
         ).await;
 
         match nm_add_ap(&ssid, &pass, &ip, emitter).await {
@@ -216,9 +217,10 @@ async fn configure_hostapd_path(
     emitter: &SetupEmitter,
 ) -> Result<()> {
     emitter.progress("installing dnsmasq and hostapd");
-    sentryusb_shell::run_with_timeout(
+    crate::apt::apt_install(
+        |m| emitter.progress(m),
+        &["dnsmasq", "hostapd"],
         Duration::from_secs(300),
-        "apt-get", &["-y", "install", "dnsmasq", "hostapd"],
     ).await.context("failed to install hostapd/dnsmasq")?;
 
     emitter.progress(&format!("configuring AP '{ssid}' with IP {ip}"));
