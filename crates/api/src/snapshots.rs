@@ -82,17 +82,14 @@ pub async fn list_snapshots(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        // Recursive size in *allocated* bytes — reflink-aware. We
-        // explicitly avoid `du -sb` (which is `--apparent-size
-        // --block-size=1`) because snapshots are XFS reflink copies
-        // of cam_disk.bin that share nearly all extents with the
-        // live image. Apparent size would report the full file
-        // length (e.g. 64 GB) for every snapshot, regardless of how
-        // many blocks it actually owns. `du -sB1` reports allocated
-        // bytes — but note this number still counts blocks shared
-        // with other snapshots and with cam_disk.bin, so it is NOT
-        // "what you'd reclaim by deleting just this snapshot." Use
-        // `total_allocated_bytes` below for the dedup'd aggregate.
+        // Per-snapshot apparent allocated bytes (st_blocks * 512). This
+        // is NOT reflink-aware: each snap.bin is `cp --reflink=always` of
+        // cam_disk.bin, so every snap.bin's `st_blocks` is the full
+        // cam_disk block count even though those extents are shared with
+        // the live image and the other snapshots. Treat this as an upper
+        // bound, not "what you'd reclaim by deleting just this snapshot."
+        // The aggregate `total_allocated_bytes` below uses df-based math
+        // to recover the reflink-exclusive footprint.
         let du_out = sentryusb_shell::run(
             "du", &["-sB1", &path.to_string_lossy()],
         ).await.unwrap_or_default();
@@ -113,22 +110,46 @@ pub async fn list_snapshots(
     // what users actually want (delete the oldest to free space).
     entries.sort_by_key(|e| e.created_unix);
 
-    // Aggregate allocated bytes across all snapshots in a SINGLE du
-    // invocation so XFS reflink-shared extents are deduplicated. Summing
-    // per-snapshot sizes client-side double-counts shared blocks N times
-    // (every snap.bin reflinks most of cam_disk.bin), producing totals
-    // larger than the partition itself.
+    // Reflink-aware aggregate: bytes that would be freed if every snapshot
+    // were deleted. `du` is NOT reflink-aware — it dedupes hard links by
+    // inode, but each snap.bin is a separate inode whose extents are shared
+    // with cam_disk.bin via `cp --reflink=always`. Each snap.bin's
+    // `st_blocks` therefore reports the full cam_disk.bin block count, and
+    // `du -sB1 /backingfiles/snapshots` (even as a single tree walk) sums
+    // those per-file counts — producing N × cam_disk_size, far larger than
+    // the partition.
+    //
+    // Compute the true reflink-exclusive footprint as:
+    //     df_used(/backingfiles)  −  du(--exclude=snapshots /backingfiles/)
+    // i.e. partition-level used bytes (which counts each allocated extent
+    // once, regardless of how many files reference it) minus the apparent
+    // footprint of non-snapshot content. Deleting all snapshots leaves only
+    // the non-snapshot files (chiefly cam_disk.bin), whose blocks XFS
+    // retains, so `df` settles to that du value afterwards — the difference
+    // is what the snapshots collectively hold exclusively.
     let total_allocated_bytes: u64 = if entries.is_empty() {
         0
     } else {
-        let du_out = sentryusb_shell::run(
-            "du", &["-sB1", SNAPSHOTS_DIR],
+        let df_out = sentryusb_shell::run(
+            "df", &["--output=used", "--block-size=1", "/backingfiles/"],
         ).await.unwrap_or_default();
-        du_out
+        let used_bytes: u64 = df_out
+            .lines()
+            .last()
+            .and_then(|l| l.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let non_snap_out = sentryusb_shell::run(
+            "du", &["-sB1", "--exclude=snapshots", "/backingfiles/"],
+        ).await.unwrap_or_default();
+        let non_snap_bytes: u64 = non_snap_out
             .split_whitespace()
             .next()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
+            .unwrap_or(0);
+
+        used_bytes.saturating_sub(non_snap_bytes)
     };
 
     (StatusCode::OK, Json(serde_json::json!({
