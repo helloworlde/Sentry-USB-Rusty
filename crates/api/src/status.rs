@@ -33,6 +33,12 @@ use crate::router::AppState;
 #[derive(Clone, Default)]
 struct CachedNetwork {
     wifi_ssid: String,
+    /// Frequency in Hz as a string (e.g. "5180000000" for 5.18 GHz).
+    /// The iOS client formats this for display via `formatFreqGHz`; the
+    /// web UI ignores it. Empty when not connected or `iw` isn't
+    /// installed. Cached with the rest of the wifi info since channel
+    /// only changes on reconnect/roam.
+    wifi_freq: String,
     wifi_ip: String,
     ether_ip: String,
     ether_speed: String,
@@ -169,6 +175,11 @@ struct PiStatus {
     uptime: String,
     drives_active: String,
     wifi_ssid: String,
+    /// Frequency in Hz as a string (e.g. "5180000000" for 5.18 GHz).
+    /// Empty when not on WiFi or `iw` isn't installed. iOS renders this
+    /// as "5.2 GHz" in the dashboard Wi-Fi sub-line via `formatFreqGHz`;
+    /// the web UI doesn't currently use it.
+    wifi_freq: String,
     wifi_strength: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     wifi_signal_dbm: Option<i32>,
@@ -181,6 +192,13 @@ struct PiStatus {
     wifi_tx_bps: u64,
     ether_rx_bps: u64,
     ether_tx_bps: u64,
+    /// Stable per-device suffix derived from the system hostname (the
+    /// part after the final `-`, e.g. "sentryusb-A3F1" → "A3F1"). iOS
+    /// uses this for the dashboard hero-bar identifier so devices paired
+    /// over WiFi (no BLE metadata path) still show "Sentry USB-A3F1"
+    /// instead of bare "Sentry USB". Empty if `/etc/hostname` is
+    /// unreadable or has no dash.
+    device_suffix: String,
 }
 
 pub async fn get_status(
@@ -196,6 +214,7 @@ pub async fn get_status(
         uptime: String::new(),
         drives_active: "no".into(),
         wifi_ssid: String::new(),
+        wifi_freq: String::new(),
         wifi_strength: String::new(),
         wifi_signal_dbm: None,
         wifi_ip: String::new(),
@@ -207,6 +226,7 @@ pub async fn get_status(
         wifi_tx_bps: 0,
         ether_rx_bps: 0,
         ether_tx_bps: 0,
+        device_suffix: read_device_suffix(),
     };
 
     // SBC model
@@ -276,6 +296,7 @@ pub async fn get_status(
     // net_sampler background loop.
     let net = cached_network().await;
     s.wifi_ssid = net.wifi_ssid;
+    s.wifi_freq = net.wifi_freq;
     s.wifi_ip = net.wifi_ip;
     s.ether_ip = net.ether_ip;
     s.ether_speed = net.ether_speed;
@@ -330,9 +351,14 @@ async fn compute_network_info() -> CachedNetwork {
         info.wifi_dev = wifi_dev.clone();
         let ssid_args = ["-r", wifi_dev.as_str()];
         let ip_args = ["-4", "addr", "show", wifi_dev.as_str()];
-        let (ssid_r, ip_r) = tokio::join!(
+        // `iw dev <iface> link` line "freq: 5180" gives us the channel
+        // frequency in MHz with no extra cost beyond a single fork. The
+        // result is cached for NETWORK_TTL like the other wifi fields.
+        let iw_args = ["dev", wifi_dev.as_str(), "link"];
+        let (ssid_r, ip_r, iw_r) = tokio::join!(
             sentryusb_shell::run("iwgetid", &ssid_args),
             sentryusb_shell::run("ip", &ip_args),
+            sentryusb_shell::run("iw", &iw_args),
         );
         if let Ok(out) = ssid_r {
             info.wifi_ssid = out.trim().to_string();
@@ -343,6 +369,20 @@ async fn compute_network_info() -> CachedNetwork {
                 if trimmed.starts_with("inet ") {
                     if let Some(addr) = trimmed.split_whitespace().nth(1) {
                         info.wifi_ip = addr.split('/').next().unwrap_or("").to_string();
+                    }
+                }
+            }
+        }
+        if let Ok(out) = iw_r {
+            for line in out.lines() {
+                let trimmed = line.trim();
+                // Format: `freq: 5180` (MHz). Convert to Hz string so iOS
+                // `Formatters.formatFreqGHz` can divide by 1e9 and render
+                // "5.2 GHz" without further parsing.
+                if let Some(rest) = trimmed.strip_prefix("freq:") {
+                    if let Ok(mhz) = rest.trim().parse::<u64>() {
+                        info.wifi_freq = (mhz * 1_000_000).to_string();
+                        break;
                     }
                 }
             }
@@ -632,6 +672,28 @@ fn read_fan_speed() -> String {
         let candidate = entry.path().join("fan1_input");
         if let Ok(data) = std::fs::read_to_string(&candidate) {
             return data.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// Last segment after the final `-` of the system hostname — e.g.
+/// "sentryusb-A3F1" → "A3F1". Used by iOS to render the device-specific
+/// identifier on the dashboard even when paired over WiFi (the BLE path
+/// has its own device-info channel, but WiFi-only pairing has no way to
+/// learn the suffix without it being in /status). Empty when the
+/// hostname has no dash or `/etc/hostname` can't be read; an 8-char cap
+/// guards against weird hostnames where the post-dash segment is a
+/// fully-qualified domain piece rather than a stable identifier.
+fn read_device_suffix() -> String {
+    let hostname = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if let Some(idx) = hostname.rfind('-') {
+        let suffix = &hostname[idx + 1..];
+        if !suffix.is_empty() && suffix.len() <= 8 {
+            return suffix.to_string();
         }
     }
     String::new()
