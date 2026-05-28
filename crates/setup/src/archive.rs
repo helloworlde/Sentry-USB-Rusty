@@ -573,6 +573,35 @@ fn replace_fstab_entry(fstype: &str, mount_point: &str, new_line: &str) -> Resul
     Ok(())
 }
 
+/// Strip any prior entry for `mount_point` with filesystem type `fstype`
+/// from `/etc/fstab` without writing a replacement. Used when the wizard
+/// clears an optional share (e.g. MUSIC_SHARE_NAME) so the old line
+/// doesn't linger and confuse archiveloop on the next mount cycle.
+fn remove_fstab_entry(fstype: &str, mount_point: &str) -> Result<()> {
+    let _ = std::process::Command::new("mount")
+        .args(["/", "-o", "remount,rw"])
+        .output();
+
+    let existing = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
+    let kept: Vec<String> = existing
+        .lines()
+        .filter(|l| {
+            let fields: Vec<&str> = l.split_whitespace().collect();
+            !(fields.len() >= 3 && fields[1] == mount_point && fields[2] == fstype)
+        })
+        .map(|s| s.to_string())
+        .collect();
+    if kept.len() == existing.lines().count() {
+        return Ok(());
+    }
+    let mut out = kept.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    std::fs::write("/etc/fstab", out).context("write /etc/fstab")?;
+    Ok(())
+}
+
 async fn configure_nfs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
     let server = env.get("ARCHIVE_SERVER", "");
     let share = env.get("SHARE_NAME", "");
@@ -612,6 +641,8 @@ async fn configure_nfs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<(
         );
         replace_fstab_entry("nfs", "/mnt/musicarchive", &music_line)?;
         emitter.progress("Added NFS music mount to /etc/fstab");
+    } else {
+        clear_music_archive_mount("nfs", emitter)?;
     }
     Ok(())
 }
@@ -675,6 +706,24 @@ async fn configure_cifs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
         );
         replace_fstab_entry("cifs", "/mnt/musicarchive", &music_line)?;
         emitter.progress("Added CIFS music mount to /etc/fstab");
+    } else {
+        clear_music_archive_mount("cifs", emitter)?;
+    }
+    Ok(())
+}
+
+/// Drop the /mnt/musicarchive fstab line of `fstype` (if any) and remove
+/// the mount-point directory. Called when MUSIC_SHARE_NAME is cleared so
+/// archiveloop stops trying to mount a share the user no longer wants.
+/// `rmdir` is intentional — refuses to remove a dir that's still mounted
+/// or has content, which is the safe behavior.
+fn clear_music_archive_mount(fstype: &str, emitter: &SetupEmitter) -> Result<()> {
+    let path = "/mnt/musicarchive";
+    remove_fstab_entry(fstype, path)?;
+    if std::path::Path::new(path).is_dir() {
+        if std::fs::remove_dir(path).is_ok() {
+            emitter.progress("Removed stale /mnt/musicarchive (MUSIC_SHARE_NAME unset)");
+        }
     }
     Ok(())
 }
