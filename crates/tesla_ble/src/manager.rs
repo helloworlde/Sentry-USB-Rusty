@@ -562,27 +562,58 @@ async fn signed_request_with_refresh_retry(
     // Note: success-bookkeeping (note_successful_query) is now done
     // by the caller in run_session_task so the latency timer covers
     // the full retry envelope, not just the final attempt.
-    match try_signed_request_once(state, domain, &inner).await {
-        Ok(QueryOutcome::Plaintext(bytes)) => Ok(bytes),
-        Ok(QueryOutcome::SessionRefresh(info)) => {
-            apply_session_refresh(state, domain, info)?;
-            info!(
-                "PersistentSession: retrying signed request to {:?} after SessionInfo refresh",
-                domain
-            );
-            match try_signed_request_once(state, domain, &inner).await {
-                Ok(QueryOutcome::Plaintext(bytes)) => Ok(bytes),
-                Ok(QueryOutcome::SessionRefresh(_)) => {
+    //
+    // Retry budget: at most one SessionInfo refresh and at most one
+    // OPERATIONSTATUS_WAIT retry per query. The budgets are
+    // independent so a WAIT followed by a refresh (or vice-versa)
+    // still gets a final plaintext attempt. If either path repeats,
+    // we bail and let the schedule's fast-retry handle the next
+    // tick — better than holding up subsequent queries with an
+    // unbounded loop.
+    const WAIT_RETRY_DELAY: Duration = Duration::from_millis(400);
+    let mut refresh_retries_left = 1u32;
+    let mut wait_retries_left = 1u32;
+
+    loop {
+        match try_signed_request_once(state, domain, &inner).await {
+            Ok(QueryOutcome::Plaintext(bytes)) => return Ok(bytes),
+            Ok(QueryOutcome::SessionRefresh(info)) => {
+                if refresh_retries_left == 0 {
                     bail!("car requested SessionInfo refresh twice in a row — giving up")
                 }
-                Err(e) => Err(e),
+                refresh_retries_left -= 1;
+                apply_session_refresh(state, domain, info)?;
+                info!(
+                    "PersistentSession: retrying signed request to {:?} after SessionInfo refresh",
+                    domain
+                );
             }
+            Ok(QueryOutcome::OperationWait) => {
+                if wait_retries_left == 0 {
+                    // Two WAITs in a row — Tesla is genuinely
+                    // blocked. Surface a clean error (not the old
+                    // "no sub_sig_data" hex dump) so the sampler
+                    // marks this tick failed and the schedule's
+                    // fast-retry path picks it up shortly.
+                    bail!(
+                        "car returned OPERATIONSTATUS_WAIT twice in a row for \
+                         {:?} — sample will be retried on next schedule tick",
+                        domain
+                    );
+                }
+                wait_retries_left -= 1;
+                debug!(
+                    "PersistentSession: WAIT from {:?}; sleeping {:?} and retrying once",
+                    domain, WAIT_RETRY_DELAY
+                );
+                sleep(WAIT_RETRY_DELAY).await;
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => Err(e),
     }
 }
 
-/// One of two normal outcomes from a signed query.
+/// Normal outcomes from a signed query.
 enum QueryOutcome {
     /// Decrypted response payload — pass it through to the caller.
     Plaintext(Vec<u8>),
@@ -590,6 +621,10 @@ enum QueryOutcome {
     /// cached state and retry. Caller must call `apply_session_refresh`
     /// and re-issue the query.
     SessionRefresh(SessionInfo),
+    /// Car returned a status-only reply with operation_status=WAIT
+    /// (no payload, no fault). Transient — caller should retry after
+    /// a short delay. No session state change required.
+    OperationWait,
 }
 
 /// Apply a car-provided SessionInfo refresh: derive a new session
@@ -752,6 +787,17 @@ async fn try_signed_request_once(
         .as_ref()
         .map(|s| s.signed_message_fault as u32)
         .unwrap_or(0);
+    // operation_status is field 1 of MessageStatus; signed_message_fault
+    // is field 2. They're independent: Tesla can send a clean
+    // "wait / busy" status with fault=0 and no encrypted payload,
+    // which we previously misread as "no sub_sig_data" and surfaced
+    // as a WARN with a hex dump. See OperationStatusE in
+    // proto/universal_message.proto: OK=0, WAIT=1, ERROR=2.
+    let op_status = rm
+        .signed_message_status
+        .as_ref()
+        .map(|s| s.operation_status)
+        .unwrap_or(0);
 
     // Check for a SessionInfo refresh first — the car uses this as
     // the standard "your session is stale, here's fresh info" reply.
@@ -835,6 +881,52 @@ async fn try_signed_request_once(
             state.domains.remove(&domain);
         }
         bail!("car responded with fault code {}", fault);
+    }
+
+    // Status-only reply (no encrypted payload, no fault, but
+    // operation_status != OK). Tesla sends these as "your request
+    // was received but I can't answer right now — retry shortly".
+    // Observed shape on the wire is field 12 = MessageStatus
+    // { operation_status: 1 (WAIT) }, field 50 = request_uuid,
+    // no sub_sig_data, no payload. Treating these as decode errors
+    // (the old behavior) created a one-sample data gap per
+    // occurrence and a noisy WARN with a full hex dump.
+    //
+    // Distinguish:
+    //   * WAIT (1)  — transient, retryable in the same session
+    //   * ERROR (2) — Tesla explicitly rejected; not retryable here
+    // The retry policy lives one layer up in
+    // signed_request_with_refresh_retry so the caller doesn't see
+    // a transient WAIT as a failure at all.
+    if rm.sub_sig_data.is_none() && fault == 0 && op_status != 0 {
+        const OPERATIONSTATUS_WAIT: i32 = 1;
+        const OPERATIONSTATUS_ERROR: i32 = 2;
+        if op_status == OPERATIONSTATUS_WAIT {
+            debug!(
+                "PersistentSession: domain {:?} returned OPERATIONSTATUS_WAIT \
+                 (status-only reply, no payload) — caller will retry",
+                domain
+            );
+            return Ok(QueryOutcome::OperationWait);
+        }
+        if op_status == OPERATIONSTATUS_ERROR {
+            bail!(
+                "car returned OPERATIONSTATUS_ERROR for {:?} (status-only \
+                 reply, no encrypted payload). request_uuid={}",
+                domain,
+                hex::encode(&rm.request_uuid),
+            );
+        }
+        // Unknown non-OK status — keep a sanitized log without the
+        // full hex dump (the per-byte content was only useful for
+        // diagnosing the original "no sub_sig_data" mystery).
+        bail!(
+            "car returned unknown operation_status={} for {:?} \
+             (no encrypted payload). request_uuid={}",
+            op_status,
+            domain,
+            hex::encode(&rm.request_uuid),
+        );
     }
 
     // Pull out the encrypted payload + AES_GCM_Response sig data.
