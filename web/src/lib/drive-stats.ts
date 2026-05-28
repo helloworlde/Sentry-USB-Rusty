@@ -50,19 +50,29 @@ export function computeFilteredStats(
   let seiAutopilotDistanceKm = 0
 
   for (const d of drives) {
+    // Top-line totals include every drive (matches the backend
+    // `drive_stats` cache in crates/drives/src/db.rs:1061-1063).
     totalDistanceMi += d.distanceMi
     totalDistanceKm += d.distanceKm
     totalDurationMs += d.durationMs
+    if (d.source === "tessie") {
+      tessieCount += 1
+      continue
+    }
+    // Every FSD/AP-attributed metric is SEI-only. Tessie's autopilot
+    // distance/time fields carry *inferred* numbers (not from dashcam
+    // SEI telemetry), so summing them into the numerator while the
+    // denominator stays SEI-only produces >100% nonsense — and even
+    // when both sides included Tessie, the formula would still report
+    // inferred-vs-measured as a single blended score, which the
+    // backend explicitly avoids. Backend equivalent: SEI-only sums
+    // in crates/drives/src/db.rs:1065-1080.
+    seiTotalDistanceKm += d.distanceKm
     fsdEngagedMs += d.fsdEngagedMs
     fsdDistanceMi += d.fsdDistanceMi
     fsdDistanceKm += d.fsdDistanceKm
     fsdDisengagements += d.fsdDisengagements
     autopilotEngagedMs += d.autosteerEngagedMs + d.taccEngagedMs
-    if (d.source === "tessie") {
-      tessieCount += 1
-      continue
-    }
-    seiTotalDistanceKm += d.distanceKm
     seiAutopilotDistanceKm += d.autosteerDistanceKm + d.taccDistanceKm
   }
 
