@@ -2,6 +2,12 @@ import { useEffect, useMemo, useState } from "react"
 import { useSearchParams } from "react-router-dom"
 import type { DriveSummary, RouteOverview } from "@/types/drives"
 import { fetchDrives, fetchRouteOverviews } from "@/api/drives"
+import {
+  computeFilteredStats,
+  type DrivesFilteredStats,
+} from "@/lib/drive-stats"
+
+export type { DrivesFilteredStats }
 
 const PAGE_SIZE = 10
 
@@ -44,27 +50,6 @@ export interface DrivesFilters {
   // and the filter comparison both stay on one unit. The popover UI
   // converts to/from km for display when the user prefers metric.
   minDistanceMi?: number
-}
-
-/**
- * Aggregate stats for the currently filtered drive list. Recomputes
- * whenever the date range / filters / underlying drives change so the
- * summary strip always reflects the user's current selection
- * (e.g. "Last 7 days" → last-7-days totals, not lifetime).
- */
-export interface DrivesFilteredStats {
-  count: number
-  totalDistanceMi: number
-  totalDistanceKm: number
-  totalDurationMs: number
-  fsdEngagedMs: number
-  fsdDistanceMi: number
-  fsdDistanceKm: number
-  fsdPercent: number
-  fsdDisengagements: number
-  autopilotEngagedMs: number
-  autopilotPercent: number
-  tessieCount: number
 }
 
 export interface DrivesListState {
@@ -255,50 +240,13 @@ export function useDrivesList(): DrivesListState {
 
   // Aggregate stats over the *entire* filtered set (not just the visible
   // page) — this is the "lifetime within current selection" number the
-  // header strip displays.
-  const filteredStats = useMemo<DrivesFilteredStats>(() => {
-    let totalDistanceMi = 0
-    let totalDistanceKm = 0
-    let totalDurationMs = 0
-    let fsdEngagedMs = 0
-    let fsdDistanceMi = 0
-    let fsdDistanceKm = 0
-    let fsdDisengagements = 0
-    let autopilotEngagedMs = 0
-    let tessieCount = 0
-
-    for (const d of filtered) {
-      totalDistanceMi += d.distanceMi
-      totalDistanceKm += d.distanceKm
-      totalDurationMs += d.durationMs
-      fsdEngagedMs += d.fsdEngagedMs
-      fsdDistanceMi += d.fsdDistanceMi
-      fsdDistanceKm += d.fsdDistanceKm
-      fsdDisengagements += d.fsdDisengagements
-      autopilotEngagedMs += d.autosteerEngagedMs + d.taccEngagedMs
-      if (d.source === "tessie") tessieCount += 1
-    }
-
-    const fsdPercent =
-      totalDurationMs > 0 ? (fsdEngagedMs / totalDurationMs) * 100 : 0
-    const autopilotPercent =
-      totalDurationMs > 0 ? (autopilotEngagedMs / totalDurationMs) * 100 : 0
-
-    return {
-      count: filtered.length,
-      totalDistanceMi,
-      totalDistanceKm,
-      totalDurationMs,
-      fsdEngagedMs,
-      fsdDistanceMi,
-      fsdDistanceKm,
-      fsdPercent,
-      fsdDisengagements,
-      autopilotEngagedMs,
-      autopilotPercent,
-      tessieCount,
-    }
-  }, [filtered])
+  // header strip displays. Delegated to the shared helper so the formula
+  // stays in lockstep with anywhere else on the client that aggregates
+  // drives.
+  const filteredStats = useMemo<DrivesFilteredStats>(
+    () => computeFilteredStats(filtered),
+    [filtered],
+  )
 
   const updateParams = (mut: (p: URLSearchParams) => void) => {
     const next = new URLSearchParams(params)
