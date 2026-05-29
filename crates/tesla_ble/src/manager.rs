@@ -83,6 +83,22 @@ pub struct PersistentSession {
     cmd_tx: mpsc::Sender<Command>,
 }
 
+/// Result of an on-demand pairing probe ([`Command::CheckPairing`]).
+/// Splits "the car says our key isn't on its whitelist" (the user must
+/// re-pair) from "couldn't reach the car right now" (asleep, out of
+/// range, radio busy) so callers — notably the API's BLE status card —
+/// only clear the paired marker on the former, never on contention.
+#[derive(Debug, Clone)]
+pub enum PairingStatus {
+    /// session-info handshake succeeded: key is enrolled, car answered.
+    Paired,
+    /// Car returned `SESSION_INFO_STATUS_KEY_NOT_ON_WHITELIST`.
+    NotPaired,
+    /// Connect/scan/transport failure — pairing is unknown, not
+    /// disproven. Carries a short reason for logs.
+    Unreachable(String),
+}
+
 enum Command {
     Query {
         domain: Domain,
@@ -104,6 +120,13 @@ enum Command {
     /// connection so it doesn't open a competing one or disturb the slot.
     BodyController {
         reply: oneshot::Sender<Result<crate::proto::vcsec::VehicleStatus>>,
+    },
+    /// On-demand "is our key still on the car's whitelist" probe. Runs a
+    /// session-info handshake over the held connection and reports a
+    /// tri-state. Lets the API's status card verify pairing through this
+    /// session instead of spawning a competing connection.
+    CheckPairing {
+        reply: oneshot::Sender<PairingStatus>,
     },
     Shutdown,
 }
@@ -306,6 +329,28 @@ impl PersistentSession {
         rx.await.context("session task dropped the reply channel")?
     }
 
+    /// Probe whether our key is still on the car's whitelist, reusing
+    /// the held connection (no competing scan/connect). A dead
+    /// background task or dropped reply maps to `Unreachable` — the
+    /// same "pairing unknown" bucket as a transport failure, so callers
+    /// never read a stopped session as "not paired".
+    pub async fn check_pairing(&self) -> PairingStatus {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(Command::CheckPairing { reply: tx })
+            .await
+            .is_err()
+        {
+            return PairingStatus::Unreachable(
+                "PersistentSession background task has stopped".into(),
+            );
+        }
+        rx.await.unwrap_or(PairingStatus::Unreachable(
+            "session task dropped the reply channel".into(),
+        ))
+    }
+
     // Typed wrappers: each does a raw Infotainment `query()` and
     // decodes the response into the relevant car_server sub-message.
 
@@ -428,6 +473,20 @@ async fn run_session_task(
                     note_successful_query(&mut state, started.elapsed().as_millis());
                 }
                 let _ = reply.send(result);
+            }
+            Command::CheckPairing { reply } => {
+                // `Ok(Paired)` / `Ok(NotPaired)` are definitive answers
+                // from the car; `Err` is a connect/transport failure.
+                // Route the Err through the transport handler so a dead
+                // link is dropped + reconnected on the next call, then
+                // collapse it to `Unreachable` for the caller.
+                let result = handle_check_pairing(&mut state).await;
+                handle_transport_error_if_any(&mut state, &result).await;
+                let status = match result {
+                    Ok(status) => status,
+                    Err(e) => PairingStatus::Unreachable(format!("{e:#}")),
+                };
+                let _ = reply.send(status);
             }
             Command::Shutdown => break,
         }
@@ -1057,6 +1116,25 @@ async fn handle_body_controller(
         .context("ensure_connected returned without a connection")?;
     // Success-bookkeeping is done by the caller (run_session_task).
     crate::body_controller::query(conn).await
+}
+
+/// session-info handshake over the held connection for the
+/// [`Command::CheckPairing`] probe. `Ok(Paired)`/`Ok(NotPaired)` are
+/// answers the car gave us; `Err` is a connect/transport failure the
+/// caller maps to `Unreachable` (and which drops the connection via
+/// `handle_transport_error_if_any`). `KeyNotPaired` deliberately does
+/// NOT drop the link — re-handshaking won't change a whitelist verdict.
+async fn handle_check_pairing(state: &mut SessionState) -> Result<PairingStatus> {
+    ensure_connected(state).await?;
+    let conn = state
+        .conn
+        .as_mut()
+        .context("ensure_connected returned without a connection")?;
+    match session::request_session_info(conn, &state.keypair, Domain::Infotainment).await {
+        Ok(_) => Ok(PairingStatus::Paired),
+        Err(session::SessionError::KeyNotPaired) => Ok(PairingStatus::NotPaired),
+        Err(session::SessionError::Other(e)) => Err(e).context("session-info handshake"),
+    }
 }
 
 async fn ensure_connected(state: &mut SessionState) -> Result<()> {

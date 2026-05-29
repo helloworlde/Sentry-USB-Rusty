@@ -32,9 +32,17 @@
 //!   sentry-off         - turn Sentry Mode off
 //!   charge-port-open   - open the charge port
 //!   charge-port-close  - close the charge port
+//!   session-info       - pairing probe (see below)
+//!
+//! `session-info` is not an action: it prints exactly one stdout token
+//! — `PAIRED`, `NOT_PAIRED`, or `UNREACHABLE` — and exits 0 for all
+//! three. The API matches on that token (its shell helper only surfaces
+//! stdout) and clears the paired marker only on `NOT_PAIRED`. Config
+//! errors exit 2 with no token, which the API reads as "couldn't
+//! verify", never "unpaired".
 //!
 //! Exit codes:
-//!   0 success
+//!   0 success (for session-info: a token was printed)
 //!   1 invalid usage
 //!   2 config error (missing VIN, missing key file)
 //!   3 BLE error (scan/connect/handshake failed)
@@ -48,11 +56,11 @@ use anyhow::{Context, Result};
 use sentryusb_tesla_ble::{
     actions::{self, ActionPayload},
     keys::KeyPair,
-    manager::PersistentSession,
+    manager::{PairingStatus, PersistentSession},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const KEY_FILE: &str = "/root/.ble/key_private.pem";
 const CONFIG_FILE: &str = "/root/sentryusb.conf";
@@ -79,6 +87,13 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // `session-info` is a pairing probe, not an action — it reports a
+    // stdout token rather than running a command. Handle it on its own
+    // IPC-first / direct-fallback path before the action dispatch.
+    if verb == "session-info" {
+        return run_session_info().await;
+    }
+
     // Try the IPC fast-path first. If the telemetry daemon is up,
     // it'll service the action via its already-warm session and
     // return in <300ms — without competing for the BLE slot. If the
@@ -221,6 +236,119 @@ async fn try_via_ipc(verb: &str) -> Result<(), IpcError> {
             "read response: {}",
             e
         ))),
+        Err(_) => Err(IpcError::Unavailable(
+            "daemon response timed out after 90s".into(),
+        )),
+    }
+}
+
+/// `session-info` verb. Prints one pairing token to stdout and exits 0
+/// (config errors exit 2 with no token). IPC-first so the probe reuses
+/// the telemetry daemon's warm connection; direct fallback covers a
+/// disabled/crashed daemon.
+async fn run_session_info() -> ExitCode {
+    match session_info_via_ipc().await {
+        Ok(token) => {
+            println!("{token}");
+            return ExitCode::SUCCESS;
+        }
+        Err(IpcError::Unavailable(reason)) => {
+            info!(
+                "telemetry IPC unavailable ({}), checking pairing via direct BLE",
+                reason
+            );
+        }
+        Err(IpcError::DaemonRejected(msg)) => {
+            // Daemon answered with something we don't recognise. Don't
+            // fall through to a direct attempt (it would just wake the
+            // car again and likely repeat) — report unknown as
+            // unreachable so the API leaves the marker alone.
+            warn!("daemon returned unexpected session-info reply: {}", msg);
+            println!("UNREACHABLE");
+            return ExitCode::SUCCESS;
+        }
+    }
+
+    // Direct fallback: open our own one-shot session.
+    let (vin, adapter) = match load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("{e:#}");
+            return ExitCode::from(2);
+        }
+    };
+    let keypair = match KeyPair::load(Path::new(KEY_FILE)) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("loading BLE key file {KEY_FILE}: {e:#}");
+            return ExitCode::from(2);
+        }
+    };
+    let session = PersistentSession::start(keypair, vin, adapter);
+    let status = session.check_pairing().await;
+    session.shutdown().await;
+    let token = match status {
+        PairingStatus::Paired => "PAIRED",
+        PairingStatus::NotPaired => "NOT_PAIRED",
+        PairingStatus::Unreachable(reason) => {
+            info!("session-info direct probe unreachable: {reason}");
+            "UNREACHABLE"
+        }
+    };
+    println!("{token}");
+    ExitCode::SUCCESS
+}
+
+/// Send `session-info` over the daemon IPC socket and map the reply to
+/// a stdout token. `Unavailable` means no daemon is listening (caller
+/// falls back to direct); `DaemonRejected` means an unrecognised reply.
+async fn session_info_via_ipc() -> Result<&'static str, IpcError> {
+    let stream = match tokio::time::timeout(
+        Duration::from_millis(1000),
+        UnixStream::connect(IPC_SOCKET),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(IpcError::Unavailable(format!(
+                "connect to {}: {}",
+                IPC_SOCKET, e
+            )));
+        }
+        Err(_) => {
+            return Err(IpcError::Unavailable(format!(
+                "connect to {} timed out",
+                IPC_SOCKET
+            )));
+        }
+    };
+
+    let (read_half, mut write_half) = stream.into_split();
+    if let Err(e) = write_half.write_all(b"session-info\n").await {
+        return Err(IpcError::Unavailable(format!("writing verb: {}", e)));
+    }
+
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    match tokio::time::timeout(Duration::from_secs(90), reader.read_line(&mut line)).await {
+        Ok(Ok(0)) => Err(IpcError::Unavailable(
+            "daemon closed connection without response".into(),
+        )),
+        Ok(Ok(_)) => {
+            let line = line.trim();
+            let rest = line.strip_prefix("ERR ").map(str::trim);
+            if line == "OK" {
+                Ok("PAIRED")
+            } else if rest.is_some_and(|r| r.starts_with("NOT_PAIRED")) {
+                Ok("NOT_PAIRED")
+            } else if rest.is_some_and(|r| r.starts_with("UNREACHABLE")) {
+                Ok("UNREACHABLE")
+            } else {
+                Err(IpcError::DaemonRejected(line.to_string()))
+            }
+        }
+        Ok(Err(e)) => Err(IpcError::Unavailable(format!("read response: {}", e))),
         Err(_) => Err(IpcError::Unavailable(
             "daemon response timed out after 90s".into(),
         )),

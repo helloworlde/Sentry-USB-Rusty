@@ -1017,13 +1017,19 @@ async fn handle_action_request(
         return;
     }
 
-    // Resolve the verb to a typed ActionPayload before doing any
-    // BLE work — saves the cost of the radio handoff for a typo.
-    let action = match action_socket::parse_verb(&verb) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = req.reply.send(Err(e));
-            return;
+    // Resolve the verb before any BLE work (saves the radio handoff on
+    // a typo). "session-info" is the pairing probe — `None` here, then
+    // dispatched to check_pairing() below; every other verb must
+    // resolve to a typed ActionPayload.
+    let action = if verb == "session-info" {
+        None
+    } else {
+        match action_socket::parse_verb(&verb) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                let _ = req.reply.send(Err(e));
+                return;
+            }
         }
     };
 
@@ -1070,21 +1076,47 @@ async fn handle_action_request(
         .session;
 
     let started = Instant::now();
-    let result = session.send_action(action).await;
-    let elapsed_ms = started.elapsed().as_millis();
-    match &result {
-        Ok(bytes) => info!(
-            "action_socket: verb={} ok ({}ms, {} bytes decrypted response)",
-            verb,
-            elapsed_ms,
-            bytes.len()
-        ),
-        Err(e) => warn!(
-            "action_socket: verb={} failed after {}ms: {:#}",
-            verb, elapsed_ms, e
-        ),
-    }
-    let _ = req.reply.send(result.map(|_| ()));
+    let result = match action {
+        // Pairing probe: reuse this session's held connection. Map the
+        // tri-state onto the line protocol's OK/ERR contract —
+        // Paired => "OK", NotPaired => "ERR NOT_PAIRED", Unreachable =>
+        // "ERR UNREACHABLE: …". sentryusb-ble-action parses these tokens
+        // and the API clears the paired marker only on NOT_PAIRED.
+        None => {
+            use sentryusb_tesla_ble::manager::PairingStatus;
+            let status = session.check_pairing().await;
+            info!(
+                "action_socket: verb=session-info -> {:?} ({}ms)",
+                status,
+                started.elapsed().as_millis()
+            );
+            match status {
+                PairingStatus::Paired => Ok(()),
+                PairingStatus::NotPaired => Err(anyhow::anyhow!("NOT_PAIRED")),
+                PairingStatus::Unreachable(reason) => {
+                    Err(anyhow::anyhow!("UNREACHABLE: {reason}"))
+                }
+            }
+        }
+        Some(action) => {
+            let result = session.send_action(action).await;
+            let elapsed_ms = started.elapsed().as_millis();
+            match &result {
+                Ok(bytes) => info!(
+                    "action_socket: verb={} ok ({}ms, {} bytes decrypted response)",
+                    verb,
+                    elapsed_ms,
+                    bytes.len()
+                ),
+                Err(e) => warn!(
+                    "action_socket: verb={} failed after {}ms: {:#}",
+                    verb, elapsed_ms, e
+                ),
+            }
+            result.map(|_| ())
+        }
+    };
+    let _ = req.reply.send(result);
 }
 
 /// Release our radio-lock entry. Called on radio-release transitions

@@ -422,33 +422,63 @@ pub async fn ble_status(
         })));
     }
 
-    // Full BLE session-info probe
-    let result = sentryusb_shell::run_with_timeout(
-        Duration::from_secs(15),
-        "/root/bin/tesla-control",
-        &["-ble", "-vin", &vin.to_uppercase(), "session-info", "/root/.ble/key_private.pem", "infotainment"],
-    ).await;
+    // Full pairing probe via sentryusb-ble-action, which reuses the
+    // telemetry daemon's warm connection (IPC) instead of spawning a
+    // competing tesla-control process that fought the radio and — on
+    // any timeout — wrongly deleted the paired marker. The binary
+    // prints one stdout token; run_with_timeout only surfaces stdout,
+    // so we match on that. 20s covers a cold direct-fallback scan when
+    // the daemon is down.
+    let probe = sentryusb_shell::run_with_timeout(
+        Duration::from_secs(20),
+        "/root/bin/sentryusb-ble-action",
+        &["session-info"],
+    )
+    .await;
+    let token = probe.as_deref().map(str::trim).unwrap_or("");
 
-    if result.is_err() {
-        let _ = std::fs::remove_file("/root/.ble/paired");
-        return (StatusCode::OK, Json(serde_json::json!({
-            "status": "keys_generated",
-            "vin": vin,
-            "binaries_installed": binaries_installed,
-            "note": "Car not reachable or key not paired",
-        })));
+    match token {
+        "PAIRED" => {
+            // Feed the live "connected" indicator on the BLE card.
+            crate::ble::mark_ble_success();
+            let _ = std::fs::write("/root/.ble/paired", "1");
+            let _ = std::fs::remove_file("/root/.ble/key_pending_pairing");
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": "paired",
+                "vin": vin,
+                "binaries_installed": binaries_installed,
+            })))
+        }
+        "NOT_PAIRED" => {
+            // The ONLY case that clears the marker: the car explicitly
+            // rejected our key (KEY_NOT_ON_WHITELIST). Re-pair needed.
+            let _ = std::fs::remove_file("/root/.ble/paired");
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": "keys_generated",
+                "vin": vin,
+                "binaries_installed": binaries_installed,
+                "note": "Car reports this key is not paired -- re-pair from the BLE card and tap your card on the console",
+            })))
+        }
+        _ => {
+            // UNREACHABLE, a non-zero exit (config error / binary
+            // missing), or an empty/garbled reply: pairing is unknown,
+            // not disproven. Leave the marker as-is so a busy radio or a
+            // sleeping car can't flip the card to "not paired".
+            if let Err(e) = &probe {
+                tracing::warn!(
+                    "ble session-info probe could not run ({e:#}); leaving paired marker unchanged"
+                );
+            }
+            let paired = std::path::Path::new("/root/.ble/paired").exists();
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": if paired { "paired" } else { "keys_generated" },
+                "vin": vin,
+                "binaries_installed": binaries_installed,
+                "note": "Could not verify pairing right now (car asleep or BLE radio busy); status unchanged",
+            })))
+        }
     }
-
-    // session-info round-trip succeeded — feed the live "connected"
-    // indicator on the BLE settings card.
-    crate::ble::mark_ble_success();
-    let _ = std::fs::write("/root/.ble/paired", "1");
-    let _ = std::fs::remove_file("/root/.ble/key_pending_pairing");
-    (StatusCode::OK, Json(serde_json::json!({
-        "status": "paired",
-        "vin": vin,
-        "binaries_installed": binaries_installed,
-    })))
 }
 
 /// GET /api/system/speedtest — stream 64MB of random data for bandwidth testing.

@@ -42,7 +42,13 @@
 //!
 //! Where `<verb>` is one of:
 //!   `wake`, `sentry-on`, `sentry-off`, `charge-port-open`,
-//!   `charge-port-close`.
+//!   `charge-port-close`, `session-info`.
+//!
+//! `session-info` is special: instead of a one-shot action it runs a
+//! pairing probe over the held connection and replies `OK` (paired),
+//! `ERR NOT_PAIRED` (car rejected our key), or `ERR UNREACHABLE: <why>`
+//! (couldn't reach the car). Handled in `main::handle_action_request`,
+//! not `parse_verb` (which only maps action verbs).
 //!
 //! Socket lives at `/tmp/sentryusb-telemetry.sock` with mode 0600 —
 //! only root can connect (matches `sentryusb-ble-action`'s usual
