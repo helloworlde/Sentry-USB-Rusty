@@ -363,6 +363,48 @@ fn current_ble_adapter_for_pair() -> String {
     "hci0".to_string()
 }
 
+/// Remount the root filesystem read-write. These images keep `/`
+/// read-only to protect the SD card; a plain write to `/root` silently
+/// no-ops until this runs. Mirrors the remount the keygen / config /
+/// VIN-set paths in `ble.rs` already do before their writes.
+fn remount_root_rw() {
+    if let Err(e) = std::process::Command::new("bash")
+        .args(["-c", "/root/bin/remountfs_rw"])
+        .status()
+    {
+        tracing::warn!("remountfs_rw failed to run: {e}");
+    }
+}
+
+/// Persist the BLE pairing marker so the pair card survives a reload.
+///
+/// `paired=true` writes `/root/.ble/paired` and clears the
+/// `key_pending_pairing` flag; `paired=false` removes the marker.
+/// Always remounts rw first — without it the write no-ops on the
+/// read-only-root images and the card reverts to "Pair" on every
+/// navigation (the bug this fixes). Logs on failure instead of
+/// swallowing it, so a future regression is visible in the journal.
+fn set_ble_paired_marker(paired: bool) {
+    remount_root_rw();
+    // ENOENT on a remove just means the file wasn't there — expected,
+    // not worth a warning.
+    let ignore_missing = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    if paired {
+        if let Err(e) = std::fs::write("/root/.ble/paired", "1") {
+            tracing::warn!("failed to write /root/.ble/paired: {e}");
+        }
+        if let Err(e) = std::fs::remove_file("/root/.ble/key_pending_pairing") {
+            if !ignore_missing(&e) {
+                tracing::warn!("failed to clear /root/.ble/key_pending_pairing: {e}");
+            }
+        }
+    } else if let Err(e) = std::fs::remove_file("/root/.ble/paired") {
+        if !ignore_missing(&e) {
+            tracing::warn!("failed to remove /root/.ble/paired: {e}");
+        }
+    }
+}
+
 /// GET /api/system/ble-status
 pub async fn ble_status(
     State(_s): State<AppState>,
@@ -414,7 +456,7 @@ pub async fn ble_status(
                 "binaries_installed": binaries_installed,
             })));
         }
-        let _ = std::fs::write("/root/.ble/paired", "1");
+        set_ble_paired_marker(true);
         return (StatusCode::OK, Json(serde_json::json!({
             "status": "paired",
             "vin": vin,
@@ -441,8 +483,7 @@ pub async fn ble_status(
         "PAIRED" => {
             // Feed the live "connected" indicator on the BLE card.
             crate::ble::mark_ble_success();
-            let _ = std::fs::write("/root/.ble/paired", "1");
-            let _ = std::fs::remove_file("/root/.ble/key_pending_pairing");
+            set_ble_paired_marker(true);
             (StatusCode::OK, Json(serde_json::json!({
                 "status": "paired",
                 "vin": vin,
@@ -452,7 +493,7 @@ pub async fn ble_status(
         "NOT_PAIRED" => {
             // The ONLY case that clears the marker: the car explicitly
             // rejected our key (KEY_NOT_ON_WHITELIST). Re-pair needed.
-            let _ = std::fs::remove_file("/root/.ble/paired");
+            set_ble_paired_marker(false);
             (StatusCode::OK, Json(serde_json::json!({
                 "status": "keys_generated",
                 "vin": vin,
