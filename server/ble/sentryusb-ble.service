@@ -30,24 +30,13 @@ ExecStartPre=/usr/sbin/rfkill unblock bluetooth
 # kernel needs the device powered on first regardless of which one
 # we end up using.
 ExecStartPre=-/bin/bash -c 'for hci in /sys/class/bluetooth/hci*; do [ -d "$hci" ] && /usr/bin/hciconfig $(basename "$hci") up; done'
-# Wait for BlueZ DBus before invoking btmgmt below. btmgmt acquires the
-# kernel BT management socket via BlueZ, and at boot time runs the risk
-# of starting before bluetoothd has claimed the socket. When that happens
-# btmgmt blocks indefinitely instead of returning an error, eating the
-# full 90s systemd start-pre timeout. Doing the org.bluez ready-check
-# *first* makes btmgmt non-blocking on every restart path.
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do busctl status org.bluez >/dev/null 2>&1 && break; echo "Waiting for org.bluez... ($i/30)"; sleep 1; done'
-# Re-enable controller-level LE advertising. The btmgmt flag persists in
-# kernel state and ends up OFF after certain restart paths (service crash,
-# manual restart, bond-dir reset). With it OFF, BlueZ's RegisterAdvertisement
-# below has no effect — the radio stops broadcasting. Already-bonded phones
-# can still reconnect via the bonded address, so the bug is invisible to
-# existing users, but any NEW device trying to discover the Pi (first-time
-# setup, re-pair after bond wipe, additional family-member phone, future
-# iOS client) will silently fail with "Pi not found nearby." The leading
-# '-' makes systemd treat a missing btmgmt as non-fatal, and `timeout 5`
-# is belt-and-suspenders against any future BlueZ-readiness race.
-ExecStartPre=-/usr/bin/timeout 5 /usr/bin/btmgmt advertising on
+# The BlueZ-ready wait and `btmgmt advertising on` moved into the daemon
+# (wait_for_adapter + enable_controller_advertising). They ran ~6s
+# synchronously here, and since this unit is WantedBy=multi-user.target
+# that ~6s landed in the boot transaction (~5s of time-to-graphical.target
+# on RK3399). In the daemon the unit reaches active immediately; both
+# guards stay intact — it waits for org.bluez before touching btmgmt, and
+# re-enables controller advertising before registering the GATT app.
 ExecStart=/usr/bin/python3 /root/bin/sentryusb-ble.py
 Restart=always
 RestartSec=5

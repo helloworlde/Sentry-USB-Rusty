@@ -1136,14 +1136,12 @@ def find_adapter(bus, preferred_hci=None):
 def wait_for_adapter(bus, preferred_hci=None, timeout_s=15, poll_interval_s=0.2):
     """Wait for BlueZ to expose an LE adapter, polling up to `timeout_s`.
 
-    The systemd unit waits for the org.bluez D-Bus name to be claimed before
-    starting this script, but BlueZ exposes the adapter object asynchronously
-    after claiming the bus name. On a slow boot, busy SD card, or service
-    restart (after archiveloop's awake_stop, OOM kill, RuntimeMaxSec, etc.),
-    a single GetManagedObjects() call can race ahead of adapter enumeration
-    and find nothing. The script then exits 1, systemd retries up to
-    StartLimitBurst times, and if all retries hit the race the service stays
-    inactive until reboot.
+    Absorbs both BlueZ-readiness waits internally so the unit doesn't have
+    to block boot in ExecStartPre: a DBusException means org.bluez isn't on
+    the bus yet (BlueZ still starting — ~6s on RK3399), and an empty result
+    means the bus name is claimed but the adapter object isn't enumerated
+    yet (a race seen on slow boots, busy SD cards, or service restarts after
+    archiveloop's awake_stop / OOM kill). Both just keep the poll going.
 
     First-principle fix: wait for the dependency we actually need (the LE
     adapter object), not just the bus name. Polling once every 200ms for ~5
@@ -1154,7 +1152,11 @@ def wait_for_adapter(bus, preferred_hci=None, timeout_s=15, poll_interval_s=0.2)
     deadline = time.time() + timeout_s
     last_log = 0.0
     while time.time() < deadline:
-        path = find_adapter(bus, preferred_hci=preferred_hci)
+        try:
+            path = find_adapter(bus, preferred_hci=preferred_hci)
+        except dbus.exceptions.DBusException:
+            # org.bluez not on the bus yet — BlueZ still coming up.
+            path = None
         if path:
             return path
         if time.time() - last_log >= 1.0:
@@ -1163,6 +1165,30 @@ def wait_for_adapter(bus, preferred_hci=None, timeout_s=15, poll_interval_s=0.2)
             last_log = time.time()
         time.sleep(poll_interval_s)
     return None
+
+def enable_controller_advertising(adapter_path):
+    """Re-enable controller-level LE advertising via btmgmt.
+
+    The kernel mgmt 'advertising' flag persists OFF after some restart
+    paths (crash, manual restart, bond-dir reset); with it OFF, BlueZ's
+    RegisterAdvertisement below silently does nothing and the radio stops
+    broadcasting (new devices see "Pi not found nearby"). Run only after
+    wait_for_adapter() so BlueZ is provably up and btmgmt can't hang on the
+    mgmt socket. Best-effort. (Moved out of the unit's ExecStartPre so the
+    service no longer blocks the boot transaction.)
+    """
+    hci = adapter_path.rsplit('/', 1)[-1]  # /org/bluez/hci0 -> hci0
+    cmd = ['btmgmt']
+    idx = hci[3:]
+    if hci.startswith('hci') and idx.isdigit():
+        cmd += ['--index', idx]
+    cmd += ['advertising', 'on']
+    try:
+        subprocess.run(cmd, timeout=5, capture_output=True, check=False)
+        log.info(f'Controller advertising enabled on {hci}')
+    except Exception as e:
+        log.warning(f'btmgmt advertising on failed (non-fatal): {e}')
+
 
 def register_ad_cb():
     log.info('Advertisement registered')
@@ -1350,12 +1376,16 @@ def main():
     preferred = read_ble_adapter_from_config()
     if preferred:
         log.info(f'Config requests BLE adapter: {preferred}')
-    adapter_path = wait_for_adapter(bus, preferred_hci=preferred, timeout_s=15)
+    adapter_path = wait_for_adapter(bus, preferred_hci=preferred, timeout_s=30)
     if not adapter_path:
-        log.error('No Bluetooth LE adapter found after 15s — BlueZ may be misconfigured')
+        log.error('No Bluetooth LE adapter found after 30s — BlueZ may be misconfigured')
         sys.exit(1)
 
     log.info(f'Using adapter: {adapter_path}')
+
+    # Re-enable controller-level advertising now that BlueZ is provably up
+    # (was a unit ExecStartPre; moved here so the unit reaches active fast).
+    enable_controller_advertising(adapter_path)
 
     # Subscribe to BlueZ D-Bus signals so connection events are logged.
     # This makes it possible to see whether iOS actually connects to the Pi
