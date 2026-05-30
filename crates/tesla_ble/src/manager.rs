@@ -59,13 +59,10 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(1_500);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// Drop and rebuild the cached BLE adapter after this many consecutive
-/// connect failures. A flappy-but-recoverable link reconnects via the
-/// reused adapter (success resets the counter, so the adapter is never
-/// rebuilt), but a genuinely wedged bluez session / hci reset surfaces
-/// as sustained failures — rebuilding then gets a fresh D-Bus
-/// connection to self-heal. Bounded at one rebuild per N failures so it
-/// can't reintroduce the per-reconnect Manager leak it exists to fix.
+/// Rebuild the cached adapter after this many consecutive connect
+/// failures — self-heals a wedged bluez session / hci reset. Success
+/// resets the counter, so a flappy link never rebuilds (and never leaks
+/// a fresh D-Bus connection per reconnect).
 const ADAPTER_REBUILD_AFTER: u32 = 5;
 
 /// Seconds added to the *estimated* car clock to produce the
@@ -208,21 +205,15 @@ struct SessionState {
     /// (stale notifications, unmatched broadcasts, chunked stragglers).
     /// Each event still produced a successful query.
     framing_desync_recoveries: u32,
-    /// Cached BLE adapter (btleplug Manager + its bluez D-Bus session),
-    /// created once and reused across reconnects. The old code built a
-    /// fresh `Manager::new()` on every `ensure_connected`, opening a new
-    /// D-Bus connection each time; on a flappy link those accumulate
-    /// until root hits the D-Bus per-UID connection ceiling (~256) and
-    /// every BLE op fails with "maximum number of active connections for
-    /// UID 0 has been reached" until the daemon restarts. A dropped GATT
-    /// connection doesn't kill the adapter/session, so reusing it across
-    /// reconnects is both correct and leak-free.
+    /// Cached btleplug adapter (a bluez D-Bus session), reused across
+    /// reconnects. A fresh `Manager::new()` per `ensure_connected` leaks a
+    /// D-Bus connection each time until root hits the per-UID ceiling
+    /// (~256) and every BLE op fails with "maximum number of active
+    /// connections for UID 0". A dropped GATT link doesn't kill the
+    /// adapter, so reuse is safe.
     cached_adapter: Option<btleplug::platform::Adapter>,
-    /// Consecutive `ensure_connected` failures; reset to 0 on success.
-    /// At `ADAPTER_REBUILD_AFTER` we drop `cached_adapter` so a genuinely
-    /// wedged bluez session (daemon restart, hci reset) gets rebuilt —
-    /// bounded to one rebuild per N failures so it can't reintroduce the
-    /// per-reconnect Manager leak.
+    /// Consecutive `ensure_connected` failures; reset on success, triggers
+    /// an adapter rebuild at `ADAPTER_REBUILD_AFTER`.
     consecutive_connect_failures: u32,
 }
 
@@ -571,11 +562,8 @@ async fn signed_request_with_refresh_retry(
             }
             Ok(QueryOutcome::OperationWait) => {
                 if wait_retries_left == 0 {
-                    // Two WAITs in a row — Tesla is genuinely
-                    // blocked. Surface a clean error (not the old
-                    // "no sub_sig_data" hex dump) so the sampler
-                    // marks this tick failed and the schedule's
-                    // fast-retry path picks it up shortly.
+                    // Two WAITs in a row — surface a clean error so the
+                    // sampler fails this tick and fast-retries.
                     bail!(
                         "car returned OPERATIONSTATUS_WAIT twice in a row for \
                          {:?} — sample will be retried on next schedule tick",
@@ -729,11 +717,8 @@ async fn try_signed_request_once(
         .as_ref()
         .map(|s| s.signed_message_fault as u32)
         .unwrap_or(0);
-    // operation_status is field 1 of MessageStatus; signed_message_fault
-    // is field 2. They're independent: Tesla can send a clean
-    // "wait / busy" status with fault=0 and no encrypted payload,
-    // which we previously misread as "no sub_sig_data" and surfaced
-    // as a WARN with a hex dump. See OperationStatusE in
+    // Independent of signed_message_fault: the car can send a clean
+    // "wait/busy" status (fault=0, no payload). OperationStatusE in
     // proto/universal_message.proto: OK=0, WAIT=1, ERROR=2.
     let op_status = rm
         .signed_message_status
@@ -1164,10 +1149,8 @@ async fn handle_check_pairing(state: &mut SessionState) -> Result<PairingStatus>
     }
 }
 
-/// Record one `ensure_connected` failure. After `ADAPTER_REBUILD_AFTER`
-/// in a row, drop the cached adapter so the next attempt rebuilds it —
-/// self-heals a wedged bluez session without rebuilding (and leaking a
-/// D-Bus connection) on every reconnect.
+/// Record an `ensure_connected` failure; after `ADAPTER_REBUILD_AFTER` in
+/// a row, drop the cached adapter so the next attempt rebuilds it.
 fn note_connect_failure(state: &mut SessionState) {
     state.consecutive_connect_failures =
         state.consecutive_connect_failures.saturating_add(1);
@@ -1188,11 +1171,8 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
         return Ok(());
     }
 
-    // Reuse the cached adapter (and its bluez D-Bus session) across
-    // reconnects; only build a fresh one when we don't have it yet (or
-    // after it was dropped following sustained failures). Building a new
-    // Manager per reconnect leaked D-Bus connections — see
-    // `cached_adapter`.
+    // Reuse the cached adapter; build a fresh one only when absent (see
+    // `cached_adapter` for why per-reconnect rebuilds leak D-Bus conns).
     let adapter = match state.cached_adapter.clone() {
         Some(a) => a,
         None => match scan::adapter_by_name(state.adapter_name.as_deref()).await {

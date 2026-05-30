@@ -284,9 +284,7 @@ async fn main() -> Result<()> {
     // Same gate for sentry mode (from `state closures`): any non-Off
     // value keeps the car awake. `None` → assume on.
     let mut last_sentry_mode: Option<sample::SentryMode> = None;
-    // Throttle for the "parked but staying Active" gate diagnostic so it
-    // logs ~once/min instead of every tick. Answers the common "why
-    // won't my car sleep" question by surfacing which signal pinned us.
+    // Throttle for the staying-Active gate log (~1/min).
     let mut last_gate_log: Option<Instant> = None;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
@@ -478,14 +476,8 @@ async fn tick(
             } else {
                 "DEFAULTED: unread"
             };
-            // Active means we keep polling, which keeps the car awake.
-            // Quiet needs (car_truly_asleep OR parked_confirmed) AND
-            // !charge AND !sentry. Surface all four so a stuck Active is
-            // diagnosable: a car that's parked-awake (cam_disk touched
-            // because OUR polling keeps it awake) never goes
-            // `car_truly_asleep`, so the only escape is `parked_confirmed`
-            // — and if shift_state isn't observed as Park, that's stuck
-            // too and the car can never sleep.
+            // Quiet needs (asleep || parked_confirmed) && !charge && !sentry.
+            // Log all four so a stuck-Active gate is diagnosable.
             info!(
                 "gate: staying Active — car_truly_asleep={}, parked_polls={}/{}, \
                  sentry_on={} [{}], actively_charging={} [{}]",
@@ -870,18 +862,28 @@ async fn tick(
             any_call_ran = true;
         }
 
-        // Update park-confirmation counter from drive's shift
-        // observation (if drive ran this tick).
+        // Parked = not in a driving gear. Park or Unknown both count:
+        // Intel-MCU Teslas report the gear as Invalid/SNA (→ Unknown) once
+        // the drive computer powers down on parking, while a moving car
+        // always reports a real gear. Drive/Reverse/Neutral reset; None
+        // (drive poll didn't run / failed) leaves the counter alone.
         match shift_state_observed {
-            Some(s) if s.is_park() => {
+            Some(
+                sample::ShiftState::Drive
+                | sample::ShiftState::Reverse
+                | sample::ShiftState::Neutral,
+            ) => {
+                *parked_polls = 0;
+            }
+            Some(_) => {
+                // Park, or Unknown (drive computer asleep).
                 *parked_polls = parked_polls.saturating_add(1);
                 if *parked_polls == PARK_CONFIRMATIONS_BEFORE_QUIET {
-                    // Whether we drop to Quiet next tick depends on the
-                    // charging/sentry gate — log the outcome so the
-                    // journal shows why polling did/didn't slow down.
+                    // One-shot on first confirm; charge/sentry decide the
+                    // next tick.
                     if actively_charging || sentry_on {
                         info!(
-                            "{} consecutive Park observations — but staying Active \
+                            "{} consecutive parked observations — but staying Active \
                              (actively_charging={}, sentry_on={}); car is awake for \
                              a reason, quiet polling would freeze battery/sentry signals",
                             PARK_CONFIRMATIONS_BEFORE_QUIET,
@@ -890,24 +892,14 @@ async fn tick(
                         );
                     } else {
                         info!(
-                            "{} consecutive Park observations — dropping to body-controller polling so the car can sleep",
+                            "{} consecutive parked observations — dropping to body-controller polling so the car can sleep",
                             PARK_CONFIRMATIONS_BEFORE_QUIET
                         );
                     }
                 }
             }
-            Some(sample::ShiftState::Unknown) => {
-                // Unrecognized shift code — leave the counter alone
-                // (stay Active rather than quiet on a parse miss).
-            }
-            Some(_) => {
-                // Drive / Reverse / Neutral — actively moving,
-                // reset the Park counter.
-                *parked_polls = 0;
-            }
             None => {
-                // Drive didn't run this tick OR drive failed —
-                // leave the counter alone.
+                // Drive poll didn't run / failed — leave the counter alone.
             }
         }
 
@@ -921,11 +913,7 @@ async fn tick(
             persist(conn, sample);
         }
 
-        // Live snapshot of the gate inputs for the BLE card (not the DB).
-        // Reflects this tick's charge/closures polls; "Poll now" forces an
-        // Active tick, so the card shows a fresh sentry/charge read.
-        // shift_state_observed is this tick's drive read (None = drive
-        // didn't run this tick OR Tesla omitted shift_state).
+        // Live gate snapshot for the BLE card (not the DB).
         write_gate_status_file(*last_sentry_mode, *last_charging_state, shift_state_observed);
 
         // Sleep until the next sub-sampler is due (usually drive, 15s).
@@ -1027,13 +1015,8 @@ fn persist(conn: &Connection, sample: Sample) {
     }
 }
 
-/// Live snapshot file for the BLE card. Holds the latest sentry-mode and
-/// charging-state the gate is working from, so the UI can show them (and
-/// "Poll now" surfaces a fresh read). Deliberately NOT persisted to the
-/// telemetry DB — it's a transient current-state file, overwritten each
-/// Active tick. `unknown` means we haven't gotten a value from the car
-/// yet (Tesla can omit these fields), which is itself the tell for "why
-/// won't my car sleep" — the gate assumes on when it can't read them.
+/// Live gate inputs for the BLE card, overwritten each Active tick (not
+/// persisted). `unknown` = no value read from the car yet.
 const GATE_STATUS_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
 
 fn write_gate_status_file(
@@ -1047,10 +1030,7 @@ fn write_gate_status_file(
     let charging_s = charging
         .map(|c| format!("{c:?}"))
         .unwrap_or_else(|| "unknown".into());
-    // `absent` (vs `Unknown`) means the drive poll succeeded but Tesla
-    // didn't include shift_state at all — the case that wedges the
-    // park-confirmation counter, since the gate can't tell "parked" from
-    // "drive didn't run". Surfacing it makes the wedge self-evident.
+    // `absent` = drive poll succeeded but shift_state omitted.
     let shift_s = shift
         .map(|s| format!("{s:?}"))
         .unwrap_or_else(|| "absent".into());

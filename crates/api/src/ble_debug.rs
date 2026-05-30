@@ -931,24 +931,8 @@ fn write_history_full(out: &mut String) {
     }
 }
 
-/// Read the live status file the sampler maintains via
-/// crates/tesla_ble/src/manager.rs. Cross-process IPC via a single
-/// line of plain text — no async, no parsing complexity, and the
-/// raw file content is what we surface to the user anyway.
-///
-/// This is the most reliable "is the sampler connected RIGHT NOW"
-/// signal in the bundle. The disconnect log shows history; the
-/// systemctl section shows the process; this section shows the BLE
-/// link itself.
-/// The live quiet-mode gate inputs the telemetry daemon snapshots each
-/// Active tick: sentry_mode, charging_state, shift_state. The gate only
-/// drops to sleep-safe polling when parked AND not charging AND sentry
-/// off, so when a tester asks "why won't my car sleep", these three are
-/// the answer. `shift_state=Unknown`/`absent` while parked is the known
-/// wedge — the park-confirmation counter only advances on a clear gear,
-/// and Tesla doesn't always report Park as an explicit gear. Pair this
-/// with the `gate: staying Active … parked_polls=N/3` line in the
-/// sampler journal below.
+/// Dump the live gate file: sentry/charge/shift the daemon is gating on.
+/// `shift_state=Unknown` while parked is expected on Intel-MCU Teslas.
 fn write_gate_state(out: &mut String) {
     const GATE_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
     match std::fs::read_to_string(GATE_PATH) {
@@ -971,6 +955,15 @@ fn write_gate_state(out: &mut String) {
     }
 }
 
+/// Read the live status file the sampler maintains via
+/// crates/tesla_ble/src/manager.rs. Cross-process IPC via a single
+/// line of plain text — no async, no parsing complexity, and the
+/// raw file content is what we surface to the user anyway.
+///
+/// This is the most reliable "is the sampler connected RIGHT NOW"
+/// signal in the bundle. The disconnect log shows history; the
+/// systemctl section shows the process; this section shows the BLE
+/// link itself.
 fn write_live_session_status(out: &mut String) {
     const STATUS_PATH: &str = "/mutable/sentryusb-ble-status.txt";
     match std::fs::read_to_string(STATUS_PATH) {

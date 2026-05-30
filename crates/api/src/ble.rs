@@ -497,18 +497,12 @@ fn read_radio_owner() -> Option<String> {
 
 /// GET /api/system/ble-latest-sample
 ///
-/// Live gate snapshot the telemetry daemon writes each Active tick —
-/// the latest sentry-mode and charging-state it's gating on. Not in the
-/// DB (it's transient current-state), so the latest-sample handler reads
-/// it from this file and folds it into the response. Path mirrors
-/// `GATE_STATUS_PATH` in the tesla_telemetry daemon.
+/// Live gate snapshot the telemetry daemon overwrites each Active tick;
+/// mirrors `GATE_STATUS_PATH` in the daemon.
 const GATE_STATUS_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
 
-/// Parse `sentry_mode` / `charging_state` out of the live gate file.
-/// Returns `(None, None)` if the daemon hasn't written it yet. A value
-/// of `"unknown"` is preserved (not nulled) — it means the daemon hasn't
-/// read that field from the car, which is exactly what the user wants to
-/// see when diagnosing "why won't my car sleep".
+/// `(sentry, charging, shift)` from the gate file, `None` each if unwritten.
+/// `"unknown"` is kept (not nulled) — it means the daemon couldn't read it.
 fn read_gate_status() -> (Option<String>, Option<String>, Option<String>) {
     let Ok(body) = std::fs::read_to_string(GATE_STATUS_PATH) else {
         return (None, None, None);
@@ -692,11 +686,7 @@ pub async fn ble_latest_sample(
                 "tire_rr_psi": tire_rr_psi,
                 "odometer_mi": odometer_mi,
                 "location_name": location_name,
-                // Live gate inputs (sentry mode, charging state, shift)
-                // from the daemon's snapshot file, not the DB. "unknown"
-                // means the daemon couldn't read the field; shift
-                // "absent" means Tesla omitted shift_state on a
-                // successful drive poll (wedges the park-sleep gate).
+                // Live gate inputs from the daemon's gate file, not the DB.
                 "sentry_mode": sentry_mode,
                 "charging_state": charging_state,
                 "shift_state": shift_state,

@@ -78,9 +78,7 @@ interface BleLatestSample {
   tire_rr_psi?: number | null
   odometer_mi?: number | null
   location_name?: string | null
-  /** Live gate inputs from the daemon's snapshot file (not the DB).
-   *  "unknown" means the daemon couldn't read the field from the car;
-   *  shift "absent" means Tesla omitted shift_state on a good drive poll. */
+  /** Live gate inputs (not the DB). "unknown"/"absent" = not read. */
   sentry_mode?: string | null
   charging_state?: string | null
   shift_state?: string | null
@@ -1083,6 +1081,15 @@ function TelemetryOutputPanel({
               label="Shift"
               value={sample.shift_state === "absent" ? "Not reported" : sample.shift_state}
             />
+          )}
+          {sample.shift_state === "Unknown" && (
+            <p className="pt-1 text-[10px] text-amber-400/80">
+              Shift reads <strong>Unknown</strong> — this is expected on older
+              (Intel-based) Teslas. Tesla powers down the gear computer when the
+              car is in Park with nobody inside, so the gear is no longer
+              reported. We treat <strong>Unknown as Park</strong> so the car is
+              still allowed to sleep.
+            </p>
           )}
           <Row label="Interior temp" value={fmtTemp(sample.interior_temp_c, metric)} />
           <Row label="Exterior temp" value={fmtTemp(sample.exterior_temp_c, metric)} />
