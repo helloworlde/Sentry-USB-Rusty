@@ -2335,6 +2335,7 @@ dependencies = [
  "sentryusb-cloud-uploader",
  "sentryusb-drives",
  "sentryusb-gadget",
+ "sentryusb-setup",
  "sentryusb-shell",
  "sentryusb-ws",
  "tokio",
