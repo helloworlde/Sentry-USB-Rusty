@@ -17,10 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: CLA Assistant
-        if: |
-          (github.event.comment.body == 'recheck' ||
-           github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') ||
-          github.event_name == 'pull_request_target'
+        # Run on PR events and on every issue comment, then let the action do
+        # its own whitespace-tolerant matching of the sign phrase / "recheck".
+        # An exact `==` gate here silently skips sign comments that carry a
+        # trailing CR/whitespace (e.g. pasted from the web UI).
+        if: github.event_name == 'pull_request_target' || github.event_name == 'issue_comment'
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
