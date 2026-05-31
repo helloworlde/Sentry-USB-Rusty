@@ -210,11 +210,18 @@ pub async fn evaluate(
         // sending OFF and synchronously (the helper blocks until the local
         // server dispatched the push) so it egresses while we still have
         // power. One-shot per home cycle.
-        notify_event(
-            "Pi going offline",
-            "Archive complete at home — releasing accessory power. The Pi will power down until your next drive.",
-        )
-        .await;
+        //
+        // Word the message to the actual release reason: an archive doesn't
+        // always run at home (no new footage / keep-awake handled it), so
+        // `archive_seen_active` distinguishes "archive finished" from the
+        // grace-expired "nothing to archive" path. (Mirrors decide_desired's
+        // two home-OFF branches.)
+        let msg = if state.archive_seen_active {
+            "Archive complete at home — releasing accessory power. The Pi will power down until your next drive."
+        } else {
+            "Back home — releasing accessory power. The Pi will power down until your next drive."
+        };
+        notify_event("Pi going offline", msg).await;
         state.offline_notified = true;
     }
 
