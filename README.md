@@ -28,6 +28,11 @@
 
 The Rust rewrite of the original Go version. Same `sentryusb.conf`, faster server, more reliable.
 
+> [!IMPORTANT]
+> Beginning with update 2026.20, Tesla has begun offering the ability to encrypt Tesla cam footage, which is enabled by default. Encrypted files cannot be read by Sentry USB. To continue using Sentry USB, please disable the encryption.
+> 
+> You can find the relevant settings in your vehicle's menu under Safety, beneath the dashcam USB storage options.
+
 ---
 
 ## Screenshots
