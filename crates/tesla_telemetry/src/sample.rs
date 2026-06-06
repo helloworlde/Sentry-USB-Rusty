@@ -153,6 +153,24 @@ pub struct DriveResult {
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub meta: ResponseMeta,
+    /// Live speed / power / active-route detail. Decoded only when the
+    /// experimental flag is on; inert otherwise.
+    pub detail: DriveDetail,
+}
+
+/// Live driving + navigation detail from the BLE `DriveState` message.
+#[derive(Debug, Clone, Default)]
+pub struct DriveDetail {
+    /// Instantaneous speed, mph.
+    pub speed_mph: Option<f32>,
+    /// Instantaneous drive power, kW (negative = regen).
+    pub power_kw: Option<i32>,
+    /// Active-route destination label, if navigating.
+    pub route_destination: Option<String>,
+    /// Estimated minutes to arrival on the active route.
+    pub route_minutes_to_arrival: Option<f32>,
+    /// Miles remaining to arrival on the active route.
+    pub route_miles_to_arrival: Option<f32>,
 }
 
 /// Result of a successful `sample_climate` call. Slow-changing —
@@ -162,6 +180,24 @@ pub struct ClimateResult {
     pub exterior_temp_c: Option<f64>,
     pub hvac_on: Option<bool>,
     pub meta: ResponseMeta,
+    /// Setpoints / fan / defroster / seat-heater / preconditioning detail.
+    /// Decoded only when the experimental flag is on; inert otherwise.
+    pub detail: ClimateDetail,
+}
+
+/// Extended climate detail from the BLE `ClimateState` message.
+/// Temperatures are Celsius; seat-heater / fan levels are Tesla's raw
+/// integer steps (0 = off).
+#[derive(Debug, Clone, Default)]
+pub struct ClimateDetail {
+    pub driver_setpoint_c: Option<f32>,
+    pub passenger_setpoint_c: Option<f32>,
+    pub fan_status: Option<i32>,
+    pub front_defroster_on: Option<bool>,
+    pub rear_defroster_on: Option<bool>,
+    pub preconditioning: Option<bool>,
+    pub seat_heater_left: Option<i32>,
+    pub seat_heater_right: Option<i32>,
 }
 
 // LocationResult was removed: standalone `state location` queries
@@ -182,6 +218,38 @@ pub struct ChargeResult {
     pub battery_pct: Option<f64>,
     pub charging_state: Option<ChargingState>,
     pub meta: ResponseMeta,
+    /// Expanded charging detail. Always decoded (cheap, read-only), but
+    /// only consumed/logged when the experimental flag is on, so a
+    /// normal install is unaffected. Persistence + API/web surfacing is
+    /// a follow-up once the decode is validated on real hardware.
+    pub detail: ChargeDetail,
+}
+
+/// Extra fields from the BLE `ChargeState` message that the car already
+/// sends but the sampler didn't previously surface. All optional — a
+/// field is `None` when the car didn't report it this poll.
+#[derive(Debug, Clone, Default)]
+pub struct ChargeDetail {
+    /// Actual current the charger is delivering, amps.
+    pub charger_actual_current_a: Option<i32>,
+    /// Charging power, kW.
+    pub charger_power_kw: Option<i32>,
+    /// Charger input voltage, volts.
+    pub charger_voltage_v: Option<i32>,
+    /// Set/requested charging amps.
+    pub charging_amps_set: Option<i32>,
+    /// Charge rate, mi/hr added.
+    pub charge_rate_mph: Option<f32>,
+    /// Energy added this session, kWh.
+    pub charge_energy_added_kwh: Option<f32>,
+    /// Charge limit (target SoC), percent.
+    pub charge_limit_soc: Option<i32>,
+    /// Estimated minutes to full charge.
+    pub minutes_to_full_charge: Option<i32>,
+    /// Rated battery range, miles.
+    pub battery_range_mi: Option<f32>,
+    /// Charge port door open.
+    pub charge_port_door_open: Option<bool>,
 }
 
 /// Result of a successful `sample_closures` call. In-memory only —
@@ -192,6 +260,29 @@ pub struct ChargeResult {
 pub struct ClosuresResult {
     pub sentry_mode: Option<SentryMode>,
     pub meta: ResponseMeta,
+    /// Door / window / lock / trunk state. Decoded only when the
+    /// experimental flag is on; inert otherwise. Each field is None when
+    /// the car didn't report it this poll.
+    pub detail: ClosuresDetail,
+}
+
+/// Security-relevant closure state from the BLE `ClosuresState` message.
+/// `true` = open / unlocked. `frunk` is the front trunk, `trunk` the rear.
+#[derive(Debug, Clone, Default)]
+pub struct ClosuresDetail {
+    pub locked: Option<bool>,
+    pub door_driver_front_open: Option<bool>,
+    pub door_driver_rear_open: Option<bool>,
+    pub door_passenger_front_open: Option<bool>,
+    pub door_passenger_rear_open: Option<bool>,
+    pub frunk_open: Option<bool>,
+    pub trunk_open: Option<bool>,
+    pub window_driver_front_open: Option<bool>,
+    pub window_passenger_front_open: Option<bool>,
+    pub window_driver_rear_open: Option<bool>,
+    pub window_passenger_rear_open: Option<bool>,
+    /// Sunroof opening as a percentage (0 = closed).
+    pub sunroof_percent_open: Option<i32>,
 }
 
 /// Result of a successful `sample_tires` call. Very slow-changing —
@@ -242,6 +333,17 @@ pub struct Sample {
     /// current location. Pulled from `state drive`. Used as
     /// drive start/end labels in the UI.
     pub location_name: Option<String>,
+    // Charging detail (v11). Populated from ChargeResult.detail only
+    // when the experimental flag is on; None otherwise, so a normal
+    // install writes the same rows it always has. Powers the charging
+    // view under "Driving".
+    pub charger_power_kw: Option<i32>,
+    pub charger_actual_current_a: Option<i32>,
+    pub charger_voltage_v: Option<i32>,
+    pub charge_rate_mph: Option<f32>,
+    pub charge_energy_added_kwh: Option<f32>,
+    pub charge_limit_soc: Option<i32>,
+    pub battery_range_mi: Option<f32>,
     pub source: String,
 }
 
@@ -302,6 +404,9 @@ pub async fn sample_drive(vin: &str, adapter: &str) -> Result<DriveResult> {
         lat: pick_f64(&drive, &["latitude", "nativeLatitude", "native_latitude"]),
         lon: pick_f64(&drive, &["longitude", "nativeLongitude", "native_longitude"]),
         meta,
+        // Expanded detail is decoded only on the in-process BLE path; the
+        // legacy shell-out path leaves it empty.
+        detail: DriveDetail::default(),
     })
 }
 
@@ -333,6 +438,9 @@ pub async fn sample_climate(vin: &str, adapter: &str) -> Result<ClimateResult> {
             &["isClimateOn", "is_climate_on", "hvacAuto", "climateKeeperMode"],
         ),
         meta,
+        // Expanded detail is decoded only on the in-process BLE path; the
+        // legacy shell-out path leaves it empty.
+        detail: ClimateDetail::default(),
     })
 }
 
@@ -363,6 +471,9 @@ pub async fn sample_charge(vin: &str, adapter: &str) -> Result<ChargeResult> {
         // we don't bother parsing charging_state out of the JSON.
         charging_state: None,
         meta,
+        // Expanded detail is decoded only on the in-process BLE path
+        // (sample_charge_ble); the legacy shell-out path leaves it empty.
+        detail: ChargeDetail::default(),
     })
 }
 

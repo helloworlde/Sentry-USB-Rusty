@@ -15,8 +15,9 @@ use sentryusb_tesla_ble::{
 use tracing::{info, warn};
 
 use crate::sample::{
-    BodyControllerSample, ChargeResult, ChargingState, ClimateResult, ClosuresResult,
-    DriveResult, ResponseMeta, Sample, SentryMode, ShiftState, TiresResult, now_secs,
+    BodyControllerSample, ChargeDetail, ChargeResult, ChargingState, ClimateDetail, ClimateResult,
+    ClosuresDetail, ClosuresResult, DriveDetail, DriveResult, ResponseMeta, Sample, SentryMode,
+    ShiftState, TiresResult, now_secs,
 };
 
 /// 1 bar = 14.5038 psi (NIST). Tesla reports TPMS in bar on the wire.
@@ -166,6 +167,33 @@ pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult
         ),
     }
 
+    use car_server::drive_state as ds;
+    let detail = DriveDetail {
+        speed_mph: drive.optional_speed_float.as_ref().map(|v| {
+            let ds::OptionalSpeedFloat::SpeedFloat(n) = v;
+            *n
+        }),
+        power_kw: drive.optional_power.as_ref().map(|v| {
+            let ds::OptionalPower::Power(n) = v;
+            *n
+        }),
+        route_destination: drive.optional_active_route_destination.as_ref().map(|v| {
+            let ds::OptionalActiveRouteDestination::ActiveRouteDestination(s) = v;
+            s.clone()
+        }),
+        route_minutes_to_arrival: drive
+            .optional_active_route_minutes_to_arrival
+            .as_ref()
+            .map(|v| {
+                let ds::OptionalActiveRouteMinutesToArrival::ActiveRouteMinutesToArrival(n) = v;
+                *n
+            }),
+        route_miles_to_arrival: drive.optional_active_route_miles_to_arrival.as_ref().map(|v| {
+            let ds::OptionalActiveRouteMilesToArrival::ActiveRouteMilesToArrival(n) = v;
+            *n
+        }),
+    };
+
     Ok(DriveResult {
         location_name,
         odometer_mi,
@@ -173,7 +201,25 @@ pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult
         lat,
         lon,
         meta,
+        detail,
     })
+}
+
+/// Emit a one-line summary of live drive + navigation detail. Logged only
+/// when the experimental flag is on. The route destination is treated as
+/// PII (it is a place name), so the log reports only whether a route is
+/// active plus the ETA / distance, never the destination string.
+pub fn log_drive_detail(c: &DriveResult) {
+    let d = &c.detail;
+    info!(
+        "drive-detail [experimental]: speed_mph={:?} power_kw={:?} navigating={} \
+         eta_min={:?} miles_to_arrival={:?}",
+        d.speed_mph,
+        d.power_kw,
+        d.route_destination.is_some(),
+        d.route_minutes_to_arrival,
+        d.route_miles_to_arrival,
+    );
 }
 
 /// `state climate` over BLE. Interior/exterior temps + HVAC on/off.
@@ -206,12 +252,68 @@ pub async fn sample_climate_ble(session: &PersistentSession) -> Result<ClimateRe
         });
     let meta = build_meta(climate.timestamp.as_ref(), started);
 
+    use car_server::climate_state as cls;
+    let detail = ClimateDetail {
+        driver_setpoint_c: climate.optional_driver_temp_setting.as_ref().map(|v| {
+            let cls::OptionalDriverTempSetting::DriverTempSetting(n) = v;
+            *n
+        }),
+        passenger_setpoint_c: climate.optional_passenger_temp_setting.as_ref().map(|v| {
+            let cls::OptionalPassengerTempSetting::PassengerTempSetting(n) = v;
+            *n
+        }),
+        fan_status: climate.optional_fan_status.as_ref().map(|v| {
+            let cls::OptionalFanStatus::FanStatus(n) = v;
+            *n
+        }),
+        front_defroster_on: climate.optional_is_front_defroster_on.as_ref().map(|v| {
+            let cls::OptionalIsFrontDefrosterOn::IsFrontDefrosterOn(b) = v;
+            *b
+        }),
+        rear_defroster_on: climate.optional_is_rear_defroster_on.as_ref().map(|v| {
+            let cls::OptionalIsRearDefrosterOn::IsRearDefrosterOn(b) = v;
+            *b
+        }),
+        preconditioning: climate.optional_is_preconditioning.as_ref().map(|v| {
+            let cls::OptionalIsPreconditioning::IsPreconditioning(b) = v;
+            *b
+        }),
+        seat_heater_left: climate.optional_seat_heater_left.as_ref().map(|v| {
+            let cls::OptionalSeatHeaterLeft::SeatHeaterLeft(n) = v;
+            *n
+        }),
+        seat_heater_right: climate.optional_seat_heater_right.as_ref().map(|v| {
+            let cls::OptionalSeatHeaterRight::SeatHeaterRight(n) = v;
+            *n
+        }),
+    };
+
     Ok(ClimateResult {
         interior_temp_c,
         exterior_temp_c,
         hvac_on,
         meta,
+        detail,
     })
+}
+
+/// Emit a one-line summary of extended climate detail. Logged only when
+/// the experimental flag is on; lets a tester confirm the `ClimateState`
+/// fields decode correctly off a real car before they reach the UI.
+pub fn log_climate_detail(c: &ClimateResult) {
+    let d = &c.detail;
+    info!(
+        "climate-detail [experimental]: setpoint[drv={:?} pass={:?}] fan={:?} \
+         defrost[front={:?} rear={:?}] precond={:?} seat[l={:?} r={:?}]",
+        d.driver_setpoint_c,
+        d.passenger_setpoint_c,
+        d.fan_status,
+        d.front_defroster_on,
+        d.rear_defroster_on,
+        d.preconditioning,
+        d.seat_heater_left,
+        d.seat_heater_right,
+    );
 }
 
 /// `state charge` over BLE. Battery percent (usable preferred,
@@ -243,11 +345,82 @@ pub async fn sample_charge_ble(session: &PersistentSession) -> Result<ChargeResu
     let charging_state = charge.charging_state.as_ref().map(map_charging_state);
     let meta = build_meta(charge.timestamp.as_ref(), started);
 
+    // Expanded charging detail — fields the `ChargeState` message already
+    // carries that the sampler didn't previously surface. Decode is cheap
+    // and read-only; the caller only logs/consumes it when the
+    // experimental flag is on, so this is inert on a normal install.
+    let detail = ChargeDetail {
+        charger_actual_current_a: charge.optional_charger_actual_current.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargerActualCurrent::ChargerActualCurrent(n) = v;
+            *n
+        }),
+        charger_power_kw: charge.optional_charger_power.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargerPower::ChargerPower(n) = v;
+            *n
+        }),
+        charger_voltage_v: charge.optional_charger_voltage.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargerVoltage::ChargerVoltage(n) = v;
+            *n
+        }),
+        charging_amps_set: charge.optional_charging_amps.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargingAmps::ChargingAmps(n) = v;
+            *n
+        }),
+        charge_rate_mph: charge.optional_charge_rate_mph_float.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargeRateMphFloat::ChargeRateMphFloat(n) = v;
+            *n
+        }),
+        charge_energy_added_kwh: charge.optional_charge_energy_added.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargeEnergyAdded::ChargeEnergyAdded(n) = v;
+            *n
+        }),
+        charge_limit_soc: charge.optional_charge_limit_soc.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargeLimitSoc::ChargeLimitSoc(n) = v;
+            *n
+        }),
+        minutes_to_full_charge: charge.optional_minutes_to_full_charge.as_ref().map(|v| {
+            let car_server::charge_state::OptionalMinutesToFullCharge::MinutesToFullCharge(n) = v;
+            *n
+        }),
+        battery_range_mi: charge.optional_battery_range.as_ref().map(|v| {
+            let car_server::charge_state::OptionalBatteryRange::BatteryRange(n) = v;
+            *n
+        }),
+        charge_port_door_open: charge.optional_charge_port_door_open.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargePortDoorOpen::ChargePortDoorOpen(n) = v;
+            *n
+        }),
+    };
+
     Ok(ChargeResult {
         battery_pct,
         charging_state,
         meta,
+        detail,
     })
+}
+
+/// Emit a one-line summary of the expanded charging detail. Called only
+/// when the experimental flag is on, so a normal install stays quiet.
+/// Lets a tester confirm the new `ChargeState` fields decode correctly
+/// off a real car before we wire them into the DB + API + web UI.
+pub fn log_charge_detail(c: &ChargeResult) {
+    let d = &c.detail;
+    info!(
+        "charge-detail [experimental]: amps={:?} power_kw={:?} volts={:?} amps_set={:?} \
+         rate_mph={:?} added_kwh={:?} limit_soc={:?} mins_to_full={:?} range_mi={:?} \
+         port_open={:?}",
+        d.charger_actual_current_a,
+        d.charger_power_kw,
+        d.charger_voltage_v,
+        d.charging_amps_set,
+        d.charge_rate_mph,
+        d.charge_energy_added_kwh,
+        d.charge_limit_soc,
+        d.minutes_to_full_charge,
+        d.battery_range_mi,
+        d.charge_port_door_open,
+    );
 }
 
 /// `state location` over BLE — raw GPS `(lat, lon)`. Separate from the
@@ -285,7 +458,93 @@ pub async fn sample_closures_ble(session: &PersistentSession) -> Result<Closures
     let sentry_mode = closures.sentry_mode_state.as_ref().map(map_sentry_mode);
     let meta = build_meta(closures.timestamp.as_ref(), started);
 
-    Ok(ClosuresResult { sentry_mode, meta })
+    use car_server::closures_state as cs;
+    let detail = ClosuresDetail {
+        locked: closures.optional_locked.as_ref().map(|v| {
+            let cs::OptionalLocked::Locked(b) = v;
+            *b
+        }),
+        door_driver_front_open: closures.optional_door_open_driver_front.as_ref().map(|v| {
+            let cs::OptionalDoorOpenDriverFront::DoorOpenDriverFront(b) = v;
+            *b
+        }),
+        door_driver_rear_open: closures.optional_door_open_driver_rear.as_ref().map(|v| {
+            let cs::OptionalDoorOpenDriverRear::DoorOpenDriverRear(b) = v;
+            *b
+        }),
+        door_passenger_front_open: closures.optional_door_open_passenger_front.as_ref().map(|v| {
+            let cs::OptionalDoorOpenPassengerFront::DoorOpenPassengerFront(b) = v;
+            *b
+        }),
+        door_passenger_rear_open: closures.optional_door_open_passenger_rear.as_ref().map(|v| {
+            let cs::OptionalDoorOpenPassengerRear::DoorOpenPassengerRear(b) = v;
+            *b
+        }),
+        frunk_open: closures.optional_door_open_trunk_front.as_ref().map(|v| {
+            let cs::OptionalDoorOpenTrunkFront::DoorOpenTrunkFront(b) = v;
+            *b
+        }),
+        trunk_open: closures.optional_door_open_trunk_rear.as_ref().map(|v| {
+            let cs::OptionalDoorOpenTrunkRear::DoorOpenTrunkRear(b) = v;
+            *b
+        }),
+        window_driver_front_open: closures.optional_window_open_driver_front.as_ref().map(|v| {
+            let cs::OptionalWindowOpenDriverFront::WindowOpenDriverFront(b) = v;
+            *b
+        }),
+        window_passenger_front_open: closures
+            .optional_window_open_passenger_front
+            .as_ref()
+            .map(|v| {
+                let cs::OptionalWindowOpenPassengerFront::WindowOpenPassengerFront(b) = v;
+                *b
+            }),
+        window_driver_rear_open: closures.optional_window_open_driver_rear.as_ref().map(|v| {
+            let cs::OptionalWindowOpenDriverRear::WindowOpenDriverRear(b) = v;
+            *b
+        }),
+        window_passenger_rear_open: closures
+            .optional_window_open_passenger_rear
+            .as_ref()
+            .map(|v| {
+                let cs::OptionalWindowOpenPassengerRear::WindowOpenPassengerRear(b) = v;
+                *b
+            }),
+        sunroof_percent_open: closures.optional_sun_roof_percent_open.as_ref().map(|v| {
+            let cs::OptionalSunRoofPercentOpen::SunRoofPercentOpen(n) = v;
+            *n
+        }),
+    };
+
+    Ok(ClosuresResult {
+        sentry_mode,
+        meta,
+        detail,
+    })
+}
+
+/// Emit a one-line summary of door / window / lock state. Logged only
+/// when the experimental flag is on so a normal install stays quiet;
+/// lets a tester confirm the `ClosuresState` fields decode correctly off
+/// a real car before they are surfaced in the API and web UI.
+pub fn log_closures_detail(c: &ClosuresResult) {
+    let d = &c.detail;
+    info!(
+        "closures-detail [experimental]: locked={:?} doors[df={:?} dr={:?} pf={:?} pr={:?}] \
+         frunk={:?} trunk={:?} windows[df={:?} pf={:?} dr={:?} pr={:?}] sunroof%={:?}",
+        d.locked,
+        d.door_driver_front_open,
+        d.door_driver_rear_open,
+        d.door_passenger_front_open,
+        d.door_passenger_rear_open,
+        d.frunk_open,
+        d.trunk_open,
+        d.window_driver_front_open,
+        d.window_passenger_front_open,
+        d.window_driver_rear_open,
+        d.window_passenger_rear_open,
+        d.sunroof_percent_open,
+    );
 }
 
 /// `state tire-pressure` over BLE. Converts Tesla's native bar →

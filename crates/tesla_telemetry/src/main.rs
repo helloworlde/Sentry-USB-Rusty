@@ -653,6 +653,9 @@ async fn tick(
             if presence_now == Some(true) {
                 match sample_ble::sample_drive_ble(session).await {
                     Ok(d) => {
+                        if cfg.experimental {
+                            sample_ble::log_drive_detail(&d);
+                        }
                         // Self-correct the Pi's clock if it's
                         // significantly off — uses Tesla's
                         // GPS-derived timestamp from the response.
@@ -727,6 +730,9 @@ async fn tick(
                     if refresh_due {
                         match sample_ble::sample_climate_ble(session).await {
                             Ok(c) => {
+                                if cfg.experimental {
+                                    sample_ble::log_climate_detail(&c);
+                                }
                                 try_sync_clock(c.meta);
                                 refresh.interior_temp_c = c.interior_temp_c;
                                 refresh.exterior_temp_c = c.exterior_temp_c;
@@ -737,6 +743,9 @@ async fn tick(
                         }
                         match sample_ble::sample_charge_ble(session).await {
                             Ok(c) => {
+                                if cfg.experimental {
+                                    sample_ble::log_charge_detail(&c);
+                                }
                                 try_sync_clock(c.meta);
                                 refresh.battery_pct = c.battery_pct;
                                 // Also refresh the gate input so a
@@ -755,6 +764,9 @@ async fn tick(
                         // fields, so this doesn't affect `any_ok`.
                         match sample_ble::sample_closures_ble(session).await {
                             Ok(c) => {
+                                if cfg.experimental {
+                                    sample_ble::log_closures_detail(&c);
+                                }
                                 try_sync_clock(c.meta);
                                 if let Some(sm) = c.sentry_mode {
                                     *last_sentry_mode = Some(sm);
@@ -849,6 +861,9 @@ async fn tick(
         if schedule.drive_due(tick_now) {
             let success = match sample_ble::sample_drive_ble(session).await {
                 Ok(d) => {
+                    if cfg.experimental {
+                        sample_ble::log_drive_detail(&d);
+                    }
                     try_sync_clock(d.meta);
                     sample.odometer_mi = d.odometer_mi;
                     sample.location_name = d.location_name;
@@ -917,6 +932,9 @@ async fn tick(
         if schedule.climate_due(tick_now) {
             let success = match sample_ble::sample_climate_ble(session).await {
                 Ok(c) => {
+                    if cfg.experimental {
+                        sample_ble::log_climate_detail(&c);
+                    }
                     try_sync_clock(c.meta);
                     sample.interior_temp_c = c.interior_temp_c;
                     sample.exterior_temp_c = c.exterior_temp_c;
@@ -936,6 +954,20 @@ async fn tick(
         if schedule.charge_due(tick_now) {
             let success = match sample_ble::sample_charge_ble(session).await {
                 Ok(c) => {
+                    if cfg.experimental {
+                        sample_ble::log_charge_detail(&c);
+                        // Persist the expanded charging detail (v11 columns).
+                        // Gated by the flag so a normal install writes the
+                        // same rows it always has (these stay NULL).
+                        let d = &c.detail;
+                        sample.charger_power_kw = d.charger_power_kw;
+                        sample.charger_actual_current_a = d.charger_actual_current_a;
+                        sample.charger_voltage_v = d.charger_voltage_v;
+                        sample.charge_rate_mph = d.charge_rate_mph;
+                        sample.charge_energy_added_kwh = d.charge_energy_added_kwh;
+                        sample.charge_limit_soc = d.charge_limit_soc;
+                        sample.battery_range_mi = d.battery_range_mi;
+                    }
                     try_sync_clock(c.meta);
                     sample.battery_pct = c.battery_pct;
                     // Refresh the gate input on success; keep the previous
@@ -961,6 +993,9 @@ async fn tick(
         if schedule.closures_due(tick_now) {
             let success = match sample_ble::sample_closures_ble(session).await {
                 Ok(c) => {
+                    if cfg.experimental {
+                        sample_ble::log_closures_detail(&c);
+                    }
                     try_sync_clock(c.meta);
                     if let Some(sm) = c.sentry_mode {
                         *last_sentry_mode = Some(sm);
