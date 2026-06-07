@@ -4,12 +4,18 @@ import { KeepAccessorySection } from "@/components/settings/sections/KeepAccesso
 import { DisplayUnitsSection } from "@/components/settings/sections/DisplayUnitsSection"
 import { UpdateSection } from "@/components/settings/sections/UpdateSection"
 
-export function DeviceTab() {
+interface Props {
+  /** Forwarded to KeepAccessorySection so its disabled-state CTA can
+   *  re-launch the Setup Wizard. */
+  onOpenWizard?: () => void
+}
+
+export function DeviceTab({ onOpenWizard }: Props = {}) {
   return (
     <PrefGrid>
       <KeepAwakePreference />
       <DisplayUnitsSection />
-      <KeepAccessorySection />
+      <KeepAccessorySection onOpenWizard={onOpenWizard} />
       <UpdateSection />
     </PrefGrid>
   )

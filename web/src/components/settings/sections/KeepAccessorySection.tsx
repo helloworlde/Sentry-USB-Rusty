@@ -4,22 +4,27 @@ import { PrefCard } from "@/components/settings/PrefCard"
 import { KeepAccessoryConfig } from "@/components/settings/KeepAccessoryConfig"
 import { useKeepAccessory } from "@/hooks/useKeepAccessory"
 
+interface Props {
+  /** Re-launches the Setup Wizard so the user can enable the 12V step. */
+  onOpenWizard?: () => void
+}
+
 /**
  * Settings card for the keep-accessory feature (12V-powered Pis): the 12V
  * gate, the home geofence (with "Use current location" + adjustable radius),
  * and a manual ON/OFF override that hits the car over BLE right now.
  */
-export function KeepAccessorySection() {
+export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
   const { values, loaded, saving, update, useCurrentLocation, manualSet } = useKeepAccessory()
   const [msg, setMsg] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
 
-  // Niche, 12V-only feature: the card only appears once it's been enabled in
-  // Setup, so glovebox-USB setups never see it. Once shown it persists for the
-  // session (everOn) so toggling it off doesn't make the card vanish mid-edit.
+  // Niche, 12V-only feature for glovebox-USB setups. Once it's been enabled in
+  // the session (everOn) we keep showing the full UI even if the user toggles
+  // it back off mid-edit, so settings don't vanish mid-change.
   const everOn = useRef(false)
   if (values.enabled) everOn.current = true
-  if (loaded && !values.enabled && !everOn.current) return null
+  const showDisabled = loaded && !values.enabled && !everOn.current
 
   async function manual(on: boolean) {
     setPending(true)
@@ -34,7 +39,22 @@ export function KeepAccessorySection() {
   }
 
   return (
-    <PrefCard icon={<Plug className="h-3.5 w-3.5" />} halo="amber" title="Keep Accessory">
+    <PrefCard
+      icon={<Plug className="h-3.5 w-3.5" />}
+      halo="amber"
+      title="Keep Accessory"
+      disabled={
+        showDisabled
+          ? {
+              reason:
+                "Enable 'Keep Accessory' in the Setup Wizard. This feature is only useful for 12V-powered Pis.",
+              cta: onOpenWizard
+                ? { label: "Open Setup Wizard", onClick: onOpenWizard }
+                : undefined,
+            }
+          : undefined
+      }
+    >
       {!loaded ? (
         <p className="t-xs">Loading…</p>
       ) : (

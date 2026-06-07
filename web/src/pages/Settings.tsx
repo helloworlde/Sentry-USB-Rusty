@@ -265,7 +265,7 @@ export default function Settings() {
       <TabBar tabs={TABS} active={activeTab} onSelect={setTab} scrollable={isMobile} />
 
       <Suspense fallback={<TabFallback />}>
-        {activeTab === "Device" && <DeviceTab />}
+        {activeTab === "Device" && <DeviceTab onOpenWizard={handleOpenWizard} />}
         {activeTab === "Car & Network" && <NetworkTab status={status} />}
         {activeTab === "Notifications" && <NotificationsTab />}
         {activeTab === "System" && (
