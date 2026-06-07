@@ -228,7 +228,7 @@ export default function Charging() {
         />
         <ChargingRatesButton tags={tags} onSaved={reload} />
         {!selectMode && (
-          <div className="ml-3 min-w-0 flex-1">
+          <div className="order-last w-full sm:order-none sm:ml-3 sm:w-auto sm:min-w-0 sm:flex-1">
             <ChargingSummaryStrip stats={stats} loading={loading} />
           </div>
         )}
