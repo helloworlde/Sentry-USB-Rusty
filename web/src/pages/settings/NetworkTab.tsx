@@ -3,6 +3,7 @@ import { PrefCard } from "@/components/settings/PrefCard"
 import { Row } from "@/components/ui/StatusTile"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 import CloudPairingSection from "@/components/CloudPairingSection"
+import { AwayModeControl } from "@/components/settings/sections/AwayModeControl"
 import { useAwayMode } from "@/hooks/useAwayMode"
 import type { PiStatus } from "@/lib/api"
 
@@ -67,6 +68,12 @@ export function NetworkTab({ status }: Props) {
           )}
         </PrefCard>
       </div>
+
+      {/* Away Mode — both the control and the active-AP reconnect info now
+          live on this (Network) tab. The control card was previously on the
+          Device tab while only the AP status showed here, which split one
+          feature across two tabs. */}
+      <AwayModeControl />
 
       {awayStatus.state === "active" && (
         <PrefCard

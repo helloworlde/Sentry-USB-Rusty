@@ -4,11 +4,9 @@ import {
   RefreshCw,
   Stethoscope,
   Gauge,
-  Settings as SettingsIcon,
   Unplug,
   RotateCcw,
   Loader2,
-  Download,
 } from "lucide-react"
 import { api } from "@/lib/api"
 import { HeaderStrip } from "@/components/settings/HeaderStrip"
@@ -189,91 +187,6 @@ export default function Settings() {
     }
   }
 
-  // Export the device's full configuration as a bash-sourceable .conf
-  // file. Matches the format the old Go version produced so the file
-  // round-trips between versions: active settings become `export KEY='value'`
-  // lines, defaults become `# export KEY='value'` so the user can see what
-  // they didn't change. Rusty-only Web-UI preferences (the JSON kv-store
-  // at /mutable/.sentryusb_preferences.json — new in the Rust rewrite) are
-  // appended at the bottom as `# preference:` comment lines: kept here for
-  // export completeness without polluting the bash namespace if the file
-  // is ever sourced. Single quotes inside values are escaped via the
-  // standard '\'' trick so the file stays valid bash even for passwords
-  // containing apostrophes.
-  async function handleExportConfig(): Promise<string> {
-    const [configRes, prefsRes] = await Promise.all([
-      fetch("/api/setup/config"),
-      fetch("/api/config/preference"),
-    ])
-    if (!configRes.ok) throw new Error("Failed to read config")
-    const config = (await configRes.json()) as Record<
-      string,
-      { value: string; active: boolean }
-    >
-    const prefs = prefsRes.ok
-      ? ((await prefsRes.json()) as Record<string, unknown>)
-      : {}
-
-    const now = new Date().toISOString()
-    const ver = version || "unknown"
-    const host = hostname || "sentryusb"
-    const escape = (s: string) => (s ?? "").replace(/'/g, "'\\''")
-
-    let content = ""
-    content += `# sentryusb.conf — exported from Sentry USB UI\n`
-    content += `# Exported:  ${now}\n`
-    content += `# Hostname:  ${host}\n`
-    content += `# Version:   ${ver}\n`
-    content += `#\n`
-    content += `# This file is bash-sourceable. Active settings are 'export' lines;\n`
-    content += `# inactive/default values are commented out for reference.\n`
-    content += `\n`
-    content += `# === Setup configuration ===\n`
-
-    // Sort for stable, diff-friendly output across exports.
-    const keys = Object.keys(config).sort()
-    for (const k of keys) {
-      const e = config[k]
-      const v = escape(e.value ?? "")
-      if (e.active) {
-        content += `export ${k}='${v}'\n`
-      } else {
-        content += `# export ${k}='${v}'\n`
-      }
-    }
-
-    // Web-UI preferences (new in the Rusty rewrite). The Go version had
-    // no equivalent concept — preferences were either bash exports in the
-    // conf file or hard-coded defaults. Now things like keep-awake mode,
-    // backup location, notification toggles, and community feature flags
-    // live in a key-value JSON store; include them here as comments so a
-    // human reading this file can see the complete configuration state.
-    const prefKeys = Object.keys(prefs).sort()
-    if (prefKeys.length > 0) {
-      content += `\n`
-      content += `# === Web UI preferences (Sentry USB Rusty) ===\n`
-      content += `# Managed via the web UI; stored in /mutable/.sentryusb_preferences.json.\n`
-      content += `# Listed here for export completeness — these are NOT sourced by bash.\n`
-      for (const k of prefKeys) {
-        const v = prefs[k]
-        // JSON.stringify keeps the type info (string vs boolean vs number)
-        // visible in the export, which matters because the same key can be
-        // either "enabled"/"disabled" strings or true/false booleans
-        // depending on which UI screen wrote it.
-        content += `# preference: ${k} = ${JSON.stringify(v)}\n`
-      }
-    }
-
-    const blob = new Blob([content], { type: "text/plain" })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = "sentryusb.conf"
-    a.click()
-    URL.revokeObjectURL(url)
-    return "Downloaded"
-  }
-
   async function handleOpenWizard() {
     try {
       const res = await fetch("/api/setup/config")
@@ -307,16 +220,6 @@ export default function Settings() {
       icon: Gauge,
       label: "Speed Test",
       onClick: () => setSpeedOpen(true),
-    },
-    {
-      icon: SettingsIcon,
-      label: "Raw Config",
-      onClick: handleOpenRawConfig,
-    },
-    {
-      icon: Download,
-      label: "Export Config",
-      onClick: handleExportConfig,
     },
     {
       icon: Unplug,
@@ -356,7 +259,6 @@ export default function Settings() {
         hostname={hostname}
         sbc={sbc}
         uptimeSec={uptimeSec}
-        onOpenWizard={handleOpenWizard}
       />
 
       <ActionsRail actions={actions} danger={dangerActions} />
@@ -367,18 +269,10 @@ export default function Settings() {
         {activeTab === "Device" && <DeviceTab />}
         {activeTab === "Network" && <NetworkTab status={status} />}
         {activeTab === "Updates" && <UpdatesTab />}
-        {activeTab === "Backups" && <BackupsTab onOpenRawConfig={handleOpenRawConfig} />}
+        {activeTab === "Backups" && <BackupsTab onOpenRawConfig={handleOpenRawConfig} version={version} hostname={hostname} />}
         {activeTab === "Notifications" && <NotificationsTab />}
         {activeTab === "Privacy" && <PrivacyTab />}
-        {activeTab === "About" && (
-          <AboutTab
-            status={status}
-            sbc={sbc}
-            hostname={hostname}
-            uptimeSec={uptimeSec}
-            onOpenWizard={handleOpenWizard}
-          />
-        )}
+        {activeTab === "About" && <AboutTab onOpenWizard={handleOpenWizard} />}
       </Suspense>
 
       {/* Modals — each wrapped in its own Suspense so a slow chunk for

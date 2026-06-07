@@ -1,4 +1,4 @@
-import { Settings as SettingsIcon, Wand2 } from "lucide-react"
+import { Settings as SettingsIcon } from "lucide-react"
 import { formatUptime } from "@/lib/utils"
 import { useVersion } from "@/hooks/useVersion"
 
@@ -6,14 +6,12 @@ interface HeaderStripProps {
   hostname?: string | null
   sbc?: string | null
   uptimeSec?: number | null
-  onOpenWizard: () => void
 }
 
 export function HeaderStrip({
   hostname,
   sbc,
   uptimeSec,
-  onOpenWizard,
 }: HeaderStripProps) {
   const version = useVersion()
 
@@ -49,14 +47,6 @@ export function HeaderStrip({
           )}
         </div>
       </div>
-      <button
-        onClick={onOpenWizard}
-        className="action-chip"
-        style={{ background: "#161b24", border: "1px solid #1e242f" }}
-      >
-        <Wand2 className="h-3.5 w-3.5" />
-        Setup Wizard
-      </button>
     </div>
   )
 }

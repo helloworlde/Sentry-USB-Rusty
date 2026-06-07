@@ -4,23 +4,83 @@ import { ConfigBackupSection } from "@/components/settings/sections/ConfigBackup
 
 interface Props {
   onOpenRawConfig: () => void
+  /** App version, written into the export file header. */
+  version?: string | null
+  /** Device hostname, written into the export file header. */
+  hostname?: string | null
 }
 
-export function BackupsTab({ onOpenRawConfig }: Props) {
-  async function exportConfig() {
+/**
+ * Settings → Backups. Owns the single source of truth for both
+ * "Export Config" and "Raw Configuration" — these used to be duplicated
+ * as chips in the page-level ActionsRail, which produced two divergent
+ * export code paths. The rich export (version/hostname header, Web-UI
+ * preferences, bash-safe quote escaping) now lives here only.
+ */
+export function BackupsTab({ onOpenRawConfig, version, hostname }: Props) {
+  // Export the device's full configuration as a bash-sourceable .conf
+  // file. Active settings become `export KEY='value'` lines; defaults
+  // become `# export KEY='value'` so the user can see what they didn't
+  // change. Rusty-only Web-UI preferences (the JSON kv-store at
+  // /mutable/.sentryusb_preferences.json) are appended as `# preference:`
+  // comment lines for export completeness without polluting the bash
+  // namespace if the file is ever sourced. Single quotes inside values
+  // are escaped via the standard '\'' trick so the file stays valid bash.
+  async function exportConfig(): Promise<void> {
     try {
-      const res = await fetch("/api/setup/config")
-      if (!res.ok) throw new Error("Failed")
-      const data = await res.json()
-      let content = "# sentryusb.conf - exported from Sentry USB UI\n"
-      for (const [k, v] of Object.entries(data)) {
-        const entry = v as { value: string; active: boolean }
-        if (entry.active) {
-          content += `export ${k}='${entry.value}'\n`
+      const [configRes, prefsRes] = await Promise.all([
+        fetch("/api/setup/config"),
+        fetch("/api/config/preference"),
+      ])
+      if (!configRes.ok) throw new Error("Failed to read config")
+      const config = (await configRes.json()) as Record<
+        string,
+        { value: string; active: boolean }
+      >
+      const prefs = prefsRes.ok
+        ? ((await prefsRes.json()) as Record<string, unknown>)
+        : {}
+
+      const now = new Date().toISOString()
+      const ver = version || "unknown"
+      const host = hostname || "sentryusb"
+      const escape = (s: string) => (s ?? "").replace(/'/g, "'\\''")
+
+      let content = ""
+      content += `# sentryusb.conf — exported from Sentry USB UI\n`
+      content += `# Exported:  ${now}\n`
+      content += `# Hostname:  ${host}\n`
+      content += `# Version:   ${ver}\n`
+      content += `#\n`
+      content += `# This file is bash-sourceable. Active settings are 'export' lines;\n`
+      content += `# inactive/default values are commented out for reference.\n`
+      content += `\n`
+      content += `# === Setup configuration ===\n`
+
+      // Sort for stable, diff-friendly output across exports.
+      const keys = Object.keys(config).sort()
+      for (const k of keys) {
+        const e = config[k]
+        const v = escape(e.value ?? "")
+        if (e.active) {
+          content += `export ${k}='${v}'\n`
         } else {
-          content += `# export ${k}='${entry.value}'\n`
+          content += `# export ${k}='${v}'\n`
         }
       }
+
+      const prefKeys = Object.keys(prefs).sort()
+      if (prefKeys.length > 0) {
+        content += `\n`
+        content += `# === Web UI preferences (Sentry USB Rusty) ===\n`
+        content += `# Managed via the web UI; stored in /mutable/.sentryusb_preferences.json.\n`
+        content += `# Listed here for export completeness — these are NOT sourced by bash.\n`
+        for (const k of prefKeys) {
+          const v = prefs[k]
+          content += `# preference: ${k} = ${JSON.stringify(v)}\n`
+        }
+      }
+
       const blob = new Blob([content], { type: "text/plain" })
       const url = URL.createObjectURL(blob)
       const a = document.createElement("a")
