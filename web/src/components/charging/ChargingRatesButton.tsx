@@ -127,7 +127,7 @@ export function ChargingRatesButton({
         Rates
       </button>
       {open && (
-        <div className="absolute right-0 top-full z-50 mt-2 max-h-[80vh] w-80 overflow-y-auto rounded-xl border border-white/10 bg-slate-900/95 p-3 shadow-2xl backdrop-blur">
+        <div className="absolute right-0 top-full z-50 mt-2 max-h-[80vh] w-80 max-w-[calc(100vw-1.5rem)] overflow-y-auto rounded-xl border border-white/10 bg-slate-900/95 p-3 shadow-2xl backdrop-blur">
           <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">
             Electricity rates
           </div>
@@ -237,7 +237,7 @@ export function ChargingRatesButton({
                         <X className="h-3.5 w-3.5" />
                       </button>
                     </div>
-                    <div className="mt-1.5 flex items-center gap-1.5">
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                       <input
                         type="time"
                         value={p.start}

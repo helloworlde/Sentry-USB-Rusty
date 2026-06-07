@@ -171,7 +171,7 @@ export function CarStatusCard({
         <Link
           to="/community?view=chimes"
           title={`Active lock chime: ${lockChimeName}`}
-          className="absolute right-3 top-3 inline-flex max-w-[180px] items-center gap-1.5 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/15"
+          className="absolute right-3 top-3 inline-flex max-w-[120px] items-center gap-1.5 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/15 sm:max-w-[180px]"
         >
           <Music2 className="h-3 w-3 shrink-0" />
           <span className="truncate">{lockChimeName}</span>
@@ -182,7 +182,7 @@ export function CarStatusCard({
       {/* Top row — car state + duration. Right padding reserves room
           for the absolutely-positioned chime chip when present so
           long durations / labels can't slide under it. */}
-      <div className={"flex items-center gap-3 " + (lockChimeName ? "pr-32 sm:pr-40" : "")}>
+      <div className={"flex items-center gap-3 " + (lockChimeName ? "pr-32 sm:pr-48" : "")}>
         <span className="tile-icon halo-accent">
           <Car className="h-4 w-4" />
         </span>
