@@ -23,11 +23,8 @@ import type { PiStatus } from "@/lib/api"
 // default-export contract.
 const DeviceTab = lazy(() => import("@/pages/settings/DeviceTab").then(m => ({ default: m.DeviceTab })))
 const NetworkTab = lazy(() => import("@/pages/settings/NetworkTab").then(m => ({ default: m.NetworkTab })))
-const UpdatesTab = lazy(() => import("@/pages/settings/UpdatesTab").then(m => ({ default: m.UpdatesTab })))
-const BackupsTab = lazy(() => import("@/pages/settings/BackupsTab").then(m => ({ default: m.BackupsTab })))
 const NotificationsTab = lazy(() => import("@/pages/settings/NotificationsTab").then(m => ({ default: m.NotificationsTab })))
-const PrivacyTab = lazy(() => import("@/pages/settings/PrivacyTab").then(m => ({ default: m.PrivacyTab })))
-const AboutTab = lazy(() => import("@/pages/settings/AboutTab").then(m => ({ default: m.AboutTab })))
+const SystemTab = lazy(() => import("@/pages/settings/SystemTab").then(m => ({ default: m.SystemTab })))
 
 // Modals are only mounted while open — defer their bundles entirely
 // until the user opens them. SetupWizard alone pulls in several
@@ -37,14 +34,16 @@ const RawConfigEditor = lazy(() => import("@/components/settings/sections/RawCon
 const HealthCheckModal = lazy(() => import("@/components/settings/sections/HealthCheckModal").then(m => ({ default: m.HealthCheckModal })))
 const SpeedTestModal = lazy(() => import("@/components/settings/sections/SpeedTestModal").then(m => ({ default: m.SpeedTestModal })))
 
+// Four task-based groups (consolidated from the original seven):
+//   Device        — keep-awake, units, keep-accessory, software updates
+//   Car & Network — WiFi/Eth, Tesla BLE, Away Mode, SentryCloud
+//   Notifications — mobile push + community features
+//   System        — backups/export/raw-config, setup wizard, privacy
 const TABS = [
   "Device",
-  "Network",
-  "Updates",
-  "Backups",
+  "Car & Network",
   "Notifications",
-  "Privacy",
-  "About",
+  "System",
 ] as const
 type TabName = (typeof TABS)[number]
 
@@ -267,12 +266,16 @@ export default function Settings() {
 
       <Suspense fallback={<TabFallback />}>
         {activeTab === "Device" && <DeviceTab />}
-        {activeTab === "Network" && <NetworkTab status={status} />}
-        {activeTab === "Updates" && <UpdatesTab />}
-        {activeTab === "Backups" && <BackupsTab onOpenRawConfig={handleOpenRawConfig} version={version} hostname={hostname} />}
+        {activeTab === "Car & Network" && <NetworkTab status={status} />}
         {activeTab === "Notifications" && <NotificationsTab />}
-        {activeTab === "Privacy" && <PrivacyTab />}
-        {activeTab === "About" && <AboutTab onOpenWizard={handleOpenWizard} />}
+        {activeTab === "System" && (
+          <SystemTab
+            onOpenRawConfig={handleOpenRawConfig}
+            onOpenWizard={handleOpenWizard}
+            version={version}
+            hostname={hostname}
+          />
+        )}
       </Suspense>
 
       {/* Modals — each wrapped in its own Suspense so a slow chunk for

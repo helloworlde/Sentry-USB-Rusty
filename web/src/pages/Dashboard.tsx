@@ -430,7 +430,7 @@ export default function Dashboard() {
       sub: "Go to Settings to install",
       action: (
         <Link
-          to="/settings?tab=Updates"
+          to="/settings?tab=Device"
           className="action-chip action-chip--accent shrink-0"
         >
           Install <ChevronRight className="h-3.5 w-3.5" />

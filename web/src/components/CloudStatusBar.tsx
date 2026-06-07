@@ -61,7 +61,7 @@ export function CloudStatusBar() {
 
   if (!status) return null
 
-  const linkTo = "/settings?tab=Network"
+  const linkTo = "/settings?tab=Car%20%26%20Network"
 
   // Unpaired — compact "Connect" prompt
   if (!status.paired) {

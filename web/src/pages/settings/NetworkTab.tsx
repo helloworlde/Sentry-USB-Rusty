@@ -1,9 +1,11 @@
 import { Wifi, Cable } from "lucide-react"
-import { PrefCard } from "@/components/settings/PrefCard"
+import { PrefCard, PrefGrid } from "@/components/settings/PrefCard"
 import { Row } from "@/components/ui/StatusTile"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 import CloudPairingSection from "@/components/CloudPairingSection"
 import { AwayModeControl } from "@/components/settings/sections/AwayModeControl"
+import { BleEnableToggle } from "@/components/settings/sections/BleEnableToggle"
+import { BlePairButton } from "@/components/settings/sections/BlePairButton"
 import { useAwayMode } from "@/hooks/useAwayMode"
 import type { PiStatus } from "@/lib/api"
 
@@ -68,6 +70,15 @@ export function NetworkTab({ status }: Props) {
           )}
         </PrefCard>
       </div>
+
+      {/* Tesla BLE — the car-connection layer. Enable/disable the telemetry
+          + keep-awake-nudge features, then pair with the car. Lives here on
+          the Car & Network tab alongside the other connectivity surfaces
+          (WiFi, Cloud, Away Mode) rather than on the Device tab. */}
+      <PrefGrid min={300}>
+        <BleEnableToggle />
+        <BlePairButton />
+      </PrefGrid>
 
       {/* Away Mode — both the control and the active-AP reconnect info now
           live on this (Network) tab. The control card was previously on the
