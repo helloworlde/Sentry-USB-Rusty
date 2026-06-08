@@ -48,6 +48,11 @@ The Rust rewrite of the original Go version. Same `sentryusb.conf`, faster serve
 </p>
 
 <p align="center">
+  <img src="docs/images/charging-list.png" alt="Charging history" width="900"><br>
+  <em>Every charge session — energy added, duration, cost, and charging speed — with per-tag time-of-use electricity rates and rolling totals for the selected range.</em>
+</p>
+
+<p align="center">
   <img src="docs/images/setup-wizard.png" alt="Setup Wizard" width="900"><br>
   <em>11-step setup wizard — no SSH, no config files.</em>
 </p>
