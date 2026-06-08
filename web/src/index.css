@@ -55,6 +55,63 @@
   --color-slate-50: #f0f2f5;
 }
 
+/* ── Liquid Glass — the app's surface look ──────────────────────────
+   Applied via <html data-style="liquid"> (set in index.html). Translucent frosted material with a bright specular top
+   edge, heavy backdrop blur + vibrancy, and ambient accent light behind
+   the cards so the glass has colour to refract. The body gradient follows
+   the chosen accent. (backdrop-filter is GPU-heavy — lovely on a laptop,
+   likely sluggish on the Pi itself.) */
+html[data-style="liquid"] {
+  --radius-lg: 0.9rem; --radius-xl: 1.15rem; --radius-2xl: 1.5rem; --radius-3xl: 2rem;
+}
+/* Card brightness (--lg-glass) and ambient-glow intensity (--lg-glow):
+   the fallbacks here are the tuned defaults; the glow spans a wide band
+   across the whole top rather than a single corner blob. */
+html[data-style="liquid"] body {
+  background:
+    radial-gradient(1600px 820px at 50% -30%, color-mix(in srgb, var(--color-accent) calc(var(--lg-glow, 1.5) * 20%), transparent), transparent 72%),
+    radial-gradient(1200px 800px at 0% -8%, color-mix(in srgb, var(--color-accent) calc(var(--lg-glow, 1.5) * 15%), transparent), transparent 60%),
+    radial-gradient(1200px 800px at 100% -4%, oklch(0.62 0.19 285 / calc(var(--lg-glow, 1.5) * 0.15)), transparent 60%),
+    radial-gradient(900px 560px at 50% 118%, color-mix(in srgb, var(--color-accent) calc(var(--lg-glow, 1.5) * 11%), transparent), transparent 64%),
+    #07090c;
+  background-attachment: fixed;
+}
+html[data-style="liquid"] .glass-card {
+  background: linear-gradient(150deg,
+    rgb(255 255 255 / var(--lg-glass, 0.02)),
+    rgb(255 255 255 / calc(var(--lg-glass, 0.02) * 0.4)) 55%,
+    rgb(255 255 255 / calc(var(--lg-glass, 0.02) * 0.55)));
+  border: 1px solid rgb(255 255 255 / calc(var(--lg-glass, 0.02) * 1.3));
+  border-radius: 1.5rem;
+  backdrop-filter: blur(22px) saturate(185%);
+  -webkit-backdrop-filter: blur(22px) saturate(185%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / calc(var(--lg-glass, 0.02) * 3)), inset 0 -1px 1px rgba(255, 255, 255, 0.05), 0 12px 34px rgba(0, 0, 0, 0.45);
+}
+html[data-style="liquid"] .glass-sidebar {
+  background: rgba(255, 255, 255, 0.055);
+  backdrop-filter: blur(26px) saturate(180%);
+  -webkit-backdrop-filter: blur(26px) saturate(180%);
+  border-right: 1px solid rgba(255, 255, 255, 0.10);
+}
+html[data-style="liquid"] .tab-bar {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 1rem;
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+}
+html[data-style="liquid"] .tab-item.active {
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+html[data-style="liquid"] .actions-rail {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(14px) saturate(170%);
+  -webkit-backdrop-filter: blur(14px) saturate(170%);
+}
+
 html, body, #root {
   height: 100%;
   margin: 0;
@@ -130,17 +187,17 @@ code, pre, .font-mono {
 }
 
 .toggle-switch:checked {
-  background: oklch(0.82 0.18 150 / 0.35);
+  background: color-mix(in srgb, var(--color-accent) 35%, transparent);
 }
 
 .toggle-switch:checked::after {
   transform: translateX(18px);
-  background: oklch(0.82 0.18 150);
-  box-shadow: 0 0 8px oklch(0.82 0.18 150 / 0.4), 0 1px 4px rgba(0, 0, 0, 0.3);
+  background: var(--color-accent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--color-accent) 40%, transparent), 0 1px 4px rgba(0, 0, 0, 0.3);
 }
 
 .toggle-switch:focus-visible {
-  outline: 2px solid oklch(0.82 0.18 150 / 0.5);
+  outline: 2px solid color-mix(in srgb, var(--color-accent) 50%, transparent);
   outline-offset: 2px;
 }
 
@@ -486,7 +543,7 @@ code, pre, .font-mono {
 .banner--error { border-color: rgba(248,113,113,.25); background: rgba(248,113,113,.06); }
 .banner--warn  { border-color: rgba(251,191,36,.22); background: rgba(251,191,36,.05); }
 .banner--info  { border-color: rgba(56,189,248,.22); background: rgba(56,189,248,.05); }
-.banner--update{ border-color: oklch(0.82 0.18 150 / 0.28); background: oklch(0.82 0.18 150 / 0.05); }
+.banner--update{ border-color: color-mix(in srgb, var(--color-accent) 28%, transparent); background: color-mix(in srgb, var(--color-accent) 5%, transparent); }
 
 /* SentryCloud compact bar */
 .cloud-bar { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 14px; }
@@ -520,9 +577,9 @@ code, pre, .font-mono {
 .action-chip:disabled { opacity: 0.5; cursor: not-allowed; }
 .action-chip--danger { color: #fca5a5; }
 .action-chip--danger:hover { background: rgba(248,113,113,.10); color: #fca5a5; }
-.action-chip--accent { color: oklch(0.82 0.18 150); background: oklch(0.82 0.18 150 / 0.15); }
-.action-chip--accent:hover { background: oklch(0.82 0.18 150 / 0.25); color: oklch(0.82 0.18 150); }
-.action-chip[aria-pressed="true"] { background: oklch(0.82 0.18 150 / 0.12); color: oklch(0.82 0.18 150); }
+.action-chip--accent { color: var(--color-accent); background: color-mix(in srgb, var(--color-accent) 15%, transparent); }
+.action-chip--accent:hover { background: color-mix(in srgb, var(--color-accent) 25%, transparent); color: var(--color-accent); }
+.action-chip[aria-pressed="true"] { background: color-mix(in srgb, var(--color-accent) 12%, transparent); color: var(--color-accent); }
 
 /* Modal primitive — replaces 3 inconsistently-built overlays */
 .modal-shell { position: fixed; inset: 0; background: rgba(0,0,0,.55); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 50; }
@@ -534,7 +591,7 @@ code, pre, .font-mono {
 .modal-body { padding: 16px; overflow: auto; }
 
 /* Severity halo helpers (status-aware icon backgrounds) */
-.halo-accent  { background: oklch(0.82 0.18 150 / 0.15); color: oklch(0.82 0.18 150); }
+.halo-accent  { background: color-mix(in srgb, var(--color-accent) 15%, transparent); color: var(--color-accent); }
 .halo-amber   { background: rgba(251,191,36,.15); color: #fbbf24; }
 .halo-red     { background: rgba(248,113,113,.15); color: #f87171; }
 .halo-rose    { background: rgba(251,113,133,.15); color: #fb7185; }
@@ -555,7 +612,7 @@ code, pre, .font-mono {
 
 /* Pill chip */
 .pill { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 600; letter-spacing: .04em; }
-.pill--accent { background: oklch(0.82 0.18 150 / 0.15); color: oklch(0.82 0.18 150); }
+.pill--accent { background: color-mix(in srgb, var(--color-accent) 15%, transparent); color: var(--color-accent); }
 .pill--amber  { background: rgba(251,191,36,.15); color: #fbbf24; }
 .pill--rose   { background: rgba(251,113,133,.15); color: #fb7185; }
 .pill--sky    { background: rgba(56,189,248,.15); color: #38bdf8; }
