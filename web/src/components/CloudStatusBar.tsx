@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 import { Link } from "react-router-dom"
-import { Cloud, CloudOff, Upload, ChevronRight, AlertTriangle } from "lucide-react"
+import { Cloud, CloudOff, Upload, ChevronRight, AlertTriangle, X } from "lucide-react"
 import { wsClient } from "@/lib/ws"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 
@@ -20,6 +20,16 @@ type CloudStatus = {
  */
 export function CloudStatusBar() {
   const [status, setStatus] = useState<CloudStatus | null>(null)
+  // SentryCloud is US/Canada-only — let users elsewhere permanently hide
+  // the "Connect" prompt (they can still pair from Settings if it ever
+  // becomes available). Only the unpaired prompt is dismissible.
+  const [dismissed, setDismissed] = useState(() => {
+    try {
+      return localStorage.getItem("cloud-bar-dismissed") === "1"
+    } catch {
+      return false
+    }
+  })
 
   useEffect(() => {
     let mounted = true
@@ -63,24 +73,39 @@ export function CloudStatusBar() {
 
   const linkTo = "/settings?tab=Car%20%26%20Network"
 
-  // Unpaired — compact "Connect" prompt
+  // Unpaired — compact "Connect" prompt, permanently dismissible.
   if (!status.paired) {
+    if (dismissed) return null
     return (
-      <Link
-        to={linkTo}
-        className="glass-card glass-card-hover cloud-bar group transition-colors"
-      >
-        <span className="halo-blue inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
-          <CloudOff className="h-4 w-4" />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="t-md">Connect SentryCloud</div>
-          <div className="t-xs">
-            Encrypted upload of drive data. Enter your 6-digit code in Settings.
+      <div className="glass-card glass-card-hover cloud-bar group relative transition-colors">
+        <Link to={linkTo} className="flex min-w-0 flex-1 items-center gap-3">
+          <span className="halo-blue inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
+            <CloudOff className="h-4 w-4" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="t-md">Connect SentryCloud</div>
+            <div className="t-xs">
+              Encrypted upload of drive data. Enter your 6-digit code in Settings.
+            </div>
           </div>
-        </div>
-        <ChevronRight className="h-4 w-4 text-slate-600 transition-transform group-hover:translate-x-0.5" />
-      </Link>
+        </Link>
+        <button
+          type="button"
+          onClick={() => {
+            setDismissed(true)
+            try {
+              localStorage.setItem("cloud-bar-dismissed", "1")
+            } catch {
+              /* ignore */
+            }
+          }}
+          title="Hide — you can still connect from Settings"
+          aria-label="Hide SentryCloud"
+          className="-mr-1 shrink-0 rounded-md p-1.5 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
     )
   }
 

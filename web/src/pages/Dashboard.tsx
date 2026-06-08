@@ -17,6 +17,9 @@ import {
   AlertTriangle,
   Wind,
   Info,
+  Film,
+  MapPin,
+  Route,
 } from "lucide-react"
 import { api } from "@/lib/api"
 import { useKeepAwake } from "@/hooks/useKeepAwake"
@@ -833,23 +836,8 @@ function ActivityTile({
     ? ("processing" as const)
     : null
 
-  // FSD link always lives inline at the end of the stats row, even
-  // when Keep Awake is showing — the previous "move it to the
-  // header action slot when KA visible" trick caused the title to
-  // collide with the phase badge AND the FSD chip in the same row.
-  const fsdLink = driveStats && driveStats.fsd_engaged_ms > 0 ? (
-    <Link
-      to="/fsd"
-      className="ml-auto flex items-center gap-1 text-[10px] text-emerald-400 transition-colors hover:text-emerald-300"
-    >
-      <Zap className="h-3 w-3" />
-      FSD {driveStats.fsd_percent}%
-      <ChevronRight className="h-3 w-3 text-slate-600" />
-    </Link>
-  ) : null
-
   return (
-    <div className="relative">
+    <div className="relative flex flex-col">
       {/* Phase notification — pinned to the card's top-right corner
           as an absolutely-positioned pill so it doesn't crowd the
           ⚡ ACTIVITY title or the inline FSD link. Only renders
@@ -865,6 +853,7 @@ function ActivityTile({
         icon={<Zap className="h-4 w-4" />}
         halo="violet"
         title="Activity"
+        className="flex-1"
       >
       {driveStats ? (
         driveStats.processed_count === 0 && driveStats.drives_count === 0 ? (
@@ -873,29 +862,36 @@ function ActivityTile({
           </p>
         ) : (
           <>
-            <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs">
-              <span>
-                <span className="text-sm font-semibold text-slate-100">
-                  {driveStats.processed_count.toLocaleString()}
-                </span>{" "}
-                <span className="text-slate-500">clips</span>
-              </span>
-              <span>
-                <span className="text-sm font-semibold text-slate-100">
-                  {driveStats.drives_count.toLocaleString()}
-                </span>{" "}
-                <span className="text-slate-500">drives</span>
-              </span>
-              <span>
-                <span className="text-sm font-semibold text-slate-100">
-                  {metric
-                    ? driveStats.total_distance_km.toFixed(0)
-                    : driveStats.total_distance_mi.toFixed(0)}
-                </span>{" "}
-                <span className="text-slate-500">{metric ? "km" : "mi"}</span>
-              </span>
-              {fsdLink}
-            </div>
+            <Row
+              icon={<Film className="h-3.5 w-3.5" />}
+              label="Clips"
+              value={driveStats.processed_count.toLocaleString()}
+            />
+            <Row
+              icon={<MapPin className="h-3.5 w-3.5" />}
+              label="Drives"
+              value={driveStats.drives_count.toLocaleString()}
+            />
+            <Row
+              icon={<Route className="h-3.5 w-3.5" />}
+              label="Distance"
+              value={`${
+                metric
+                  ? driveStats.total_distance_km.toFixed(0)
+                  : driveStats.total_distance_mi.toFixed(0)
+              } ${metric ? "km" : "mi"}`}
+            />
+            {driveStats.fsd_engaged_ms > 0 && (
+              <Row
+                icon={<Zap className="h-3.5 w-3.5" />}
+                label="FSD"
+                value={
+                  <Link to="/fsd" className="text-emerald-400 hover:text-emerald-300">
+                    {driveStats.fsd_percent}%
+                  </Link>
+                }
+              />
+            )}
 
             {archiveProgress && archiveProgress.total > 0 ? (
               <ProgressBlock
