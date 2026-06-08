@@ -62,8 +62,12 @@ struct ChargeSessionSummary {
     location_lat: Option<f64>,
     location_lon: Option<f64>,
     energy_added_kwh: Option<f64>,
-    /// Energy drawn from the charger (wall-side), kWh. Derived by
-    /// integrating charger power; always >= `energy_added_kwh`.
+    /// Energy drawn from the charger (wall-side), kWh. Trapezoidal
+    /// integral of per-sample charger power, each sample refined from
+    /// volts × amps when those agree with the car's coarse integer kW
+    /// (see `sample_power_kw`). Normally >= `energy_added_kwh` (the gap is
+    /// charging loss); on coarse data it can dip to/under it, which is why
+    /// `efficiency_pct` is clamped.
     energy_used_kwh: Option<f64>,
     /// Charging efficiency, percent = added / used, clamped to [0, 100].
     efficiency_pct: Option<f64>,
@@ -125,14 +129,58 @@ fn avg(it: impl Iterator<Item = f64>) -> Option<f64> {
     if n == 0 { None } else { Some(sum / n as f64) }
 }
 
+/// Largest gap (kW) tolerated between volts × amps and the car's own
+/// integer `charger_power` before we distrust the fine-grained product.
+/// Integer rounding alone is at most ±0.5 kW; 1.0 kW leaves room for
+/// sensor noise while staying well below the ~2 kW-plus gap that 3-phase
+/// charging always produces (see `sample_power_kw`).
+const POWER_REFINE_TOLERANCE_KW: f64 = 1.0;
+
+/// Best per-sample charger power in kW for energy integration.
+///
+/// Tesla reports `charger_power` only as whole kilowatts. That's fine at a
+/// Supercharger (rounding 150.4 → 150 is <1%) but ruinous on a slow Level
+/// 1 charge: 121 V × 12 A is 1.45 kW yet arrives as `1`, a ~30% undercount
+/// that drags integrated "used" below the car's own battery-side "added"
+/// and pushes efficiency past 100%. When the sample also carries voltage
+/// and current we recover the fractional kW from V × I.
+///
+/// The guard: V × I is the true power only on a single-/split-phase charge
+/// (Level 1, and North-American 240 V Level 2). On European 3-phase AC the
+/// car reports *per-phase* volts/amps while `charger_power` already sums
+/// the phases, so a lone V × I would be ~1/3 of reality. We therefore use
+/// V × I only when it agrees with the integer power to within
+/// `POWER_REFINE_TOLERANCE_KW`; otherwise we keep the integer. A
+/// single-phase product lands within rounding of the integer, while a
+/// 3-phase one is always off by (2/3)·total ≈ 2 kW or more — so this
+/// refines exactly the low-power single/split-phase case that needs it and
+/// is a no-op for 3-phase, DC fast charging, and any sample whose fields
+/// disagree. It can only sharpen a value already consistent with the car's
+/// own number, never invent a new one.
+fn sample_power_kw(r: &ChargeRow) -> Option<f64> {
+    let coarse = r.power_kw? as f64;
+    match (r.voltage_v, r.current_a) {
+        (Some(v), Some(a)) => {
+            let fine = v as f64 * a as f64 / 1000.0;
+            if (fine - coarse).abs() <= POWER_REFINE_TOLERANCE_KW {
+                Some(fine)
+            } else {
+                Some(coarse)
+            }
+        }
+        _ => Some(coarse),
+    }
+}
+
 /// Trapezoidal integral of charger power (kW) over a session's samples,
 /// in kWh. `None` with fewer than two power readings. In-session samples
 /// are <= `SESSION_GAP_SECS` apart by construction, so no gap guard is
-/// needed beyond skipping non-positive dt.
+/// needed beyond skipping non-positive dt. Per-sample power is the
+/// V × I-refined estimate from `sample_power_kw`, not the raw integer kW.
 fn integrate_power_kwh(rows: &[ChargeRow]) -> Option<f64> {
     let pts: Vec<(i64, f64)> = rows
         .iter()
-        .filter_map(|r| r.power_kw.map(|p| (r.ts, p as f64)))
+        .filter_map(|r| sample_power_kw(r).map(|p| (r.ts, p)))
         .collect();
     if pts.len() < 2 {
         return None;
@@ -289,7 +337,7 @@ fn tou_cost(rows: &[ChargeRow], rates: &RateConfig) -> Option<f64> {
     use chrono::{Local, Timelike};
     let pts: Vec<(i64, f64)> = rows
         .iter()
-        .filter_map(|r| r.power_kw.map(|p| (r.ts, p as f64)))
+        .filter_map(|r| sample_power_kw(r).map(|p| (r.ts, p)))
         .collect();
     if pts.len() < 2 {
         return None;
@@ -485,13 +533,15 @@ fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
     };
 
     // Energy drawn from the charger ("used", wall-side): trapezoidal
-    // integral of charger power over the session. Always >= energy added
-    // (battery-side); the gap is charging loss. Power is integer kW, so
-    // this is an estimate — fine for a badge.
+    // integral of per-sample power over the session, each sample refined
+    // from volts × amps where possible (`sample_power_kw`) so a slow Level
+    // 1 charge isn't undercounted by integer-kW rounding. Normally >=
+    // energy added (battery-side); the gap is charging loss.
     let energy_used_kwh = integrate_power_kwh(rows);
 
-    // Charging efficiency = added / used. Clamp to [0, 100]: integer-kW
-    // "used" can dip just under "added" on a short steady charge and
+    // Charging efficiency = added / used. Clamp to [0, 100] as a residual
+    // safety net: V × I refinement removes the big low-power undercount,
+    // but coarse data can still nudge "used" a hair under "added" and
     // yield a >100% artifact that reads as broken.
     let efficiency_pct = match (energy_added_kwh, energy_used_kwh) {
         (Some(added), Some(used)) if used > 0.0 => {
@@ -1058,6 +1108,66 @@ mod tests {
         assert!((used - 10.0).abs() < 1e-9, "expected 10 kWh, got {used}");
         // Fewer than two power samples → None.
         assert_eq!(integrate_power_kwh(&[row(0, Some(10), None, None)]), None);
+    }
+
+    #[test]
+    fn low_power_used_refined_from_volts_amps() {
+        // Regression for the on-vehicle ">100% efficiency" report. Level 1:
+        // 121 V × 12 A = 1.452 kW of real draw, but Tesla reports integer
+        // `charger_power` = 1. Integrating the integer undercounts "used"
+        // below the car's battery-side "added" and clamps efficiency to
+        // 100%. V × I recovers the fractional kW.
+        let mut a = row(0, Some(1), Some(4.0), Some(0.0));
+        a.voltage_v = Some(121);
+        a.current_a = Some(12);
+        let mut b = row(3600, Some(1), Some(4.0), Some(1.4));
+        b.voltage_v = Some(121);
+        b.current_a = Some(12);
+        let used = integrate_power_kwh(&[a, b]).unwrap();
+        assert!((used - 1.452).abs() < 1e-6, "expected ~1.452 kWh from V×I, got {used}");
+    }
+
+    #[test]
+    fn level2_power_refined_within_tolerance() {
+        // North-American 240 V Level 2: 240 V × 48 A = 11.52 kW, integer
+        // reported 11. Within tolerance → refine to the accurate 11.52.
+        let mut a = row(0, Some(11), Some(40.0), Some(0.0));
+        a.voltage_v = Some(240);
+        a.current_a = Some(48);
+        let mut b = row(3600, Some(11), Some(40.0), Some(11.0));
+        b.voltage_v = Some(240);
+        b.current_a = Some(48);
+        let used = integrate_power_kwh(&[a, b]).unwrap();
+        assert!((used - 11.52).abs() < 1e-6, "expected V×I refinement 11.52, got {used}");
+    }
+
+    #[test]
+    fn three_phase_power_falls_back_to_integer() {
+        // European 3-phase AC: the car reports PER-PHASE 230 V × 16 A while
+        // `charger_power` already sums the phases to integer 11 kW. A lone
+        // V × I = 3.68 kW would be ~1/3 of reality, so the guard must reject
+        // it and keep 11 — otherwise this "fix" would break 3-phase users
+        // worse than the integer-rounding bug it cures.
+        let mut a = row(0, Some(11), Some(30.0), Some(0.0));
+        a.voltage_v = Some(230);
+        a.current_a = Some(16);
+        let mut b = row(3600, Some(11), Some(30.0), Some(10.0));
+        b.voltage_v = Some(230);
+        b.current_a = Some(16);
+        let used = integrate_power_kwh(&[a, b]).unwrap();
+        assert!((used - 11.0).abs() < 1e-9, "expected integer fallback 11 kWh, got {used}");
+    }
+
+    #[test]
+    fn missing_volts_or_amps_uses_integer_power() {
+        // No voltage on the sample (older rows, decode gap) → keep the
+        // integer power exactly as before. Pins the unchanged path.
+        let mut a = row(0, Some(7), Some(25.0), Some(0.0));
+        a.current_a = Some(30); // voltage still None
+        let mut b = row(3600, Some(7), Some(25.0), Some(7.0));
+        b.current_a = Some(30);
+        let used = integrate_power_kwh(&[a, b]).unwrap();
+        assert!((used - 7.0).abs() < 1e-9, "expected integer 7 kWh when volts missing, got {used}");
     }
 
     #[test]
