@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react"
-import { Tag, X } from "lucide-react"
+import { Tag, X, Plus } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { fetchAllTagNames } from "@/api/tags"
 
 interface TagPopoverProps {
   tags: string[]
@@ -11,6 +12,7 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState("")
   const [busy, setBusy] = useState(false)
+  const [suggestions, setSuggestions] = useState<string[]>([])
   const wrapRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -20,6 +22,22 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
     }
     document.addEventListener("mousedown", onDoc)
     return () => document.removeEventListener("mousedown", onDoc)
+  }, [open])
+
+  // Pull every tag already used on other drives/charges when the popover
+  // opens, so the user can pick one instead of retyping it. The server
+  // list is SELECT DISTINCT, so a tag drops off once nothing uses it.
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    fetchAllTagNames()
+      .then((all) => {
+        if (!cancelled) setSuggestions(all)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
   }, [open])
 
   const addTag = async () => {
@@ -32,6 +50,17 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
     setBusy(true)
     try {
       await onChange([...tags, t])
+      setDraft("")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const selectSuggestion = async (tag: string) => {
+    if (tags.includes(tag)) return
+    setBusy(true)
+    try {
+      await onChange([...tags, tag])
       setDraft("")
     } finally {
       setBusy(false)
@@ -60,6 +89,12 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
   const hasTags = tags.length > 0
   const displayTag = hasTags ? tags[0] : null
   const extraCount = hasTags ? tags.length - 1 : 0
+
+  // Existing tags not already on this item, narrowed by what's typed.
+  const query = draft.trim().toLowerCase()
+  const available = suggestions.filter(
+    (s) => !tags.includes(s) && (!query || s.toLowerCase().includes(query)),
+  )
 
   return (
     <div ref={wrapRef} className="relative">
@@ -134,6 +169,27 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
               Add
             </button>
           </div>
+          {available.length > 0 && (
+            <div className="mt-2">
+              <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-slate-500">
+                {query ? "Matches" : "Existing tags"}
+              </div>
+              <div className="flex max-h-28 flex-wrap gap-1.5 overflow-y-auto">
+                {available.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    disabled={busy}
+                    onClick={() => selectSuggestion(s)}
+                    className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-xs text-slate-300 transition-colors hover:border-emerald-400/40 hover:bg-emerald-400/10 hover:text-emerald-200 disabled:opacity-50"
+                  >
+                    <Plus className="h-3 w-3" />
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {hasTags && (
             <button
               type="button"
