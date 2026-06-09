@@ -310,9 +310,16 @@ if [ -f "$TMPDIR/server/ble/sentryusb-telemetry.service" ]; then
   # file (written by sentryusb-pick-binary) → live CPU detection → arch
   # family fallback. The aarch64 suffix is per-CPU (-a53/-a72/-a76) so
   # the aux binaries' tuning matches the main daemon's tuning.
+  # Only trust active-variant when it's a real release suffix — old
+  # pickers recorded their on-disk fallback (or "legacy") here, and a
+  # download URL built from that installs the wrong CPU variant.
   _suffix=""
   if [ -s /opt/sentryusb/active-variant ]; then
     _suffix=$(cat /opt/sentryusb/active-variant 2>/dev/null | tr -d '[:space:]')
+    case "$_suffix" in
+      linux-arm64-a53|linux-arm64-a72|linux-arm64-a76|linux-armv7|linux-amd64) ;;
+      *) _suffix="" ;;
+    esac
   fi
   if [ -z "$_suffix" ]; then
     _arch=$(dpkg --print-architecture 2>/dev/null || true)
@@ -320,9 +327,11 @@ if [ -f "$TMPDIR/server/ble/sentryusb-telemetry.service" ]; then
       armhf)  _suffix=linux-armv7 ;;
       amd64)  _suffix=linux-amd64 ;;
       arm64)
-        # Sub-detect for aarch64: HWCAP atomics → a76, CPU part 0xD08 → a72,
-        # else a53. Same rules as sentryusb-pick-binary.
-        if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null; then
+        # Sub-detect for aarch64: HWCAP atomics+aes → a76, CPU part 0xD08
+        # → a72, else a53. Same rules as sentryusb-pick-binary (the a76
+        # build keeps the crypto extension, so it needs the aes hwcap).
+        if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null \
+          && grep -qE '^Features.*\baes\b' /proc/cpuinfo 2>/dev/null; then
           _suffix=linux-arm64-a76
         elif grep -qE '^CPU part[[:space:]]*:[[:space:]]*0x[dD]08' /proc/cpuinfo 2>/dev/null; then
           _suffix=linux-arm64-a72
@@ -336,7 +345,8 @@ if [ -f "$TMPDIR/server/ble/sentryusb-telemetry.service" ]; then
           armv7l)  _suffix=linux-armv7 ;;
           x86_64)  _suffix=linux-amd64 ;;
           aarch64)
-            if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null; then
+            if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null \
+              && grep -qE '^Features.*\baes\b' /proc/cpuinfo 2>/dev/null; then
               _suffix=linux-arm64-a76
             elif grep -qE '^CPU part[[:space:]]*:[[:space:]]*0x[dD]08' /proc/cpuinfo 2>/dev/null; then
               _suffix=linux-arm64-a72

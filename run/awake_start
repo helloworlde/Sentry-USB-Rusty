@@ -157,19 +157,36 @@ else
     _arch=$(uname -m 2>/dev/null || echo unknown)
     _suffix=""
     # Prefer the boot picker's recorded per-CPU variant (a53/a72/a76) so
-    # the self-heal fetch lands the same build the picker would choose —
-    # the generic linux-arm64 alias is an a72 build, which runs anywhere
-    # aarch64 but isn't tuned for the board.
+    # the self-heal fetch lands the same build the picker would choose.
+    # Only trust values matching a real release suffix — an old picker
+    # could have recorded its on-disk fallback or "legacy" here, and
+    # building a download URL from that fetches the wrong variant
+    # forever (issue #88's second act).
     if [ -r /opt/sentryusb/active-variant ]; then
       _picked=$(head -n 1 /opt/sentryusb/active-variant 2>/dev/null | tr -d '[:space:]')
       case "$_picked" in
-        linux-*) _suffix="$_picked" ;;
+        linux-arm64-a53|linux-arm64-a72|linux-arm64-a76|linux-armv7|linux-amd64)
+          _suffix="$_picked" ;;
       esac
       unset _picked
     fi
     if [ -z "$_suffix" ]; then
       case "$_arch" in
-        aarch64|arm64) _suffix="linux-arm64" ;;
+        aarch64|arm64)
+          # Same per-CPU rules as sentryusb-pick-binary / migrate.rs:
+          # atomics+aes hwcaps → a76, Cortex-A72 part id → a72, else
+          # a53. NOT the unsuffixed linux-arm64 alias — that's an a72
+          # build, and historic a72 builds baked in crypto instructions
+          # the Pi 4 / Pi Zero 2 W silicon doesn't implement (SIGILL).
+          if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null \
+            && grep -qE '^Features.*\baes\b' /proc/cpuinfo 2>/dev/null; then
+            _suffix="linux-arm64-a76"
+          elif grep -qE '^CPU part[[:space:]]*:[[:space:]]*0x[dD]08' /proc/cpuinfo 2>/dev/null; then
+            _suffix="linux-arm64-a72"
+          else
+            _suffix="linux-arm64-a53"
+          fi
+          ;;
         armv7l)        _suffix="linux-armv7" ;;
         armv6l)        _suffix="linux-armv6" ;;
         *)             _suffix="" ;;

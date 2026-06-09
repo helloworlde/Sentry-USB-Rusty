@@ -67,8 +67,12 @@ detect_variant() {
     # aarch64 sub-detection. The Features line in /proc/cpuinfo lists the
     # HWCAP names the kernel exported for this CPU. "atomics" indicates LSE
     # (ARMv8.1+ Large System Extensions) — only present on Cortex-A76 and
-    # newer in our hardware spread.
-    if grep -qE '^Features.*\batomics\b' /proc/cpuinfo; then
+    # newer in our hardware spread. The a76 build also keeps the ARMv8
+    # Cryptographic Extension enabled (the Pi 5 implements it), so require
+    # the "aes" hwcap too — a future v8.1+ board without crypto must get
+    # the a72 build (plain v8.0+crc) instead of SIGILLing in SHA/AES code.
+    if grep -qE '^Features.*\batomics\b' /proc/cpuinfo \
+        && grep -qE '^Features.*\baes\b' /proc/cpuinfo; then
         echo "linux-arm64-a76"
         return
     fi
@@ -87,7 +91,8 @@ detect_variant() {
     echo "linux-arm64-a53"
 }
 
-PICKED="$(detect_variant)"
+DETECTED="$(detect_variant)"
+PICKED="$DETECTED"
 PICKED_PATH="${INSTALL_DIR}/sentryusb-${PICKED}"
 
 # Fallback chain — if the preferred variant isn't on disk, walk back through
@@ -122,12 +127,20 @@ fi
 # half-written link.
 ln -sfn "$PICKED_PATH" "$CURRENT_LINK"
 
-# Record the choice so the in-app updater can fetch the same variant.
+# Record what this CPU NEEDS (the detected variant) — NOT what we ended
+# up running. The fallback pick above reflects what happened to be on
+# disk, and recording it poisons every downstream consumer that trusts
+# this file (updater, startup migration, awake_start's one-shot fetch):
+# they'd keep DOWNLOADING the fallback variant forever even though the
+# right one is a URL away. Same reason "legacy" must never land here —
+# it isn't a release suffix and 404s every download built from it.
 # Best-effort write — failure here doesn't block startup, the updater
 # just falls back to re-detection on its own.
-printf '%s\n' "$PICKED" > "$ACTIVE_FILE" 2>/dev/null || true
+if [ -n "$DETECTED" ]; then
+    printf '%s\n' "$DETECTED" > "$ACTIVE_FILE" 2>/dev/null || true
+fi
 
-log "selected variant=${PICKED} path=${PICKED_PATH}"
+log "selected variant=${PICKED} (detected=${DETECTED:-unknown}) path=${PICKED_PATH}"
 
 # ── Aux binaries: telemetry sampler + BLE action CLI ──
 #

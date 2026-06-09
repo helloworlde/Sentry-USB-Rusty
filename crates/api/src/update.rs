@@ -193,11 +193,30 @@ fn update_repo() -> String {
 /// `/lib/ld-linux-aarch64.so.1` isn't installed. Trust dpkg first when
 /// determining the architecture family.
 async fn detect_release_suffix() -> anyhow::Result<String> {
-    // Tier 1: ask the picker what it chose at boot.
+    // Tier 1: ask the picker what it chose at boot. Only trust values
+    // that are real release suffixes — old picker versions recorded
+    // whatever they ended up RUNNING (their on-disk fallback, or even
+    // "legacy"), and building download URLs from that either 404s or
+    // permanently installs the wrong CPU variant (issue #88's second
+    // act). Anything else falls through to live detection below.
+    const KNOWN_SUFFIXES: &[&str] = &[
+        "linux-arm64-a53",
+        "linux-arm64-a72",
+        "linux-arm64-a76",
+        "linux-armv7",
+        "linux-amd64",
+    ];
     if let Ok(s) = std::fs::read_to_string("/opt/sentryusb/active-variant") {
         let trimmed = s.trim();
-        if !trimmed.is_empty() {
+        if KNOWN_SUFFIXES.contains(&trimmed) {
             return Ok(trimmed.to_string());
+        }
+        if !trimmed.is_empty() {
+            tracing::warn!(
+                "active-variant contains {:?} (not a release suffix) — \
+                 ignoring it and re-detecting from CPU",
+                trimmed
+            );
         }
     }
 
@@ -236,11 +255,18 @@ async fn detect_release_suffix() -> anyhow::Result<String> {
     // the same variant the picker would have chosen.
     debug_assert_eq!(family, "aarch64");
     if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
-        // HWCAP_ATOMICS = LSE = ARMv8.1+ = Cortex-A76 and newer.
-        for line in cpuinfo.lines() {
-            if line.starts_with("Features") && line.split_whitespace().any(|w| w == "atomics") {
-                return Ok("linux-arm64-a76".to_string());
-            }
+        // HWCAP_ATOMICS = LSE = ARMv8.1+ = Cortex-A76 and newer. The a76
+        // build also keeps the ARMv8 crypto extension enabled (Pi 5 has
+        // it), so require the `aes` hwcap too — a v8.1+ board without
+        // crypto must get the a72 build instead of SIGILLing in SHA/AES.
+        let has_hwcap = |cap: &str| {
+            cpuinfo.lines().any(|line| {
+                line.starts_with("Features")
+                    && line.split_whitespace().any(|w| w == cap)
+            })
+        };
+        if has_hwcap("atomics") && has_hwcap("aes") {
+            return Ok("linux-arm64-a76".to_string());
         }
         // 0xD08 = Cortex-A72 (Pi 4 / RK3399 perf cluster).
         for line in cpuinfo.lines() {
