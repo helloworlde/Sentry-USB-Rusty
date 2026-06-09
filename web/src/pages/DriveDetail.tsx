@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useMemo, useState } from "react"
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react"
 import { Link, useParams } from "react-router-dom"
 import {
   ArrowLeft,
@@ -358,6 +358,12 @@ interface SpeedSectionProps {
 }
 
 function SpeedSection({ drive, speedSeries, metric, speedUnit }: SpeedSectionProps) {
+  // Stable formatter ref so the memoized DriveChart skips re-rendering on
+  // scrubber/playback ticks that don't change the speed data.
+  const formatSpeedValue = useCallback(
+    (n: number) => `${Math.round(n)} ${speedUnit}`,
+    [speedUnit],
+  )
   if (drive.maxSpeedMph === 0 && drive.avgSpeedMph === 0) return null
   return (
     <>
@@ -380,7 +386,7 @@ function SpeedSection({ drive, speedSeries, metric, speedUnit }: SpeedSectionPro
             <DriveChart
               series={speedSeries}
               valueLabel="Speed"
-              valueFormatter={(n) => `${Math.round(n)} ${speedUnit}`}
+              valueFormatter={formatSpeedValue}
               startTime={drive.startTime}
             />
           </Suspense>

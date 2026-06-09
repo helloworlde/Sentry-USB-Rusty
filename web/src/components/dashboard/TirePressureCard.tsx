@@ -1,4 +1,4 @@
-import { useMemo } from "react"
+import { memo, useMemo } from "react"
 import { Disc } from "lucide-react"
 import {
   CartesianGrid,
@@ -120,8 +120,11 @@ interface TirePressureCardProps {
   chartOnly?: boolean
 }
 
-export function TirePressureCard({ data, days = 30, chartOnly = false }: TirePressureCardProps) {
-
+export const TirePressureCard = memo(function TirePressureCard({
+  data,
+  days = 30,
+  chartOnly = false,
+}: TirePressureCardProps) {
   // Latest reading per tire for the header strip — rendered inline
   // beside the title so the card stays compact for the dashboard
   // grid.
@@ -305,7 +308,7 @@ export function TirePressureCard({ data, days = 30, chartOnly = false }: TirePre
       {chart}
     </div>
   )
-}
+})
 
 function LatestChip({
   label,

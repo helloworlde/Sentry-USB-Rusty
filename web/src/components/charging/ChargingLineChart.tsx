@@ -1,3 +1,4 @@
+import { memo } from "react"
 import {
   CartesianGrid,
   Legend,
@@ -24,7 +25,7 @@ export interface ChargeSeries {
 // reads as part of the same UI. Used for range, amperage, voltage and
 // the temperature series — each is a separate card with its own unit,
 // matching how Tessie / TeslaScope present them.
-export default function ChargingLineChart({
+function ChargingLineChart({
   points,
   series,
   unit,
@@ -119,6 +120,8 @@ export default function ChargingLineChart({
     </div>
   )
 }
+
+export default memo(ChargingLineChart)
 
 function formatTick(ms: number): string {
   const t = new Date(ms)

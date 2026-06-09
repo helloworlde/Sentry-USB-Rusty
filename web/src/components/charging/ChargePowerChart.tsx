@@ -1,3 +1,4 @@
+import { memo, useMemo } from "react"
 import {
   CartesianGrid,
   Legend,
@@ -24,7 +25,7 @@ const YAXIS_WIDTH = 40
 
 type ChartPoint = ChargePoint & { socProjected?: number | null }
 
-export default function ChargePowerChart({
+function ChargePowerChart({
   points,
   projection,
 }: {
@@ -35,24 +36,29 @@ export default function ChargePowerChart({
 }) {
   const hasProjection = !!projection && projection.length > 0
   // The last actual point carries `socProjected` too, so the dashed line
-  // joins the solid one instead of starting from a gap.
-  const data: ChartPoint[] = [
-    ...points.map((p, i) => ({
-      ...p,
-      socProjected: hasProjection && i === points.length - 1 ? p.soc : null,
-    })),
-    ...(projection ?? []).map((pp) => ({
-      ts: pp.ts,
-      powerKw: null,
-      currentA: null,
-      voltageV: null,
-      rateMph: null,
-      soc: null,
-      rangeMi: null,
-      energyAddedKwh: null,
-      socProjected: pp.soc,
-    })),
-  ]
+  // joins the solid one instead of starting from a gap. Memoized so the
+  // 30s live poll on the detail page doesn't rebuild the array (and force
+  // a recharts re-layout) when `points`/`projection` haven't changed.
+  const data: ChartPoint[] = useMemo(
+    () => [
+      ...points.map((p, i) => ({
+        ...p,
+        socProjected: hasProjection && i === points.length - 1 ? p.soc : null,
+      })),
+      ...(projection ?? []).map((pp) => ({
+        ts: pp.ts,
+        powerKw: null,
+        currentA: null,
+        voltageV: null,
+        rateMph: null,
+        soc: null,
+        rangeMi: null,
+        energyAddedKwh: null,
+        socProjected: pp.soc,
+      })),
+    ],
+    [points, projection, hasProjection],
+  )
   return (
     <div className="h-56 w-full" aria-label="Charging power and state-of-charge chart">
       <ResponsiveContainer minHeight={0} minWidth={0}>
@@ -171,6 +177,8 @@ export default function ChargePowerChart({
     </div>
   )
 }
+
+export default memo(ChargePowerChart)
 
 function Row({ color, label, value }: { color: string; label: string; value: string }) {
   return (

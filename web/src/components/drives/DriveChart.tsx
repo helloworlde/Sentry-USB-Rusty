@@ -1,4 +1,4 @@
-import { useMemo, useRef } from "react"
+import { memo, useMemo, useRef } from "react"
 import {
   Area,
   AreaChart,
@@ -36,7 +36,7 @@ const YAXIS_WIDTH = 36
 const X_PADDING_LEFT = 10
 const X_PADDING_RIGHT = 4
 
-export default function DriveChart({
+function DriveChart({
   series,
   valueLabel,
   valueFormatter,
@@ -161,6 +161,8 @@ export default function DriveChart({
     </div>
   )
 }
+
+export default memo(DriveChart)
 
 function formatTickTime(baseMs: number, relMs: number): string {
   const t = new Date(baseMs + relMs)

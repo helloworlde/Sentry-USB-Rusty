@@ -24,7 +24,7 @@ import type { ChargeSessionDetail, CurrentCharge } from "@/types/charging"
 import { SectionHeading, StatTile } from "@/components/drives/StatTile"
 import { TagPopover } from "@/components/drives/TagPopover"
 import ChargePowerChart from "@/components/charging/ChargePowerChart"
-import ChargingLineChart from "@/components/charging/ChargingLineChart"
+import ChargingLineChart, { type ChargeSeries } from "@/components/charging/ChargingLineChart"
 import { MiniPinMap } from "@/components/charging/MiniPinMap"
 import {
   fmtDuration,
@@ -36,6 +36,15 @@ import {
   fmtSoc,
 } from "@/lib/charge-format"
 import { useDistanceUnit } from "@/hooks/useDistanceUnit"
+
+// Static chart series — hoisted to module scope so their references stay
+// stable across the page's live-poll re-renders. With the charts wrapped
+// in React.memo, a stable series array lets recharts skip its (expensive)
+// re-layout when only `nowMs`/`current` changed.
+const RANGE_SERIES: ChargeSeries[] = [{ key: "rangeMi", name: "Range", color: "#a78bfa" }]
+const CURRENT_SERIES: ChargeSeries[] = [{ key: "currentA", name: "Current", color: "#fbbf24" }]
+const VOLTAGE_SERIES: ChargeSeries[] = [{ key: "voltageV", name: "Voltage", color: "#22d3ee" }]
+const VOLTAGE_Y_DOMAIN: [number | string, number | string] = [0, "dataMax + 10"]
 
 export default function ChargeSessionDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -136,12 +145,16 @@ export default function ChargeSessionDetailPage() {
 
   // The Range chart plots rangeMi directly; convert the series to km for
   // metric so the axis and tooltip match the unit.
-  const rangePoints = metric
-    ? (session?.points ?? []).map((p) => ({
-        ...p,
-        rangeMi: p.rangeMi == null ? null : p.rangeMi * 1.609344,
-      }))
-    : (session?.points ?? [])
+  const rangePoints = useMemo(
+    () =>
+      metric
+        ? (session?.points ?? []).map((p) => ({
+            ...p,
+            rangeMi: p.rangeMi == null ? null : p.rangeMi * 1.609344,
+          }))
+        : (session?.points ?? []),
+    [session?.points, metric],
+  )
 
   const lastPoint = session?.points[session.points.length - 1]
   // In progress when the live status says charging and this session's
@@ -389,7 +402,7 @@ export default function ChargeSessionDetailPage() {
               <SectionHeading>Range</SectionHeading>
               <ChargingLineChart
                 points={rangePoints}
-                series={[{ key: "rangeMi", name: "Range", color: "#a78bfa" }]}
+                series={RANGE_SERIES}
                 unit={metric ? " km" : " mi"}
               />
             </div>
@@ -406,7 +419,7 @@ export default function ChargeSessionDetailPage() {
               )}
               <ChargingLineChart
                 points={session.points}
-                series={[{ key: "currentA", name: "Current", color: "#fbbf24" }]}
+                series={CURRENT_SERIES}
                 unit=" A"
               />
             </div>
@@ -417,9 +430,9 @@ export default function ChargeSessionDetailPage() {
               <SectionHeading>Voltage</SectionHeading>
               <ChargingLineChart
                 points={session.points}
-                series={[{ key: "voltageV", name: "Voltage", color: "#22d3ee" }]}
+                series={VOLTAGE_SERIES}
                 unit=" V"
-                yDomain={[0, "dataMax + 10"]}
+                yDomain={VOLTAGE_Y_DOMAIN}
               />
             </div>
           )}
