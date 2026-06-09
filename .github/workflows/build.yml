@@ -271,6 +271,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + build
+        # Without this the test job recompiles the whole workspace + every
+        # dependency from scratch on each run. rust-cache keys on the
+        # toolchain + Cargo.lock and evicts stale build artifacts so the
+        # cache stays lean. `cache-on-failure` still saves the cache when a
+        # test fails, so a flaky run doesn't cost a full cold rebuild next.
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Install bluez build deps
         # `bluer`/`btleplug` (used by crates/tesla_ble) need libdbus-1
         # headers + pkg-config to compile. Without these `cargo test
