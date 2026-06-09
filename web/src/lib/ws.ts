@@ -1,10 +1,18 @@
 type MessageHandler = (data: unknown) => void
 type StatusListener = (connected: boolean) => void
 
+// Reconnect backoff bounds. First retry stays at 3s (snappy recovery
+// from a brief blip), then doubles up to a 30s ceiling so a Pi that's
+// mid-reboot (OTA update) or an endpoint that keeps refusing isn't hit
+// ~20×/min. Reset to the floor on a successful open.
+const INITIAL_RECONNECT_MS = 3000
+const MAX_RECONNECT_MS = 30000
+
 class WebSocketClient {
   private ws: WebSocket | null = null
   private handlers: Map<string, Set<MessageHandler>> = new Map()
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private reconnectDelay = INITIAL_RECONNECT_MS
   private pingTimer: ReturnType<typeof setInterval> | null = null
   private url: string
   private _connected = false
@@ -37,6 +45,7 @@ class WebSocketClient {
 
     this.ws.onopen = () => {
       this.setConnected(true)
+      this.reconnectDelay = INITIAL_RECONNECT_MS
       this.startPing()
     }
 
@@ -81,10 +90,12 @@ class WebSocketClient {
 
   private scheduleReconnect() {
     if (this.reconnectTimer) return
+    const delay = this.reconnectDelay
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_MS)
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       this.connect()
-    }, 3000)
+    }, delay)
   }
 
   subscribe(type: string, handler: MessageHandler): () => void {
@@ -113,6 +124,9 @@ class WebSocketClient {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
+    // A manual reconnect should start from the fast floor, not wherever
+    // the backoff had climbed to.
+    this.reconnectDelay = INITIAL_RECONNECT_MS
     this.ws?.close()
     this.ws = null
   }

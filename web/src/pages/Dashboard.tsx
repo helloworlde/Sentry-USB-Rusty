@@ -334,19 +334,52 @@ export default function Dashboard() {
     fetchLatestDrive()
     fetchActiveChime()
     fetchChargeStatus()
-    const carStatusInterval = setInterval(fetchCarStatusSample, 30_000)
-    const chargeInterval = setInterval(fetchChargeStatus, 30_000)
-    const chimeInterval = setInterval(fetchActiveChime, 300_000)
+    // Pause every poller while the tab is hidden (phone in a pocket, a
+    // backgrounded tab) so the dashboard stops hitting the Pi every 1-2s
+    // and draining the phone battery for data nobody's looking at. The
+    // `visibilitychange` handler below refreshes immediately on return so
+    // the tiles don't sit stale waiting for the next tick.
+    const carStatusInterval = setInterval(() => {
+      if (!document.hidden) fetchCarStatusSample()
+    }, 30_000)
+    const chargeInterval = setInterval(() => {
+      if (!document.hidden) fetchChargeStatus()
+    }, 30_000)
+    const chimeInterval = setInterval(() => {
+      if (!document.hidden) fetchActiveChime()
+    }, 300_000)
 
     // Status drives the live-tile values (CPU, mem, temp). 2s is fast
     // enough that a glance still feels real-time and halves the
     // server hits vs the previous 1s cadence. The uptime tile uses a
     // separate local 1s interval below so the seconds counter still
     // advances smoothly between server polls.
-    const statusInterval = setInterval(fetchStatus, 2000)
-    const statsInterval = setInterval(fetchDriveStats, 5000)
-    const storageInterval = setInterval(fetchStorageBreakdown, 10000)
-    const uptimeInterval = setInterval(() => setUptime((p) => p + 1), 1000)
+    const statusInterval = setInterval(() => {
+      if (!document.hidden) fetchStatus()
+    }, 2000)
+    const statsInterval = setInterval(() => {
+      if (!document.hidden) fetchDriveStats()
+    }, 5000)
+    const storageInterval = setInterval(() => {
+      if (!document.hidden) fetchStorageBreakdown()
+    }, 10000)
+    // Local-only counter, but still skip it while hidden so React isn't
+    // re-rendering the dashboard once a second for a backgrounded tab.
+    const uptimeInterval = setInterval(() => {
+      if (!document.hidden) setUptime((p) => p + 1)
+    }, 1000)
+
+    // Snap the live tiles back to current the moment the tab is shown
+    // again, rather than waiting up to 30s for the slow intervals.
+    const onVisible = () => {
+      if (document.hidden) return
+      fetchStatus()
+      fetchDriveStats()
+      fetchStorageBreakdown()
+      fetchCarStatusSample()
+      fetchChargeStatus()
+    }
+    document.addEventListener("visibilitychange", onVisible)
 
     const unsubscribe = wsClient.subscribe("drive_process", (data) => {
       if (!mounted) return
@@ -377,6 +410,7 @@ export default function Dashboard() {
       clearInterval(carStatusInterval)
       clearInterval(chargeInterval)
       clearInterval(chimeInterval)
+      document.removeEventListener("visibilitychange", onVisible)
       unsubscribe()
     }
   }, [])
