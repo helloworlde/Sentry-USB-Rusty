@@ -97,56 +97,77 @@ if [ -n "${RELEASE_TAG:-}" ]; then
     echo "Version: $RELEASE_TAG"
 fi
 
-# ── Pre-install SentryUSB Tesla BLE telemetry sampler binary ──
-# Same install pattern as the main sentryusb binary above:
-#   * SENTRYUSB_TELEMETRY_BINARY env override for CI / local builds
-#   * files/sentryusb-tesla-telemetry fallback injected by build-image.sh
-#   * GitHub release download as the last resort
-# The sentryusb-telemetry.service unit (installed below) has
-# ConditionPathExists=/root/bin/tesla-control so the service only runs
-# once the user pairs BLE — until then the binary sits idle, which is
-# safe and matches the lazy-install UX in the settings page.
-TELEMETRY_BINARY_URL="https://github.com/${REPO}/releases/latest/download/sentryusb-tesla-telemetry-${BINARY_SUFFIX}"
-TELEMETRY_DST="${ROOTFS_DIR}/root/bin/sentryusb-tesla-telemetry"
-if [ -n "${SENTRYUSB_TELEMETRY_BINARY:-}" ] && [ -f "${SENTRYUSB_TELEMETRY_BINARY}" ]; then
-    cp "${SENTRYUSB_TELEMETRY_BINARY}" "${TELEMETRY_DST}"
-elif [ -f "files/sentryusb-tesla-telemetry" ]; then
-    cp "files/sentryusb-tesla-telemetry" "${TELEMETRY_DST}"
-else
-    curl -fsSL "${TELEMETRY_BINARY_URL}" -o "${TELEMETRY_DST}" 2>/dev/null || {
-        echo "WARNING: Could not download telemetry binary from releases. Telemetry sampler will not run until installed."
-        rm -f "${TELEMETRY_DST}"
-    }
-fi
-[ -f "${TELEMETRY_DST}" ] && chmod +x "${TELEMETRY_DST}"
-
-# ── Install sentryusb-ble-action ──
-# One-shot BLE action CLI invoked by run/awake_start to send
-# keep-awake commands (wake / sentry-mode / charge-port). Without
-# this binary present, users with BLE keep-awake enabled hit
-# "No such file or directory" errors on every nudge attempt.
-# Same env-override → files/ → release-download precedence as the
-# telemetry binary above so build-image.sh can inject a freshly
-# cross-compiled artifact in CI.
+# ── Pre-install Tesla BLE aux binaries (telemetry sampler + action CLI) ──
 #
-# Historical note: a tester hit this exact gap (Tesla BLE keep-awake
-# failed 3× with "No such file or directory") because pi-gen only
-# installed the telemetry binary, and update.rs's best-effort fetch
-# silently skipped this binary on a curl glitch. Baking it in here
-# means fresh images never depend on the OTA path getting it.
-BLE_ACTION_BINARY_URL="https://github.com/${REPO}/releases/latest/download/sentryusb-ble-action-${BINARY_SUFFIX}"
-BLE_ACTION_DST="${ROOTFS_DIR}/root/bin/sentryusb-ble-action"
-if [ -n "${SENTRYUSB_BLE_ACTION_BINARY:-}" ] && [ -f "${SENTRYUSB_BLE_ACTION_BINARY}" ]; then
-    cp "${SENTRYUSB_BLE_ACTION_BINARY}" "${BLE_ACTION_DST}"
-elif [ -f "files/sentryusb-ble-action" ]; then
-    cp "files/sentryusb-ble-action" "${BLE_ACTION_DST}"
-else
-    curl -fsSL "${BLE_ACTION_BINARY_URL}" -o "${BLE_ACTION_DST}" 2>/dev/null || {
-        echo "WARNING: Could not download sentryusb-ble-action from releases. Keep-awake BLE nudges will fall back to awake_start's self-heal fetch on first invocation."
-        rm -f "${BLE_ACTION_DST}"
-    }
-fi
-[ -f "${BLE_ACTION_DST}" ] && chmod +x "${BLE_ACTION_DST}"
+# sentryusb-tesla-telemetry: BLE telemetry sampler daemon.
+# sentryusb-ble-action: one-shot CLI invoked by run/awake_start to send
+# keep-awake commands (wake / sentry-mode / charge-port). Without it,
+# users with BLE keep-awake enabled hit "No such file or directory"
+# errors on every nudge attempt.
+#
+# Same per-CPU variant scheme as the main binary above: stage every
+# variant under /opt/sentryusb and let the runtime picker
+# (sentryusb-pick-binary) symlink /root/bin/<name> to the right one at
+# every boot. The old scheme — a single fixed binary copied straight
+# into /root/bin — is what caused the wrong-variant SIGILL crash-loop
+# on Pi 4 (issue #88): /root/bin was written once and never
+# re-validated against the running CPU. (It was also broken in a
+# second way: the release-download fallback interpolated
+# ${BINARY_SUFFIX}, a variable nothing ever set, and the files/
+# fallback looked for unsuffixed names while build-image.sh stages
+# per-variant suffixed ones — so fresh images usually shipped with no
+# aux binaries at all and leaned entirely on the OTA updater.)
+#
+# Input precedence per variant (mirrors the main-binary loop):
+#   * files/<name>-<sfx> — per-variant build injected by build-image.sh
+#   * SENTRYUSB_TELEMETRY_BINARY / SENTRYUSB_BLE_ACTION_BINARY env
+#     override — a single binary staged under ALL variant slots; only
+#     fully correct for single-variant builds (armv7), kept for CI and
+#     local-dev convenience
+#   * GitHub release download as the last resort
+#
+# The sentryusb-telemetry.service unit (installed below) has
+# ConditionPathExists guards so the sampler only runs once the user
+# pairs BLE — until then the binaries sit idle, which is safe and
+# matches the lazy-install UX in the settings page.
+for name in sentryusb-tesla-telemetry sentryusb-ble-action; do
+    case "$name" in
+        sentryusb-tesla-telemetry) OVERRIDE="${SENTRYUSB_TELEMETRY_BINARY:-}" ;;
+        sentryusb-ble-action)      OVERRIDE="${SENTRYUSB_BLE_ACTION_BINARY:-}" ;;
+    esac
+    STAGED_ANY=""
+    for sfx in $SUFFIXES; do
+        DEST="${ROOTFS_DIR}/opt/sentryusb/${name}-${sfx}"
+        if [ -f "files/${name}-${sfx}" ]; then
+            cp "files/${name}-${sfx}" "${DEST}"
+        elif [ -n "${OVERRIDE}" ] && [ -f "${OVERRIDE}" ]; then
+            cp "${OVERRIDE}" "${DEST}"
+        else
+            URL="https://github.com/${REPO}/releases/latest/download/${name}-${sfx}"
+            curl -fsSL "${URL}" -o "${DEST}" 2>/dev/null || {
+                echo "WARNING: Could not download ${name}-${sfx} from releases. Picker will fall back."
+                rm -f "${DEST}"
+                continue
+            }
+        fi
+        chmod +x "${DEST}"
+        STAGED_ANY="yes"
+    done
+    # Pre-point the /root/bin symlink at the first staged variant (a53
+    # baseline on aarch64 — runs on every supported board) so the path
+    # exists even before the picker's first run. The picker re-points
+    # it to the best variant at every boot.
+    if [ -n "${STAGED_ANY}" ]; then
+        for sfx in $SUFFIXES; do
+            if [ -x "${ROOTFS_DIR}/opt/sentryusb/${name}-${sfx}" ]; then
+                ln -sfn "/opt/sentryusb/${name}-${sfx}" "${ROOTFS_DIR}/root/bin/${name}"
+                break
+            fi
+        done
+    else
+        echo "WARNING: no ${name} variant staged — the in-app updater installs it on first update; until then the dependent service/script stays inactive."
+    fi
+done
 
 # ── Install BLE peripheral daemon ──
 BLE_SCRIPT="${ROOTFS_DIR}/root/bin/sentryusb-ble.py"

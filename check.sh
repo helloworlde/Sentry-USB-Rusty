@@ -9,6 +9,7 @@ shellcheck -V
 shellcheck --exclude=SC1091 \
            ./setup/pi/setup-sentryusb \
            ./pi-gen-sources/00-sentryusb-tweaks/files/rc.local \
+           ./pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary \
            ./run/archiveloop \
            ./run/auto.sentryusb \
            ./run/awake_start \

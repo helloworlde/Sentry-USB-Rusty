@@ -128,4 +128,43 @@ ln -sfn "$PICKED_PATH" "$CURRENT_LINK"
 printf '%s\n' "$PICKED" > "$ACTIVE_FILE" 2>/dev/null || true
 
 log "selected variant=${PICKED} path=${PICKED_PATH}"
+
+# ── Aux binaries: telemetry sampler + BLE action CLI ──
+#
+# These live at fixed paths under /root/bin (sentryusb-telemetry.service's
+# ConditionPathExists and run/awake_start both reference them there), but
+# like the main binary they are per-CPU-tuned builds. Manage them the same
+# way: per-variant copies under /opt/sentryusb, with /root/bin as a symlink
+# this picker re-points at every boot.
+#
+# This is the fix for the wrong-variant SIGILL crash-loop (issue #88):
+# previously whatever variant landed in /root/bin stayed there forever, so
+# moving an SD card between Pi models (or a bad suffix at install time)
+# left a binary the CPU can't run — e.g. an a76 build's baked-in LSE
+# atomics / crypto instructions SIGILL on a Pi 4's Cortex-A72 — with no
+# self-heal, while the main binary silently corrected itself each boot.
+#
+# Legacy installs: if no per-variant copies exist under /opt/sentryusb
+# (image predates this scheme and the OTA updater hasn't run since), leave
+# /root/bin alone — a regular file there is the only copy we have.
+mkdir -p /root/bin 2>/dev/null || true
+for name in sentryusb-tesla-telemetry sentryusb-ble-action; do
+    AUX_PATH="${INSTALL_DIR}/${name}-${PICKED}"
+    if [ ! -x "$AUX_PATH" ]; then
+        # Same fallback chain as the main binary. a72 is safe on every
+        # aarch64 board we support (ARMv8.0 baseline, no LSE/crypto baked).
+        for fallback in linux-arm64-a72 linux-arm64-a53 linux-armv7; do
+            if [ -x "${INSTALL_DIR}/${name}-${fallback}" ]; then
+                AUX_PATH="${INSTALL_DIR}/${name}-${fallback}"
+                log "${name}: preferred variant ${PICKED} not installed, falling back to ${fallback}"
+                break
+            fi
+        done
+    fi
+    if [ -x "$AUX_PATH" ]; then
+        ln -sfn "$AUX_PATH" "/root/bin/${name}"
+        log "${name} -> ${AUX_PATH}"
+    fi
+done
+
 exit 0

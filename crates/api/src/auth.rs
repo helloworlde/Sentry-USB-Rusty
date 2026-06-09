@@ -170,6 +170,18 @@ impl AuthState {
 
         if let Ok(data) = serde_json::to_vec(&stored) {
             let _ = std::fs::write(path, data);
+            // Session tokens are bearer credentials — keep the file 0600
+            // so a non-root account or an over-broad backup can't read
+            // them. /root itself is 0700 on Pi OS; this is
+            // defense-in-depth, not the only barrier.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
         }
     }
 }

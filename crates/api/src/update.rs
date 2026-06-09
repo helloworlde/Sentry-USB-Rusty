@@ -380,15 +380,33 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
         {
             Ok(_) => {
                 // mkdir + chmod failures are tolerable individually
-                // (the dir likely exists; non-executable still gets
+                // (the dirs likely exist; non-executable still gets
                 // executed if we fix perms later). The mv is the
                 // one we MUST surface — if it fails the binary on
                 // disk doesn't get replaced.
+                //
+                // Install layout: the binary lands at its per-CPU
+                // variant path under /opt/sentryusb and /root/bin
+                // becomes a symlink to it — the same scheme the boot
+                // picker (sentryusb-pick-binary) manages for the main
+                // binary. The picker re-validates the symlink every
+                // boot, so a wrong-variant binary (SD card moved to a
+                // different Pi model) self-heals instead of SIGILL
+                // crash-looping forever (issue #88). `ln -sfn` also
+                // migrates legacy installs in place: it atomically
+                // replaces the old regular file at /root/bin.
                 if let Err(e) =
                     sentryusb_shell::run("mkdir", &["-p", "/root/bin"]).await
                 {
                     install_warnings.push(format!(
                         "telemetry: mkdir /root/bin failed: {e}"
+                    ));
+                }
+                if let Err(e) =
+                    sentryusb_shell::run("mkdir", &["-p", "/opt/sentryusb"]).await
+                {
+                    install_warnings.push(format!(
+                        "telemetry: mkdir /opt/sentryusb failed: {e}"
                     ));
                 }
                 if let Err(e) =
@@ -398,15 +416,31 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
                         "telemetry: chmod +x failed: {e}"
                     ));
                 }
-                match sentryusb_shell::run(
-                    "mv",
-                    &[
-                        telemetry_tmp,
-                        "/root/bin/sentryusb-tesla-telemetry",
-                    ],
-                )
-                .await
-                {
+                let telemetry_dest =
+                    format!("/opt/sentryusb/sentryusb-tesla-telemetry-{}", suffix);
+                // mv first, ln only on success — a failed mv must NOT
+                // re-point /root/bin at a path that doesn't exist (that
+                // would replace a working legacy binary with a dangling
+                // symlink).
+                let install_result =
+                    match sentryusb_shell::run("mv", &[telemetry_tmp, &telemetry_dest])
+                        .await
+                    {
+                        Ok(_) => {
+                            sentryusb_shell::run(
+                                "ln",
+                                &[
+                                    "-sfn",
+                                    &telemetry_dest,
+                                    "/root/bin/sentryusb-tesla-telemetry",
+                                ],
+                            )
+                            .await
+                            .map(|_| ())
+                        }
+                        Err(e) => Err(e),
+                    };
+                match install_result {
                     Ok(_) => {
                         // Service file is installed by migrate.rs
                         // (sentryusb's startup script). Restart here
@@ -427,7 +461,8 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
                     Err(e) => {
                         install_warnings.push(format!(
                             "telemetry binary install FAILED \
-                             (mv to /root/bin/sentryusb-tesla-telemetry): \
+                             (install to {telemetry_dest} + symlink from \
+                             /root/bin/sentryusb-tesla-telemetry): \
                              {e} — likely read-only rootfs; if your image \
                              uses an overlay you may need to remount manually \
                              or wait for the next reboot"
@@ -501,21 +536,47 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
                     ));
                 }
                 if let Err(e) =
+                    sentryusb_shell::run("mkdir", &["-p", "/opt/sentryusb"]).await
+                {
+                    install_warnings.push(format!(
+                        "ble-action: mkdir /opt/sentryusb failed: {e}"
+                    ));
+                }
+                if let Err(e) =
                     sentryusb_shell::run("chmod", &["+x", action_tmp]).await
                 {
                     install_warnings.push(format!(
                         "ble-action: chmod +x failed: {e}"
                     ));
                 }
-                if let Err(e) = sentryusb_shell::run(
-                    "mv",
-                    &[action_tmp, "/root/bin/sentryusb-ble-action"],
-                )
-                .await
-                {
+                // Same variant-path + picker-managed-symlink layout as
+                // the telemetry binary above; see that block for the
+                // issue #88 rationale. mv first, ln only on success.
+                let action_dest =
+                    format!("/opt/sentryusb/sentryusb-ble-action-{}", suffix);
+                let install_result =
+                    match sentryusb_shell::run("mv", &[action_tmp, &action_dest])
+                        .await
+                    {
+                        Ok(_) => {
+                            sentryusb_shell::run(
+                                "ln",
+                                &[
+                                    "-sfn",
+                                    &action_dest,
+                                    "/root/bin/sentryusb-ble-action",
+                                ],
+                            )
+                            .await
+                            .map(|_| ())
+                        }
+                        Err(e) => Err(e),
+                    };
+                if let Err(e) = install_result {
                     install_warnings.push(format!(
                         "ble-action binary install FAILED \
-                         (mv to /root/bin/sentryusb-ble-action): {e} — \
+                         (install to {action_dest} + symlink from \
+                         /root/bin/sentryusb-ble-action): {e} — \
                          likely read-only rootfs"
                     ));
                     let _ = sentryusb_shell::run("rm", &["-f", action_tmp]).await;

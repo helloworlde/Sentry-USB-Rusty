@@ -82,12 +82,14 @@ command -v docker &>/dev/null || error "Docker is required. Install it first."
 
 # ── Step 1: Get the SentryUSB binary variants ──
 #
-# Populates two parallel arrays:
-#   VARIANT_PATHS[i]  — local path to the sentryusb binary for SUFFIXES[i]
-#   TELEMETRY_PATHS[i]— local path to telemetry sampler for SUFFIXES[i] (optional)
+# Populates three parallel arrays:
+#   VARIANT_PATHS[i]   — local path to the sentryusb binary for SUFFIXES[i]
+#   TELEMETRY_PATHS[i] — local path to telemetry sampler for SUFFIXES[i] (optional)
+#   BLE_ACTION_PATHS[i]— local path to the BLE action CLI for SUFFIXES[i] (optional)
 # These get injected into pi-gen's stage_sentryusb/files/ in Step 4.
 VARIANT_PATHS=()
 TELEMETRY_PATHS=()
+BLE_ACTION_PATHS=()
 
 if [ -n "$LOCAL_BINARY" ]; then
     # Local-binary mode: one binary on the CLI, stage it under all variants.
@@ -96,8 +98,8 @@ if [ -n "$LOCAL_BINARY" ]; then
     info "Using local binary: $LOCAL_BINARY (staged under all ${#SUFFIXES[@]} variant slot(s))"
     for sfx in "${SUFFIXES[@]}"; do
         VARIANT_PATHS+=("$LOCAL_BINARY")
-        # telemetry isn't derivable from a single arbitrary binary;
-        # it gets fetched from releases below if available.
+        # telemetry/ble-action aren't derivable from a single arbitrary
+        # binary; 00-run.sh fetches them per-variant from releases.
     done
 elif command -v cross &>/dev/null && command -v node &>/dev/null; then
     info "Building binaries from source (${#SUFFIXES[@]} variant(s))..."
@@ -121,15 +123,19 @@ elif command -v cross &>/dev/null && command -v node &>/dev/null; then
             cd "$SCRIPT_DIR"
             cargo clean --release --target "$RUST_TARGET" -p sentryusb 2>/dev/null || true
             cargo clean --release --target "$RUST_TARGET" -p sentryusb-tesla-telemetry 2>/dev/null || true
+            cargo clean --release --target "$RUST_TARGET" -p sentryusb-tesla-ble 2>/dev/null || true
             RUSTFLAGS="-C target-cpu=${cpu}" cross build --release --target "$RUST_TARGET" -p sentryusb
             RUSTFLAGS="-C target-cpu=${cpu}" cross build --release --target "$RUST_TARGET" -p sentryusb-tesla-telemetry
+            RUSTFLAGS="-C target-cpu=${cpu}" cross build --release --target "$RUST_TARGET" -p sentryusb-tesla-ble --bin sentryusb-ble-action
         )
         STASH="/tmp/sentryusb-image-build/${sfx}"
         mkdir -p "$STASH"
         cp "$SCRIPT_DIR/target/$RUST_TARGET/release/sentryusb" "$STASH/sentryusb"
         cp "$SCRIPT_DIR/target/$RUST_TARGET/release/sentryusb-tesla-telemetry" "$STASH/sentryusb-tesla-telemetry"
+        cp "$SCRIPT_DIR/target/$RUST_TARGET/release/sentryusb-ble-action" "$STASH/sentryusb-ble-action"
         VARIANT_PATHS+=("$STASH/sentryusb")
         TELEMETRY_PATHS+=("$STASH/sentryusb-tesla-telemetry")
+        BLE_ACTION_PATHS+=("$STASH/sentryusb-ble-action")
     done
     ok "Built ${#SUFFIXES[@]} variant(s)"
 else
@@ -140,8 +146,10 @@ else
         curl -fsSL "https://github.com/$REPO/releases/latest/download/sentryusb-$sfx" -o "$STASH/sentryusb" \
             || error "Failed to download sentryusb-$sfx. Build locally with:\n  cargo install cross\n  cd web && npm ci && npm run build"
         curl -fsSL "https://github.com/$REPO/releases/latest/download/sentryusb-tesla-telemetry-$sfx" -o "$STASH/sentryusb-tesla-telemetry" 2>/dev/null || true
+        curl -fsSL "https://github.com/$REPO/releases/latest/download/sentryusb-ble-action-$sfx" -o "$STASH/sentryusb-ble-action" 2>/dev/null || true
         VARIANT_PATHS+=("$STASH/sentryusb")
         [ -s "$STASH/sentryusb-tesla-telemetry" ] && TELEMETRY_PATHS+=("$STASH/sentryusb-tesla-telemetry") || TELEMETRY_PATHS+=("")
+        [ -s "$STASH/sentryusb-ble-action" ] && BLE_ACTION_PATHS+=("$STASH/sentryusb-ble-action") || BLE_ACTION_PATHS+=("")
     done
     ok "Downloaded ${#SUFFIXES[@]} variant(s)"
 fi
@@ -210,8 +218,10 @@ for i in "${!SUFFIXES[@]}"; do
     info "  → staged sentryusb-${sfx}"
 done
 
-# Telemetry sampler: one binary per variant when available. For local-
-# binary mode (no per-variant telemetry binary exists) the loop is skipped.
+# Telemetry sampler + BLE action CLI: one binary per variant when
+# available. For local-binary mode (no per-variant aux binaries exist)
+# the loops are skipped and 00-run.sh falls back to per-variant release
+# downloads.
 if [ "${#TELEMETRY_PATHS[@]}" -gt 0 ]; then
     for i in "${!SUFFIXES[@]}"; do
         sfx="${SUFFIXES[$i]}"
@@ -219,6 +229,16 @@ if [ "${#TELEMETRY_PATHS[@]}" -gt 0 ]; then
         if [ -n "$src" ] && [ -f "$src" ]; then
             cp "$src" "$STAGE_FILES/sentryusb-tesla-telemetry-${sfx}"
             chmod +x "$STAGE_FILES/sentryusb-tesla-telemetry-${sfx}"
+        fi
+    done
+fi
+if [ "${#BLE_ACTION_PATHS[@]}" -gt 0 ]; then
+    for i in "${!SUFFIXES[@]}"; do
+        sfx="${SUFFIXES[$i]}"
+        src="${BLE_ACTION_PATHS[$i]:-}"
+        if [ -n "$src" ] && [ -f "$src" ]; then
+            cp "$src" "$STAGE_FILES/sentryusb-ble-action-${sfx}"
+            chmod +x "$STAGE_FILES/sentryusb-ble-action-${sfx}"
         fi
     done
 fi
