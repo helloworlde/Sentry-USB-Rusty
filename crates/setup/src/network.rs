@@ -198,9 +198,11 @@ async fn nm_write_ap_file(
          [ipv6]\n\
          method=disabled\n"
     );
-    std::fs::write(file, contents)?;
-    // NM's keyfile plugin enforces 0600 on connection files; enforce it too.
-    let _ = sentryusb_shell::run("chmod", &["0600", file]).await;
+    // Created 0600 from the start (no world-readable window for the
+    // PSK). NM's keyfile plugin REFUSES to load connection files with
+    // looser perms, so getting this wrong doesn't just leak — it
+    // silently breaks the AP profile.
+    write_secret_file(file, &contents)?;
 
     let _ = sentryusb_shell::run("nmcli", &["con", "reload"]).await;
 
@@ -255,9 +257,10 @@ async fn configure_hostapd_path(
     )?;
 
     let _ = std::fs::create_dir_all("/etc/hostapd");
-    std::fs::write(
+    // 0600 — the file carries the WPA passphrase.
+    write_secret_file(
         "/etc/hostapd/hostapd.conf",
-        format!(
+        &format!(
             "ctrl_interface=/var/run/hostapd\n\
              ctrl_interface_group=0\n\
              interface=ap0\n\
@@ -350,10 +353,12 @@ async fn configure_hostapd_path(
         std::fs::write("/etc/hosts", new + "\n")?;
     }
 
-    // Tag the wpa_supplicant block with the id_str the ifupdown config
-    // maps to AP1.
+    // Tag the wpa_supplicant network block(s) with the id_str the
+    // ifupdown config maps to AP1. Only `network={...}` blocks are
+    // touched — a bare `.replace("}")` would also stamp cred / p2p
+    // blocks and anything else with a closing brace.
     if let Ok(conf) = std::fs::read_to_string("/etc/wpa_supplicant/wpa_supplicant.conf") {
-        let new = conf.replace("}", "  id_str=\"AP1\"\n}");
+        let new = tag_network_blocks_with_id_str(&conf, "AP1");
         std::fs::write("/etc/wpa_supplicant/wpa_supplicant.conf", new)?;
     }
 
@@ -361,7 +366,63 @@ async fn configure_hostapd_path(
     Ok(())
 }
 
+/// Insert `id_str="<id>"` as the last entry of every `network={...}`
+/// block. Other block types (`cred={`, `p2p_...`) and stray braces are
+/// left untouched. Blocks that already carry an id_str are skipped, so
+/// the transform is idempotent.
+fn tag_network_blocks_with_id_str(conf: &str, id: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_network = false;
+    let mut block_has_id_str = false;
+    for line in conf.lines() {
+        let trimmed = line.trim();
+        if !in_network && trimmed.starts_with("network={") {
+            in_network = true;
+            block_has_id_str = false;
+        } else if in_network && trimmed.starts_with("id_str=") {
+            block_has_id_str = true;
+        } else if in_network && trimmed == "}" {
+            if !block_has_id_str {
+                out.push(format!("  id_str=\"{id}\""));
+            }
+            in_network = false;
+        }
+        out.push(line.to_string());
+    }
+    let mut result = out.join("\n");
+    if conf.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// Write a root-only (0600) file containing secrets (WiFi PSKs). The
+/// mode is applied at create time so there's no world-readable window;
+/// `set_permissions` afterwards covers the pre-existing-file case,
+/// where the open-time mode doesn't apply.
+fn write_secret_file(path: &str, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path))?;
+    f.write_all(contents.as_bytes())
+        .with_context(|| format!("writing {}", path))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {}", path))?;
+    Ok(())
+}
+
 /// Find the primary WiFi client device from NetworkManager.
+///
+/// Prefers the device backing an *active* WiFi connection (the right
+/// answer when several wifi interfaces exist), but falls back to any
+/// managed wifi device — a Pi being set up over Ethernet with WiFi
+/// configured-but-disconnected would otherwise fail AP setup entirely.
 async fn find_wifi_device() -> Result<String> {
     for _ in 0..5 {
         let output = sentryusb_shell::run(
@@ -373,6 +434,20 @@ async fn find_wifi_device() -> Result<String> {
         ).await.unwrap_or_default();
         let wlan = output.trim().to_string();
         if !wlan.is_empty() {
+            return Ok(wlan);
+        }
+        // No active wifi connection — fall back to the device list.
+        // `:wifi$` excludes wifi-p2p entries; ap0 is our own AP iface.
+        let output = sentryusb_shell::run(
+            "bash",
+            &[
+                "-c",
+                "nmcli -t -f DEVICE,TYPE device status | grep ':wifi$' | grep -v '^ap0:' | cut -d: -f1 | head -n1",
+            ],
+        ).await.unwrap_or_default();
+        let wlan = output.trim().to_string();
+        if !wlan.is_empty() {
+            info!("No active WiFi connection; using wifi device {} from device list", wlan);
             return Ok(wlan);
         }
         info!("Waiting for WiFi interface...");
@@ -427,4 +502,53 @@ fn append_unless_contains(path: &str, needle: &str, text: &str) -> Result<()> {
     new.push_str(text);
     std::fs::write(path, new)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tags_single_network_block() {
+        let conf = "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n\
+                    update_config=1\n\
+                    \n\
+                    network={\n\
+                    \tssid=\"home\"\n\
+                    \tpsk=\"hunter22\"\n\
+                    }\n";
+        let tagged = tag_network_blocks_with_id_str(conf, "AP1");
+        assert!(tagged.contains("  id_str=\"AP1\"\n}"));
+        assert_eq!(tagged.matches("id_str").count(), 1);
+        // Header lines untouched.
+        assert!(tagged.starts_with("ctrl_interface="));
+    }
+
+    #[test]
+    fn tags_every_network_block_but_not_cred_blocks() {
+        let conf = "network={\n\
+                    \tssid=\"home\"\n\
+                    }\n\
+                    cred={\n\
+                    \tdomain=\"example.org\"\n\
+                    }\n\
+                    network={\n\
+                    \tssid=\"work\"\n\
+                    }\n";
+        let tagged = tag_network_blocks_with_id_str(conf, "AP1");
+        assert_eq!(tagged.matches("id_str=\"AP1\"").count(), 2);
+        // The cred block's closing brace must NOT have been tagged: the
+        // id_str line directly precedes only network-block braces.
+        assert!(!tagged.contains("domain=\"example.org\"\n  id_str"));
+    }
+
+    #[test]
+    fn skips_blocks_that_already_have_id_str() {
+        let conf = "network={\n\
+                    \tssid=\"home\"\n\
+                    \tid_str=\"AP1\"\n\
+                    }\n";
+        let tagged = tag_network_blocks_with_id_str(conf, "AP1");
+        assert_eq!(tagged.matches("id_str").count(), 1, "idempotent");
+    }
 }
