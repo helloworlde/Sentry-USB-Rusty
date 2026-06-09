@@ -44,11 +44,26 @@ jobs:
         #   * a72 → Pi 4, Radxa ROCK 4C+ perf cluster (Cortex-A72)
         #   * a53 → Pi 3, Pi Zero 2 W, Allwinner H618 boards (Cortex-A53)
         # The cpu field is consumed via the RUSTFLAGS env in the build step.
+        # cpu_features: LLVM's cortex-a53/a72/a76 CPU definitions all
+        # assume the OPTIONAL ARMv8 Cryptographic Extension (+aes,+sha2)
+        # — but Broadcom never licensed it: BCM2710 (Pi 3 / Zero 2 W,
+        # A53) and BCM2711 (Pi 4, A72) have no crypto instructions.
+        # RustCrypto's sha1/sha2/aes skip runtime CPU detection when the
+        # feature is enabled at compile time, so a build with crypto
+        # baked in executes SHA/AES instructions unconditionally and
+        # dies with SIGILL on those boards the moment the BLE stack
+        # hashes the VIN (issue #88 — the real root cause; the binaries
+        # were illegal on the very CPUs they were tuned for). Strip the
+        # crypto features from a53/a72; software SHA/AES is microseconds
+        # at our message sizes. a76 keeps crypto — the Pi 5's BCM2712
+        # does implement it (and the picker requires the `aes` hwcap
+        # before selecting a76).
         include:
           - name: ARM64 a53 (Pi 3 / Pi Zero 2 W / Allwinner H618)
             runs_on: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             cpu: cortex-a53
+            cpu_features: "-C target-feature=-aes,-sha2"
             linker: cc
             gcc: ""
             artifact_suffix: linux-arm64-a53
@@ -56,6 +71,7 @@ jobs:
             runs_on: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             cpu: cortex-a72
+            cpu_features: "-C target-feature=-aes,-sha2"
             linker: cc
             gcc: ""
             artifact_suffix: linux-arm64-a72
@@ -63,6 +79,7 @@ jobs:
             runs_on: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             cpu: cortex-a76
+            cpu_features: ""
             linker: cc
             gcc: ""
             artifact_suffix: linux-arm64-a76
@@ -70,6 +87,7 @@ jobs:
             runs_on: ubuntu-22.04
             target: armv7-unknown-linux-gnueabihf
             cpu: cortex-a7
+            cpu_features: ""
             linker: arm-linux-gnueabihf-gcc
             gcc: gcc-arm-linux-gnueabihf
             artifact_suffix: linux-armv7
@@ -231,7 +249,7 @@ jobs:
         # so the bulk of the link-time win still lands.
         run: |
           if [ -n "${{ matrix.cpu }}" ]; then
-              export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }}"
+              export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }} ${{ matrix.cpu_features }}"
           fi
           case "${{ matrix.target }}" in
             aarch64-*) BUILD_WRAPPER="mold -run" ;;
@@ -254,8 +272,9 @@ jobs:
         #
         # The a72 job ALSO uploads under the legacy unsuffixed name
         # (sentryusb-linux-arm64 etc.) so pre-multi-binary installs whose
-        # in-app updater still asks for the old URL keep working — they get
-        # the a72-tuned binary, which runs correctly on every aarch64 Pi.
+        # in-app updater still asks for the old URL keep working. With the
+        # crypto features stripped (see cpu_features above) the a72 build
+        # is plain ARMv8.0+crc and genuinely runs on every aarch64 Pi.
         # The user opts into per-CPU tuning by re-running install-pi.sh.
         run: |
           mkdir -p release
