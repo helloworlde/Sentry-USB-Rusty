@@ -15,6 +15,14 @@ permissions:
 jobs:
   cla:
     runs-on: ubuntu-latest
+    # contributor-assistant/github-action's latest release (v2.6.1) still
+    # runs on Node 20, which GitHub is deprecating (JS actions forced to
+    # Node 24 on 2026-06-16, Node 20 removed 2026-09-16). There's no newer
+    # release to bump to, so opt this job's JS actions into the Node 24
+    # runtime now — clears the deprecation warning and stays ahead of the
+    # forced cutover.
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: CLA Assistant
         # Run on PR events and on every issue comment, then let the action do
