@@ -66,6 +66,24 @@ pub fn parse_drive(payload: &[u8]) -> Result<DriveState> {
         .context("response missing drive_state")
 }
 
+/// Map a `DriveState`'s shift-state oneof to the single-letter token
+/// (`P`/`R`/`N`/`D`) that tesla-control's `state drive` JSON exposed.
+/// Returns `None` when the car didn't report a concrete gear — the
+/// field is absent, or an `Invalid`/`SNA` leaf (common on a
+/// parked-and-dozing car on older firmware). Callers treat `None` as
+/// "couldn't determine — car may be asleep", not a specific gear.
+pub fn shift_state_token(drive: &DriveState) -> Option<&'static str> {
+    use crate::proto::car_server::shift_state::Type;
+    match drive.shift_state.as_ref()?.r#type.as_ref()? {
+        Type::P(_) => Some("P"),
+        Type::R(_) => Some("R"),
+        Type::N(_) => Some("N"),
+        Type::D(_) => Some("D"),
+        // Invalid / SNA — no usable gear.
+        _ => None,
+    }
+}
+
 /// Decode a `state location` response.
 pub fn parse_location(payload: &[u8]) -> Result<LocationState> {
     parse_vehicle_data(payload)?

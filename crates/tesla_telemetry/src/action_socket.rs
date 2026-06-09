@@ -37,18 +37,24 @@
 //! shell:
 //! ```text
 //!   client → server : "<verb>\n"
-//!   server → client : "OK\n"  or  "ERR <message>\n"
+//!   server → client : "OK\n"  or  "OK <payload>\n"  or  "ERR <message>\n"
 //! ```
 //!
 //! Where `<verb>` is one of:
 //!   `wake`, `sentry-on`, `sentry-off`, `charge-port-open`,
-//!   `charge-port-close`, `session-info`.
+//!   `charge-port-close`, `keep-accessory-on`, `keep-accessory-off`,
+//!   `session-info`, `drive-state`.
 //!
-//! `session-info` is special: instead of a one-shot action it runs a
-//! pairing probe over the held connection and replies `OK` (paired),
-//! `ERR NOT_PAIRED` (car rejected our key), or `ERR UNREACHABLE: <why>`
-//! (couldn't reach the car). Handled in `main::handle_action_request`,
-//! not `parse_verb` (which only maps action verbs).
+//! Most verbs are fire-and-forget actions that reply `OK` / `ERR …`.
+//! Two are *query* verbs that return data over the same connection,
+//! handled in `main::handle_action_request` (not `parse_verb`, which
+//! only maps action verbs):
+//!   * `session-info` — pairing probe: `OK` (paired),
+//!     `ERR NOT_PAIRED` (car rejected our key), or
+//!     `ERR UNREACHABLE: <why>` (couldn't reach the car).
+//!   * `drive-state` — current gear: `OK P` / `OK R` / `OK N` / `OK D`,
+//!     or `ERR UNREACHABLE: <why>` when the car is asleep / unreachable
+//!     or reported no concrete gear.
 //!
 //! Socket lives at `/tmp/sentryusb-telemetry.sock` with mode 0600 —
 //! only root can connect (matches `sentryusb-ble-action`'s usual
@@ -72,10 +78,12 @@ pub const SOCKET_PATH: &str = "/tmp/sentryusb-telemetry.sock";
 
 /// One IPC request received from the socket. The `reply` oneshot is
 /// the daemon's main loop's way to send the per-action result back
-/// to the socket connection handler.
+/// to the socket connection handler. The `Ok` payload is the line
+/// written after `OK ` — empty for fire-and-forget actions, the gear
+/// token for `drive-state`, etc.
 pub struct ActionRequest {
     pub verb: String,
-    pub reply: oneshot::Sender<Result<()>>,
+    pub reply: oneshot::Sender<Result<String>>,
 }
 
 /// Spawn the socket listener. Cleans up any stale socket from a
@@ -193,8 +201,17 @@ async fn process(stream: UnixStream, action_tx: mpsc::Sender<ActionRequest>) -> 
     };
 
     match response {
-        Ok(()) => {
-            let _ = write_half.write_all(b"OK\n").await;
+        Ok(payload) => {
+            // Empty payload → bare "OK" (fire-and-forget actions and
+            // session-info "paired"). Non-empty → "OK <payload>" (e.g.
+            // drive-state's gear token). The payload is a single short
+            // token, so no newline-stripping needed.
+            let line = if payload.is_empty() {
+                "OK\n".to_string()
+            } else {
+                format!("OK {}\n", payload)
+            };
+            let _ = write_half.write_all(line.as_bytes()).await;
         }
         Err(e) => {
             // Compress the error to one line — protocol is

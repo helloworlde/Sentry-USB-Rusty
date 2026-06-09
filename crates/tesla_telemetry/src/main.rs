@@ -1349,19 +1349,24 @@ async fn handle_action_request(
     }
 
     // Resolve the verb before any BLE work (saves the radio handoff on
-    // a typo). "session-info" is the pairing probe — `None` here, then
-    // dispatched to check_pairing() below; every other verb must
-    // resolve to a typed ActionPayload.
-    let action = if verb == "session-info" {
-        None
-    } else {
-        match action_socket::parse_verb(&verb) {
-            Ok(a) => Some(a),
+    // a typo). The two query verbs (session-info, drive-state) reuse the
+    // held connection but return data rather than a fire-and-forget
+    // action; every other verb must resolve to a typed ActionPayload.
+    enum Dispatch {
+        SessionInfo,
+        DriveState,
+        Action(sentryusb_tesla_ble::actions::ActionPayload),
+    }
+    let dispatch = match verb.as_str() {
+        "session-info" => Dispatch::SessionInfo,
+        "drive-state" => Dispatch::DriveState,
+        _ => match action_socket::parse_verb(&verb) {
+            Ok(a) => Dispatch::Action(a),
             Err(e) => {
                 let _ = req.reply.send(Err(e));
                 return;
             }
-        }
+        },
     };
 
     // Lazy-spawn or reuse the PersistentSession on the configured
@@ -1407,13 +1412,13 @@ async fn handle_action_request(
         .session;
 
     let started = Instant::now();
-    let result = match action {
+    let result: Result<String> = match dispatch {
         // Pairing probe: reuse this session's held connection. Map the
         // tri-state onto the line protocol's OK/ERR contract —
         // Paired => "OK", NotPaired => "ERR NOT_PAIRED", Unreachable =>
         // "ERR UNREACHABLE: …". sentryusb-ble-action parses these tokens
         // and the API clears the paired marker only on NOT_PAIRED.
-        None => {
+        Dispatch::SessionInfo => {
             use sentryusb_tesla_ble::manager::PairingStatus;
             let status = session.check_pairing().await;
             info!(
@@ -1422,14 +1427,49 @@ async fn handle_action_request(
                 started.elapsed().as_millis()
             );
             match status {
-                PairingStatus::Paired => Ok(()),
+                PairingStatus::Paired => Ok(String::new()),
                 PairingStatus::NotPaired => Err(anyhow::anyhow!("NOT_PAIRED")),
                 PairingStatus::Unreachable(reason) => {
                     Err(anyhow::anyhow!("UNREACHABLE: {reason}"))
                 }
             }
         }
-        Some(action) => {
+        // Gear probe: read DriveState over the held connection and reply
+        // with the single-letter token (`OK P`/`OK R`/…). A reachable
+        // car that reports no concrete gear (Invalid/SNA — typically a
+        // parked-and-dozing car) maps to UNREACHABLE so the caller
+        // retries rather than treating it as a definite gear.
+        Dispatch::DriveState => {
+            let drive = session.get_drive().await;
+            let elapsed_ms = started.elapsed().as_millis();
+            match drive {
+                Ok(drive) => {
+                    match sentryusb_tesla_ble::responses::shift_state_token(&drive) {
+                        Some(tok) => {
+                            info!("action_socket: verb=drive-state -> {} ({}ms)", tok, elapsed_ms);
+                            Ok(tok.to_string())
+                        }
+                        None => {
+                            info!(
+                                "action_socket: verb=drive-state -> no gear reported ({}ms)",
+                                elapsed_ms
+                            );
+                            Err(anyhow::anyhow!(
+                                "UNREACHABLE: car reported no gear (may be asleep)"
+                            ))
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "action_socket: verb=drive-state failed after {}ms: {:#}",
+                        elapsed_ms, e
+                    );
+                    Err(anyhow::anyhow!("UNREACHABLE: {e:#}"))
+                }
+            }
+        }
+        Dispatch::Action(action) => {
             let result = session.send_action(action).await;
             let elapsed_ms = started.elapsed().as_millis();
             match &result {
@@ -1444,7 +1484,7 @@ async fn handle_action_request(
                     verb, elapsed_ms, e
                 ),
             }
-            result.map(|_| ())
+            result.map(|_| String::new())
         }
     };
     let _ = req.reply.send(result);

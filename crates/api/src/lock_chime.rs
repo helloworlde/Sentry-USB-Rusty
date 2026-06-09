@@ -661,68 +661,37 @@ async fn query_ble_shift_state() -> Result<String, String> {
         return Err("BLE private key missing at /root/.ble/key_private.pem".into());
     }
 
-    // Stop BLE GATT daemon for exclusive hci0 access
-    let _ = sentryusb_shell::run_with_timeout(
-        Duration::from_secs(5),
-        "systemctl",
-        &["stop", "sentryusb-ble"],
+    // Read the gear via sentryusb-ble-action, which routes through the
+    // telemetry daemon's warm session (IPC) when available and falls
+    // back to a one-shot direct BLE connection otherwise. It prints one
+    // gear token on success — P / R / N / D — and exits non-zero (car
+    // asleep, out of range, key not paired, no concrete gear) otherwise.
+    // No need to stop the GATT daemon ourselves any more: the binary and
+    // daemon coordinate the radio lock internally — the old tesla-control
+    // path had to monopolise hci0, which is why it stopped sentryusb-ble.
+    //
+    // 65s outer budget sits just above the daemon's 60s per-request
+    // timeout so a slow-but-valid query (cold link to a dozing car) isn't
+    // cut short, while still bounding the rare wedged-daemon case (the
+    // binary's own 90s IPC read is the backstop there).
+    let out = sentryusb_shell::run_with_timeout(
+        Duration::from_secs(65),
+        "/root/bin/sentryusb-ble-action",
+        &["drive-state"],
     )
-    .await;
+    .await
+    .map_err(|e| {
+        let err_msg = e.to_string();
+        info!("lockchime: BLE drive state query failed: {}", err_msg);
+        format!("BLE drive state query failed: {}", err_msg)
+    })?;
 
-    let vin_upper = vin.to_uppercase();
-    let result = sentryusb_shell::run_with_timeout(
-        Duration::from_secs(15),
-        "/root/bin/tesla-control",
-        &[
-            "-ble",
-            "-vin",
-            &vin_upper,
-            "-key-file",
-            "/root/.ble/key_private.pem",
-            "state",
-            "drive",
-        ],
-    )
-    .await;
-
-    // Always restart BLE daemon
-    let _ = sentryusb_shell::run_with_timeout(
-        Duration::from_secs(5),
-        "systemctl",
-        &["start", "sentryusb-ble"],
-    )
-    .await;
-
-    let out = match result {
-        Ok(o) => o,
-        Err(e) => {
-            let err_msg = e.to_string();
-            info!("lockchime: BLE drive state query failed: {}", err_msg);
-            return Err(format!("tesla-control failed: {}", err_msg));
-        }
-    };
-
-    // Parse JSON: {"driveState":{"shiftState":{"p":{}},...}}
-    let parsed: serde_json::Value =
-        serde_json::from_str(&out).map_err(|e| {
-            info!("lockchime: failed to parse drive state JSON: {}\nRaw output: {}", e, out);
-            format!("unexpected response from tesla-control -- raw: {}", out.trim())
-        })?;
-
-    let shift_state = &parsed["driveState"]["shiftState"];
-    if shift_state.is_null() || (shift_state.is_object() && shift_state.as_object().unwrap().is_empty()) {
+    let state = out.trim().to_uppercase();
+    if state.is_empty() {
         return Err("vehicle returned empty drive state -- car may be asleep".into());
     }
-
-    if let Some(obj) = shift_state.as_object() {
-        for key in obj.keys() {
-            let state = key.to_uppercase();
-            info!("lockchime: vehicle shift state: {}", state);
-            return Ok(state);
-        }
-    }
-
-    Err("shiftState was empty in response".into())
+    info!("lockchime: vehicle shift state: {}", state);
+    Ok(state)
 }
 
 // ---------------------------------------------------------------------------
