@@ -3,6 +3,12 @@ name: Build & Release
 on:
   push:
     tags: ['v*']
+  # Compile-test pull requests (e.g. Dependabot bumps) so a breaking
+  # dependency update is caught in review instead of at the next release.
+  # Only the `test` job runs here — see its `if` guard on `build`. The
+  # release job is tag-gated, so PRs never publish a release.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -11,6 +17,10 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.name }}
+    # PRs only need the `test` job (which compiles the whole workspace on
+    # the host) to catch breakage — skip the four expensive ARM cross-builds
+    # here. The full build matrix + release run on version tags only.
+    if: github.event_name != 'pull_request'
     # Pin to 22.04 (glibc 2.35). `ubuntu-latest` now points at 24.04
     # (glibc 2.39) and Pi OS Bookworm only ships glibc 2.36 — anything
     # built on 24.04 fails on every Pi with:
