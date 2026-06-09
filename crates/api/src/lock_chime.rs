@@ -192,7 +192,14 @@ async fn copy_lock_chime_to_cam_mount() -> Result<(), String> {
         .map_err(|e| format!("mount cam disk: {}", e))?;
 
     let cam_target = PathBuf::from(CAM_MOUNT_POINT).join("LockChime.wav");
-    let write_err = write_chime_file_atomic(cam_target.to_str().unwrap_or(""), &data);
+    // write_chime_file_atomic ends in a full-system `sync` — seconds on
+    // a busy SD card — so keep it off the async workers.
+    let data_len = data.len();
+    let write_err = tokio::task::spawn_blocking(move || {
+        write_chime_file_atomic(cam_target.to_str().unwrap_or(""), &data)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("write task panicked: {e}")));
 
     if let Err(e) = sentryusb_shell::run_with_timeout(Duration::from_secs(10), "umount", &[CAM_MOUNT_POINT]).await {
         info!("lockchime: umount cam disk failed: {}", e);
@@ -202,7 +209,7 @@ async fn copy_lock_chime_to_cam_mount() -> Result<(), String> {
         return Err(format!("write LockChime.wav to cam disk: {}", e));
     }
 
-    info!("lockchime: synced LockChime.wav to cam disk ({} bytes)", data.len());
+    info!("lockchime: synced LockChime.wav to cam disk ({} bytes)", data_len);
     Ok(())
 }
 
@@ -263,7 +270,9 @@ async fn clear_lock_chime_from_cam_disk() -> Result<(), String> {
 
     let cam_target = PathBuf::from(CAM_MOUNT_POINT).join("LockChime.wav");
     let _ = std::fs::remove_file(&cam_target);
-    let _ = std::process::Command::new("sync").status();
+    // Async `sync` — the blocking std variant stalls a runtime worker
+    // for however long the kernel takes to flush every filesystem.
+    let _ = sentryusb_shell::run_with_timeout(Duration::from_secs(60), "sync", &[]).await;
 
     if let Err(e) =
         sentryusb_shell::run_with_timeout(Duration::from_secs(10), "umount", &[CAM_MOUNT_POINT]).await
@@ -798,7 +807,11 @@ async fn lock_chime_scheduler_loop() {
                 }
             }
 
-            let chosen = pick_and_activate_random();
+            // pick_and_activate_random ends in a full-system `sync`;
+            // run it off the async workers.
+            let chosen = tokio::task::spawn_blocking(pick_and_activate_random)
+                .await
+                .unwrap_or_default();
             if !chosen.is_empty() {
                 lock_chime_log(&format!("{} mode -- changed lock chime to {:?}", cfg.mode, chosen));
                 match sync_lock_chime_to_cam_disk().await {
@@ -1017,7 +1030,13 @@ pub async fn activate(
         }
     };
 
-    if let Err(_) = write_chime_file_atomic(LOCK_CHIME_TARGET, &data) {
+    let write_ok = tokio::task::spawn_blocking(move || {
+        write_chime_file_atomic(LOCK_CHIME_TARGET, &data)
+    })
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    if !write_ok {
         return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to activate lock sound");
     }
 
@@ -1050,7 +1069,7 @@ pub async fn clear_active(
         }
     }
     let _ = std::fs::remove_file(LOCK_CHIME_ACTIVE_FILE);
-    let _ = std::process::Command::new("sync").status();
+    let _ = sentryusb_shell::run_with_timeout(Duration::from_secs(60), "sync", &[]).await;
 
     // Clear from cam disk in background
     tokio::spawn(async {
@@ -1094,7 +1113,7 @@ pub async fn delete_chime(
         if data.trim() == filename {
             let _ = std::fs::remove_file(LOCK_CHIME_TARGET);
             let _ = std::fs::remove_file(LOCK_CHIME_ACTIVE_FILE);
-            let _ = std::process::Command::new("sync").status();
+            let _ = sentryusb_shell::run_with_timeout(Duration::from_secs(60), "sync", &[]).await;
             tokio::spawn(async {
                 if let Err(e) = clear_lock_chime_from_cam_disk().await {
                     info!("lockchime: cam disk clear after delete failed: {}", e);
@@ -1194,7 +1213,10 @@ pub async fn save_random_config(
 pub async fn randomize(
     State(_s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let chosen = pick_and_activate_random();
+    // Ends in a full-system `sync`; keep it off the async workers.
+    let chosen = tokio::task::spawn_blocking(pick_and_activate_random)
+        .await
+        .unwrap_or_default();
     if chosen.is_empty() {
         return crate::json_error(StatusCode::BAD_REQUEST, "No sounds in library to randomize");
     }
@@ -1237,7 +1259,10 @@ pub async fn randomize_on_connect(
         );
     }
 
-    let chosen = pick_and_activate_random();
+    // Ends in a full-system `sync`; keep it off the async workers.
+    let chosen = tokio::task::spawn_blocking(pick_and_activate_random)
+        .await
+        .unwrap_or_default();
     if chosen.is_empty() {
         return crate::json_error(StatusCode::BAD_REQUEST, "No sounds in library to randomize");
     }
