@@ -36,9 +36,11 @@ pub fn try_unframe(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
 }
 
 /// Split `frame` into MTU-sized GATT writes. ATT overhead is 3 bytes,
-/// so the chunk payload is `mtu - 3` bytes max.
+/// so the chunk payload is `mtu - 3` bytes max. Clamped to [20, 512]:
+/// 20 is the BLE 4.0 floor, 512 the ATT maximum attribute value length
+/// (a 517+ MTU still can't carry more per write).
 pub fn chunks_for_mtu(frame: &[u8], mtu: usize) -> Vec<&[u8]> {
-    let chunk_size = mtu.saturating_sub(3).max(20);
+    let chunk_size = mtu.saturating_sub(3).clamp(20, 512);
     frame.chunks(chunk_size).collect()
 }
 

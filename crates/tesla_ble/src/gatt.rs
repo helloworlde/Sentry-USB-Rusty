@@ -21,6 +21,11 @@ use crate::uuids;
 /// slot.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// The BLE 4.0 default ATT_MTU every stack accepts. Used as the TX
+/// chunking basis whenever the negotiated MTU can't be read from bluez
+/// (old bluez without the property, non-Linux dev host, busctl missing).
+const ATT_DEFAULT_MTU: usize = 23;
+
 /// Wire prefix of a RoutableMessage with `to_destination =
 /// Domain(BROADCAST=0)`:
 ///   0x32 = to_destination, length-delimited (field 6)
@@ -47,6 +52,12 @@ pub struct Connection {
     /// `take_framing_desync_recoveries()`. Lives on Connection so it
     /// captures recoveries even on a query that later times out.
     framing_desync_recoveries: u32,
+    /// ATT MTU bluez negotiated for this connection (read from the
+    /// GattCharacteristic1 `MTU` D-Bus property at open), or
+    /// `ATT_DEFAULT_MTU` when it couldn't be read. Drives the TX chunk
+    /// size: MTU 247 sends a typical signed envelope in one write
+    /// instead of nine — measured ~920ms → ~400ms per query.
+    att_mtu: usize,
 }
 
 impl Connection {
@@ -55,6 +66,9 @@ impl Connection {
     /// subscribe to notifications.
     pub async fn open(peripheral: Peripheral) -> Result<Self> {
         info!("connecting to vehicle GATT");
+        // Peer MAC for the bluez D-Bus object path — needed after
+        // connect to look up the negotiated ATT MTU.
+        let peer_mac = peripheral.address().to_string();
         // Wrap connect() in our own timeout — see CONNECT_TIMEOUT.
         let started = std::time::Instant::now();
         match timeout(CONNECT_TIMEOUT, peripheral.connect()).await {
@@ -114,7 +128,28 @@ impl Connection {
             rx_stream,
             rx_buffer: Vec::with_capacity(512),
             framing_desync_recoveries: 0,
+            att_mtu: ATT_DEFAULT_MTU,
         };
+
+        // Use the ATT MTU bluez actually negotiated, when it can tell
+        // us. Only values above the floor are trusted; everything else
+        // keeps the universally-safe 20-byte chunks.
+        match query_negotiated_att_mtu(&peer_mac).await {
+            Some(mtu) if mtu > ATT_DEFAULT_MTU => {
+                info!(
+                    "negotiated ATT MTU {} — TX in {}-byte chunks",
+                    mtu,
+                    mtu.saturating_sub(3).clamp(20, 512)
+                );
+                conn.att_mtu = mtu;
+            }
+            _ => {
+                info!(
+                    "negotiated ATT MTU unavailable from bluez — \
+                     falling back to 20-byte TX chunks"
+                );
+            }
+        }
 
         // Post-subscribe settle: bluez can emit a subscribe-complete
         // notification 50-200ms after subscribe() returns. Drain it, or
@@ -201,16 +236,18 @@ impl Connection {
         self.drain_until_quiet(Duration::from_millis(100)).await;
 
         let framed = frame(payload);
-        // Chunk at the BLE default ATT_MTU (23) = 20-byte payload after
-        // the 3-byte ATT header. btleplug 0.11.x exposes no MTU-exchange
-        // API and no way to read the negotiated MTU, so we can't assume
-        // a larger one: on stacks that didn't auto-negotiate up, writes
-        // above ~20 bytes are rejected with "Failed to initiate write".
-        // 20-byte chunks cost a few extra ATT writes per query but are
-        // universally accepted. (tesla-control's go-ble falls back to
-        // the same 20 when its MTU exchange fails.)
-        const ATT_DEFAULT_PAYLOAD: usize = 23;
-        let chunks = chunks_for_mtu(&framed, ATT_DEFAULT_PAYLOAD);
+        // Chunk at the ATT MTU bluez negotiated for this connection
+        // (read from D-Bus at open — btleplug exposes no MTU API). The
+        // car negotiates 247, so a typical signed envelope goes out in
+        // one ATT write instead of nine 20-byte ones; with WithResponse
+        // ACKs at ~50ms each that halves measured query latency. When
+        // the negotiated value couldn't be read, `att_mtu` stays at the
+        // BLE 4.0 default 23 → 20-byte chunks, which every stack
+        // accepts (tesla-control's go-ble falls back to the same 20
+        // when its MTU exchange fails). We never exceed what bluez
+        // itself negotiated, so "write too large" rejections can't
+        // happen — bluez enforces the negotiated MTU locally.
+        let chunks = chunks_for_mtu(&framed, self.att_mtu);
         debug!(
             "TX framed ({} bytes in {} chunk(s)): {}",
             framed.len(),
@@ -363,6 +400,71 @@ impl Connection {
     pub fn take_framing_desync_recoveries(&mut self) -> u32 {
         std::mem::take(&mut self.framing_desync_recoveries)
     }
+}
+
+/// Run one `busctl` invocation, bounded to 3s so a hung D-Bus can't
+/// stall the connect path. Returns stdout on success, None otherwise.
+async fn busctl(args: &[&str]) -> Option<String> {
+    use tokio::process::Command;
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        Command::new("busctl").args(args).output(),
+    )
+    .await;
+    match result {
+        Ok(Ok(o)) if o.status.success() => {
+            Some(String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Read the ATT MTU bluez negotiated for the connection to `peer_mac`,
+/// via the `MTU` property bluez ≥5.62 exposes on GattCharacteristic1
+/// D-Bus objects. btleplug has no MTU API, so this is the only window
+/// into the negotiated value.
+///
+/// `busctl tree` lists the device's characteristic object paths; the
+/// MTU is an ATT connection property, so bluez reports the same value
+/// on every characteristic — the first one that answers wins. (Not
+/// `GetManagedObjects` — busctl's JSON serializer rejects bluez's
+/// reply with "Failed to create new json object".)
+///
+/// Returns `None` on any failure — busctl missing (non-Linux dev
+/// host), old bluez without the property, parse mismatch — and the
+/// caller stays on the universally-safe default.
+async fn query_negotiated_att_mtu(peer_mac: &str) -> Option<usize> {
+    // /org/bluez/hciX/dev_58_D1_5A_44_90_FC/serviceNNNN/charNNNN
+    let dev_fragment = format!("/dev_{}/", peer_mac.replace(':', "_").to_uppercase());
+
+    let tree = busctl(&["tree", "--list", "org.bluez"]).await?;
+    for path in tree.lines().map(str::trim).filter(|p| {
+        p.contains(&dev_fragment)
+            && p.rsplit('/')
+                .next()
+                .is_some_and(|seg| seg.starts_with("char"))
+    }) {
+        let Some(prop) = busctl(&[
+            "get-property",
+            "org.bluez",
+            path,
+            "org.bluez.GattCharacteristic1",
+            "MTU",
+        ])
+        .await
+        else {
+            continue;
+        };
+        // Output shape: `q 247`
+        if let Some(v) = prop
+            .trim()
+            .strip_prefix("q ")
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            return Some(v);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
