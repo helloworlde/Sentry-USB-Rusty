@@ -780,14 +780,18 @@ function archive_teslacam_clips () {
   prunefile "${sentrylist}" "${sentrylist_archived}"
 
   # ${sentrylist} is now a list of files that haven't been archived yet.
-  # Remove short recordings from this list. This requires following the
-  # links and looking at the files themselves.
+  # Remove short recordings (.mp4 under 100000 bytes) from this list.
+  # This requires following the links and looking at the files
+  # themselves. One batched `stat -L` does the whole list; the previous
+  # xargs|echo|eval pipeline re-parsed file paths as shell text, so a
+  # clip name with spaces broke the filter and shell metacharacters in
+  # a crafted filename on the cam volume would have been EXECUTED.
+  # `-d '\n'` keeps each line one path; broken symlinks just drop out
+  # (stat errors to /dev/null), matching the old find -L behavior.
   if [ -s "${sentrylist}" ]
   then
-    (cd "$overlaymerged"; xargs -a "${sentrylist}" echo "find -L" | while read -r line
-        do
-          eval "$line \( -name \*.mp4 -a -size -100000c -printf '%p\n' \)"
-        done) > ${ignorelist}
+    (cd "$overlaymerged"; xargs -a "${sentrylist}" -d '\n' stat -L --format='%s %n' 2>/dev/null) \
+      | awk '$1 < 100000 { sub(/^[0-9]+ /, ""); if (/\.mp4$/) print }' > "${ignorelist}"
   else
     true > "${ignorelist}"
   fi
