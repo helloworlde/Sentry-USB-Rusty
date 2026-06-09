@@ -57,6 +57,26 @@ BLE_LOCK_LEGACY="/tmp/ble_keep_awake_active"
 # writes "telemetry"; the owner check below distinguishes the two.
 BLE_LOCK_OWNER="keep_awake"
 
+# Mirror of awake_start's ble_is_enabled(): read BLE_KEEP_AWAKE_ENABLED
+# fresh from /root/sentryusb.conf rather than the inherited env, so a
+# mid-session toggle in the web UI is honored without an archiveloop
+# restart. Gates the BLE sentry-off below so disabling BLE keep-awake
+# means no BLE traffic on stop either — symmetric with the sentry-on
+# path in awake_start.
+ble_is_enabled() {
+  local current=""
+  if [ -f /root/sentryusb.conf ]; then
+    current=$(grep -E '^[[:space:]]*export[[:space:]]+BLE_KEEP_AWAKE_ENABLED=' \
+      /root/sentryusb.conf 2>/dev/null \
+      | tail -n1 \
+      | sed -E "s/^[[:space:]]*export[[:space:]]+BLE_KEEP_AWAKE_ENABLED=//; s/^['\"]//; s/['\"]$//")
+  fi
+  case "$current" in
+    yes|true|1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 ble_restore_gatt_daemon() {
   local have_lock=0
   # Only count the lock as ours if keep_awake wrote it. On the multi-role
@@ -270,11 +290,13 @@ case "${SENTRY_CASE}" in
         break
       done
 
-    elif [[ -n "${TESLA_BLE_VIN:+x}" ]]
+    elif [[ -n "${TESLA_BLE_VIN:+x}" ]] && ble_is_enabled
     then
-      # Use Tesla BLE API to disable Sentry Mode.
-      # GATT daemon is already disabled (lock held by awake_start) — call directly.
-      if /root/bin/tesla-control -ble -key-file /root/.ble/key_private.pem -vin "${TESLA_BLE_VIN^^}" sentry-mode off
+      # Use Tesla BLE API to disable Sentry Mode. In-process bluez-based
+      # BLE via sentryusb-ble-action (see crates/tesla_ble): prefers the
+      # telemetry daemon's warm IPC session, falls back to a direct
+      # connection. Mirrors the sentry-on call in awake_start.
+      if /root/bin/sentryusb-ble-action sentry-off
       then
         log "Tesla BLE: Sentry Mode disabled [$(nudge_label)]."
       else
