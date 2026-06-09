@@ -777,16 +777,17 @@ fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
 pub async fn list_charging(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let result = state
-        .drives
-        .store
-        .with_locked_conn(|conn| load_charge_rows(conn, 0, None));
-
-    match result {
-        Ok(rows) => {
+    // Whole-table scan + per-session grouping/summarizing + a prefs-file
+    // read (RateConfig::load) — all blocking + CPU, so run it on the
+    // blocking pool instead of stalling an async worker on the Pi's two
+    // cores. Mirrors the spawn_blocking pattern in drives_handler.rs.
+    let store = state.drives.store.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ChargeSessionSummary>> {
+            let rows = store.with_locked_conn(|conn| load_charge_rows(conn, 0, None))?;
             let rates = RateConfig::load();
-            let tag_map = state.drives.store.get_all_charge_tags().unwrap_or_default();
-            let cost_map = state.drives.store.get_all_charge_costs().unwrap_or_default();
+            let tag_map = store.get_all_charge_tags().unwrap_or_default();
+            let cost_map = store.get_all_charge_costs().unwrap_or_default();
             let mut sessions: Vec<ChargeSessionSummary> = group_sessions(rows)
                 .iter()
                 .map(|s| {
@@ -799,12 +800,19 @@ pub async fn list_charging(
                 })
                 .collect();
             sessions.sort_by(|a, b| b.id.cmp(&a.id));
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "sessions": sessions })),
-            )
+            Ok(sessions)
+        })
+        .await;
+
+    match result {
+        Ok(Ok(sessions)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "sessions": sessions })),
+        ),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging task: {}", e))
         }
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
@@ -818,75 +826,77 @@ pub async fn single_charging(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Bound the scan so a session that never closes can't read the whole
-    // table. One plug-in can't plausibly exceed this; the gap split ends
-    // the session well before the bound in practice.
-    let window_end = id + 7 * 24 * 60 * 60;
-    let result = state
-        .drives
-        .store
-        .with_locked_conn(|conn| load_charge_rows(conn, id, Some(window_end)));
+    // Bounded scan + grouping/summarizing + two more locked-conn lookups
+    // + a prefs-file read — keep the whole thing off the async reactor.
+    let store = state.drives.store.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
+            // Bound the scan so a session that never closes can't read the
+            // whole table. One plug-in can't plausibly exceed this; the gap
+            // split ends the session well before the bound in practice.
+            let window_end = id + 7 * 24 * 60 * 60;
+            let rows =
+                store.with_locked_conn(|conn| load_charge_rows(conn, id, Some(window_end)))?;
 
-    let rows = match result {
-        Ok(rows) => rows,
-        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
+            let session = match group_sessions(rows).into_iter().next() {
+                Some(s) => s,
+                None => return Ok(None),
+            };
 
-    let session = match group_sessions(rows).into_iter().next() {
-        Some(s) => s,
-        None => return crate::json_error(StatusCode::NOT_FOUND, "charge session not found"),
-    };
+            let mut summary = summarize(&session);
+            let tags = store.get_charge_tags(summary.id).unwrap_or_default();
+            let override_cost = store.get_charge_cost(summary.id).unwrap_or_default();
+            apply_rates(&mut summary, &session, tags, &RateConfig::load());
+            apply_cost_override(&mut summary, override_cost);
 
-    let mut summary = summarize(&session);
-    let tags = state
-        .drives
-        .store
-        .get_charge_tags(summary.id)
-        .unwrap_or_default();
-    let override_cost = state
-        .drives
-        .store
-        .get_charge_cost(summary.id)
-        .unwrap_or_default();
-    apply_rates(&mut summary, &session, tags, &RateConfig::load());
-    apply_cost_override(&mut summary, override_cost);
+            let points: Vec<ChargePoint> = session
+                .iter()
+                .map(|r| ChargePoint {
+                    ts: r.ts * 1000,
+                    power_kw: r.power_kw,
+                    // DC fast charging reports 0 A (onboard charger bypassed);
+                    // show the derived P÷V current so the amperage curve is
+                    // meaningful.
+                    current_a: display_current_a(r.power_kw, r.voltage_v, r.current_a),
+                    voltage_v: r.voltage_v,
+                    rate_mph: r.rate_mph,
+                    soc: r.battery_pct,
+                    range_mi: r.range_mi,
+                    energy_added_kwh: r.energy_added_kwh,
+                })
+                .collect();
 
-    let points: Vec<ChargePoint> = session
-        .iter()
-        .map(|r| ChargePoint {
-            ts: r.ts * 1000,
-            power_kw: r.power_kw,
-            // DC fast charging reports 0 A (onboard charger bypassed); show
-            // the derived P÷V current so the amperage curve is meaningful.
-            current_a: display_current_a(r.power_kw, r.voltage_v, r.current_a),
-            voltage_v: r.voltage_v,
-            rate_mph: r.rate_mph,
-            soc: r.battery_pct,
-            range_mi: r.range_mi,
-            energy_added_kwh: r.energy_added_kwh,
+            let detail = ChargeSessionDetail {
+                avg_power_kw: avg(session.iter().filter_map(|r| r.power_kw.map(|v| v as f64))),
+                peak_current_a: session
+                    .iter()
+                    .filter_map(|r| display_current_a(r.power_kw, r.voltage_v, r.current_a))
+                    .max(),
+                avg_current_a: avg(session.iter().filter_map(|r| {
+                    display_current_a(r.power_kw, r.voltage_v, r.current_a).map(|v| v as f64)
+                })),
+                peak_voltage_v: session.iter().filter_map(|r| r.voltage_v).max(),
+                avg_voltage_v: avg(session.iter().filter_map(|r| r.voltage_v.map(|v| v as f64))),
+                peak_rate_mph: session
+                    .iter()
+                    .filter_map(|r| r.rate_mph)
+                    .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v)))),
+                summary,
+                points,
+            };
+
+            Ok(Some(serde_json::to_value(detail)?))
         })
-        .collect();
+        .await;
 
-    let detail = ChargeSessionDetail {
-        avg_power_kw: avg(session.iter().filter_map(|r| r.power_kw.map(|v| v as f64))),
-        peak_current_a: session
-            .iter()
-            .filter_map(|r| display_current_a(r.power_kw, r.voltage_v, r.current_a))
-            .max(),
-        avg_current_a: avg(session.iter().filter_map(|r| {
-            display_current_a(r.power_kw, r.voltage_v, r.current_a).map(|v| v as f64)
-        })),
-        peak_voltage_v: session.iter().filter_map(|r| r.voltage_v).max(),
-        avg_voltage_v: avg(session.iter().filter_map(|r| r.voltage_v.map(|v| v as f64))),
-        peak_rate_mph: session
-            .iter()
-            .filter_map(|r| r.rate_mph)
-            .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v)))),
-        summary,
-        points,
-    };
-
-    (StatusCode::OK, Json(serde_json::to_value(detail).unwrap()))
+    match result {
+        Ok(Ok(Some(v))) => (StatusCode::OK, Json(v)),
+        Ok(Ok(None)) => crate::json_error(StatusCode::NOT_FOUND, "charge session not found"),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging task: {}", e))
+        }
+    }
 }
 
 /// Live charge status for the dashboard banner. `charging` is false when
@@ -942,66 +952,79 @@ struct LatestCharge {
 pub async fn current_charging(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    use rusqlite::OptionalExtension;
-    let latest = state.drives.store.with_locked_conn(|conn| {
-        conn.query_row(
-            "SELECT ts, battery_pct, charge_limit_soc, charger_power_kw, \
-                    charge_rate_mph, charge_minutes_to_full, battery_range_mi, \
-                    charging_state \
-             FROM telemetry_samples \
-             WHERE charging_state IS NOT NULL \
-                OR charger_power_kw IS NOT NULL \
-                OR charge_rate_mph IS NOT NULL \
-             ORDER BY ts DESC LIMIT 1",
-            [],
-            |r| {
-                Ok(LatestCharge {
-                    ts: r.get(0)?,
-                    soc: r.get(1)?,
-                    limit_soc: r.get(2)?,
-                    power_kw: r.get(3)?,
-                    rate_mph: r.get(4)?,
-                    minutes_to_full: r.get(5)?,
-                    range_mi: r.get(6)?,
-                    charging_state: r.get(7)?,
-                })
-            },
-        )
-        .optional()
-    });
+    // One indexed LIMIT-1 lookup, but it contends for the same connection
+    // mutex as list_charging's whole-table scan; acquiring it on the
+    // reactor would block an async worker behind that scan. Run it on the
+    // blocking pool so a slow concurrent query can't stall the reactor.
+    let store = state.drives.store.clone();
+    let cur = tokio::task::spawn_blocking(move || {
+        use rusqlite::OptionalExtension;
+        let latest = store.with_locked_conn(|conn| {
+            conn.query_row(
+                "SELECT ts, battery_pct, charge_limit_soc, charger_power_kw, \
+                        charge_rate_mph, charge_minutes_to_full, battery_range_mi, \
+                        charging_state \
+                 FROM telemetry_samples \
+                 WHERE charging_state IS NOT NULL \
+                    OR charger_power_kw IS NOT NULL \
+                    OR charge_rate_mph IS NOT NULL \
+                 ORDER BY ts DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok(LatestCharge {
+                        ts: r.get(0)?,
+                        soc: r.get(1)?,
+                        limit_soc: r.get(2)?,
+                        power_kw: r.get(3)?,
+                        rate_mph: r.get(4)?,
+                        minutes_to_full: r.get(5)?,
+                        range_mi: r.get(6)?,
+                        charging_state: r.get(7)?,
+                    })
+                },
+            )
+            .optional()
+        });
 
-    let cur = match latest {
-        Ok(Some(l)) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(l.ts);
-            let age = now - l.ts;
-            let charging = match phase_is_active(l.charging_state.as_deref()) {
-                // Phase says actively charging — hold the banner the whole
-                // charge; only the 24h backstop can drop it.
-                Some(true) => age <= CHARGE_STALE_SECS,
-                // Phase says stopped/complete/disconnected — done, no banner.
-                Some(false) => false,
-                // Pre-v14 row with no phase — old heuristic.
-                None => age <= 600 && is_charging(l.power_kw, l.rate_mph),
-            };
-            // Battery % is shown for the persistent car-status banner as long
-            // as the data is reasonably fresh (<= 24h), so the banner doesn't
-            // vanish the moment a charge ends. The charging-only fields are
-            // present only while actively charging.
-            let soc = if age <= CHARGE_STALE_SECS { l.soc } else { None };
-            CurrentCharge {
-                charging,
-                soc,
-                limit_soc: if charging { l.limit_soc } else { None },
-                power_kw: if charging { l.power_kw } else { None },
-                minutes_to_full: if charging { l.minutes_to_full } else { None },
-                range_mi: if charging { l.range_mi } else { l.range_mi.filter(|_| soc.is_some()) },
+        match latest {
+            Ok(Some(l)) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(l.ts);
+                let age = now - l.ts;
+                let charging = match phase_is_active(l.charging_state.as_deref()) {
+                    // Phase says actively charging — hold the banner the whole
+                    // charge; only the 24h backstop can drop it.
+                    Some(true) => age <= CHARGE_STALE_SECS,
+                    // Phase says stopped/complete/disconnected — done, no banner.
+                    Some(false) => false,
+                    // Pre-v14 row with no phase — old heuristic.
+                    None => age <= 600 && is_charging(l.power_kw, l.rate_mph),
+                };
+                // Battery % is shown for the persistent car-status banner as
+                // long as the data is reasonably fresh (<= 24h), so the banner
+                // doesn't vanish the moment a charge ends. The charging-only
+                // fields are present only while actively charging.
+                let soc = if age <= CHARGE_STALE_SECS { l.soc } else { None };
+                CurrentCharge {
+                    charging,
+                    soc,
+                    limit_soc: if charging { l.limit_soc } else { None },
+                    power_kw: if charging { l.power_kw } else { None },
+                    minutes_to_full: if charging { l.minutes_to_full } else { None },
+                    range_mi: if charging {
+                        l.range_mi
+                    } else {
+                        l.range_mi.filter(|_| soc.is_some())
+                    },
+                }
             }
+            _ => CurrentCharge::idle(),
         }
-        _ => CurrentCharge::idle(),
-    };
+    })
+    .await
+    .unwrap_or_else(|_| CurrentCharge::idle());
     (StatusCode::OK, Json(serde_json::to_value(cur).unwrap()))
 }
 
@@ -1095,10 +1118,11 @@ pub async fn bulk_delete_charges(
     }
     let ids: Vec<i64> = body.ids.iter().filter_map(|s| s.parse::<i64>().ok()).collect();
 
-    let result = state
-        .drives
-        .store
-        .with_locked_conn(|conn| -> anyhow::Result<(usize, usize)> {
+    // Loops bounded scans + DELETEs under the connection mutex — blocking
+    // work, so run it off the reactor.
+    let store = state.drives.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store.with_locked_conn(|conn| -> anyhow::Result<(usize, usize)> {
             let mut deleted = 0usize;
             let mut sessions = 0usize;
             for id in &ids {
@@ -1126,14 +1150,19 @@ pub async fn bulk_delete_charges(
                 sessions += 1;
             }
             Ok((deleted, sessions))
-        });
+        })
+    })
+    .await;
 
     match result {
-        Ok((deleted, sessions)) => (
+        Ok(Ok((deleted, sessions))) => (
             StatusCode::OK,
             Json(serde_json::json!({ "deleted": deleted, "sessions": sessions })),
         ),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging task: {}", e))
+        }
     }
 }
 

@@ -147,24 +147,31 @@ pub struct ProcessBody {
     pub throttle_ms: Option<u64>,
 }
 
+/// Serve an already-serialized JSON string as the response body without
+/// the parse-into-`Value`-then-reserialize round-trip. The cache already
+/// holds exactly the bytes the client should receive, so hand them back
+/// directly with the JSON content-type. (Round-tripping through
+/// `serde_json::Value` also alphabetized object keys; serving the cache
+/// verbatim preserves the original field order.)
+fn cached_json_response(body: String) -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
 /// GET /api/drives — list all drives (summaries only).
 ///
 /// Returns a pre-computed JSON string stored in the `meta` table. The
 /// cache is built once at startup (or after any mutation) and served
 /// directly on every subsequent request — no grouper work, no BLOB
 /// decoding, no ORDER-BY sorter allocation.
-pub async fn list_drives(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn list_drives(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
     match state.drives.store.get_cached_drives_json() {
-        Ok(json) => match serde_json::from_str(&json) {
-            Ok(v) => (StatusCode::OK, Json(v)),
-            Err(e) => crate::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("drive cache parse: {}", e),
-            ),
-        },
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(json) => cached_json_response(json),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
+        }
     }
 }
 
@@ -183,7 +190,24 @@ pub async fn single_drive(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let tags = state.drives.store.get_all_drive_tags().unwrap_or_default();
+    // The detail page runs the grouper over every route summary AND decodes
+    // the drive's full point BLOBs to build per-point stats — easily
+    // hundreds of ms on a big history. Run it on the blocking pool so it
+    // can't stall the async reactor (which drops the WebSocket heartbeat
+    // and shows "Reconnecting to SentryUSB…").
+    let store = state.drives.store.clone();
+    tokio::task::spawn_blocking(move || single_drive_blocking(store, id))
+        .await
+        .unwrap_or_else(|_| {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "drive detail task failed")
+        })
+}
+
+fn single_drive_blocking(
+    store: std::sync::Arc<sentryusb_drives::DriveStore>,
+    id: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let tags = store.get_all_drive_tags().unwrap_or_default();
 
     // Resolve the drive id to (idx, files) AND grab the canonical
     // DriveSummary the list view emits, in a single summary pass. We
@@ -191,9 +215,7 @@ pub async fn single_drive(
     // the detail page can't disagree with the list on FSD %, distance,
     // etc. — the two are computed via different algorithms (point walk
     // vs per-clip aggregate sum) and drift ~0.1–0.5 % otherwise.
-    let (idx, files, summary) = match state
-        .drives
-        .store
+    let (idx, files, summary) = match store
         .with_route_summaries(|summaries| {
             let resolved = grouper::find_drive_files(summaries, &id);
             let summary =
@@ -218,7 +240,7 @@ pub async fn single_drive(
     let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
     let file_count = file_refs.len();
 
-    match state.drives.store.with_routes_by_files(&file_refs, |routes| {
+    match store.with_routes_by_files(&file_refs, |routes| {
         (
             routes.len(),
             grouper::build_single_drive_from_clips(routes, idx as i32, &tags),
@@ -283,11 +305,23 @@ pub async fn all_routes(
     Query(q): Query<AllRoutesQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let max_points = q.max_points.unwrap_or(500).clamp(2, 2000);
-    match state.drives.store.with_routes(|routes| {
-        grouper::route_overviews(routes, max_points)
-    }) {
-        Ok(overviews) => (StatusCode::OK, Json(serde_json::to_value(overviews).unwrap_or_default())),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    // Decodes every route's point BLOBs and downsamples each polyline —
+    // proportional to the whole drive history. Off the reactor so the map
+    // overview can't freeze the live connection.
+    let store = state.drives.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store.with_routes(|routes| grouper::route_overviews(routes, max_points))
+    })
+    .await;
+    match result {
+        Ok(Ok(overviews)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(overviews).unwrap_or_default()),
+        ),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("routes task: {}", e))
+        }
     }
 }
 
@@ -499,7 +533,8 @@ pub async fn drive_stats(
 pub async fn fsd_analytics(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let period = params
         .get("period")
         .map(|s| s.as_str())
@@ -511,14 +546,10 @@ pub async fn fsd_analytics(
 
     if period == "week" {
         return match state.drives.store.get_cached_fsd_analytics_json() {
-            Ok(json) => match serde_json::from_str::<serde_json::Value>(&json) {
-                Ok(v) => (StatusCode::OK, Json(v)),
-                Err(e) => crate::json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("fsd analytics cache parse: {}", e),
-                ),
-            },
-            Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            Ok(json) => cached_json_response(json),
+            Err(e) => {
+                crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
+            }
         };
     }
 
@@ -538,17 +569,21 @@ pub async fn fsd_analytics(
     .await;
     match result {
         Ok(Ok(analytics)) => match serde_json::to_value(&analytics) {
-            Ok(v) => (StatusCode::OK, Json(v)),
+            Ok(v) => (StatusCode::OK, Json(v)).into_response(),
             Err(e) => crate::json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("fsd analytics serialize: {}", e),
-            ),
+            )
+            .into_response(),
         },
-        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Err(e)) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
+        }
         Err(e) => crate::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("fsd analytics task: {}", e),
-        ),
+        )
+        .into_response(),
     }
 }
 
@@ -891,17 +926,29 @@ pub async fn bulk_delete_drives(
         );
     }
 
+    // The grouper pass + delete transaction is blocking + CPU; keep it off
+    // the reactor (the guards above are cheap atomic loads and stay async).
+    let store = state.drives.store.clone();
+    tokio::task::spawn_blocking(move || bulk_delete_drives_blocking(store, body.ids))
+        .await
+        .unwrap_or_else(|_| {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "bulk delete task failed")
+        })
+}
+
+fn bulk_delete_drives_blocking(
+    store: std::sync::Arc<sentryusb_drives::DriveStore>,
+    ids: Vec<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
     // Resolve every id to (drive_key, file_list) in one summary pass —
     // `with_route_summaries` rebuilds the grouper exactly once, not once
     // per id.
-    let (files, drive_keys, not_found): (Vec<String>, Vec<String>, Vec<String>) = match state
-        .drives
-        .store
+    let (files, drive_keys, not_found): (Vec<String>, Vec<String>, Vec<String>) = match store
         .with_route_summaries(|summaries| {
             let mut files = std::collections::HashSet::new();
             let mut keys = std::collections::HashSet::new();
             let mut missing = Vec::new();
-            for id in &body.ids {
+            for id in &ids {
                 let resolved = grouper::find_drive_files(summaries, id);
                 let key = grouper::find_drive_start_time(summaries, id);
                 match (resolved, key) {
@@ -931,16 +978,12 @@ pub async fn bulk_delete_drives(
         );
     }
 
-    match state
-        .drives
-        .store
-        .delete_routes_by_files(&files, &drive_keys)
-    {
+    match store.delete_routes_by_files(&files, &drive_keys) {
         Ok(deleted_routes) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "deleted": deleted_routes,
-                "drives": body.ids.len() - not_found.len(),
+                "drives": ids.len() - not_found.len(),
                 "not_found": not_found,
             })),
         ),
@@ -964,9 +1007,21 @@ pub async fn set_drive_tags(
     Path(id): Path<String>,
     Json(body): Json<SetTagsRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let key = match state
-        .drives
-        .store
+    // Resolving the id runs the grouper over every summary — off the reactor.
+    let store = state.drives.store.clone();
+    tokio::task::spawn_blocking(move || set_drive_tags_blocking(store, id, body.tags))
+        .await
+        .unwrap_or_else(|_| {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "set tags task failed")
+        })
+}
+
+fn set_drive_tags_blocking(
+    store: std::sync::Arc<sentryusb_drives::DriveStore>,
+    id: String,
+    tags: Vec<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = match store
         .with_route_summaries(|summaries| grouper::find_drive_start_time(summaries, &id))
     {
         Ok(Some(k)) => k,
@@ -979,7 +1034,7 @@ pub async fn set_drive_tags(
         Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
 
-    match state.drives.store.set_drive_tags(&key, &body.tags) {
+    match store.set_drive_tags(&key, &tags) {
         Ok(()) => crate::json_ok(),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -1014,80 +1069,86 @@ pub async fn temperature_series(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let files = match state
-        .drives
-        .store
-        .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))
-    {
-        Ok(Some((_idx, f))) => f,
-        Ok(None) => {
-            return crate::json_error(
-                StatusCode::NOT_FOUND,
-                &format!("drive not found for id='{}'", id),
-            )
-        }
-        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
+    // Find files + derive window + query — all touch the connection
+    // mutex, so run the whole chain on the blocking pool.
+    let store = state.drives.store.clone();
+    let id_err = id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
+            let files = match store
+                .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))?
+            {
+                Some((_idx, f)) => f,
+                None => return Ok(None),
+            };
 
-    // Derive the drive's wall-clock window from the min/max of its
-    // clip windows. Files without parseable timestamps (event folders,
-    // manual imports) are silently skipped — they wouldn't contribute
-    // telemetry rows anyway since the sampler keys by clock time.
-    let mut start_ts: Option<i64> = None;
-    let mut end_ts: Option<i64> = None;
-    for f in &files {
-        if let Some((s, e)) = aggregate_telemetry::window_for_route_file(f) {
-            start_ts = Some(start_ts.map_or(s, |cur| cur.min(s)));
-            end_ts = Some(end_ts.map_or(e, |cur| cur.max(e)));
-        }
-    }
-    let (start_ts, end_ts) = match (start_ts, end_ts) {
-        (Some(s), Some(e)) => (s, e),
-        _ => return (StatusCode::OK, Json(serde_json::json!({ "points": [] }))),
-    };
+            // Derive the drive's wall-clock window from the min/max of its
+            // clip windows. Files without parseable timestamps (event
+            // folders, manual imports) are silently skipped — they wouldn't
+            // contribute telemetry rows anyway since the sampler keys by
+            // clock time.
+            let mut start_ts: Option<i64> = None;
+            let mut end_ts: Option<i64> = None;
+            for f in &files {
+                if let Some((s, e)) = aggregate_telemetry::window_for_route_file(f) {
+                    start_ts = Some(start_ts.map_or(s, |cur| cur.min(s)));
+                    end_ts = Some(end_ts.map_or(e, |cur| cur.max(e)));
+                }
+            }
+            let (start_ts, end_ts) = match (start_ts, end_ts) {
+                (Some(s), Some(e)) => (s, e),
+                _ => return Ok(Some(serde_json::json!({ "points": [] }))),
+            };
 
-    let result = state.drives.store.with_locked_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT ts, interior_temp_c, exterior_temp_c \
-             FROM telemetry_samples \
-             WHERE ts BETWEEN ?1 AND ?2 \
-               AND (interior_temp_c IS NOT NULL OR exterior_temp_c IS NOT NULL) \
-             ORDER BY ts ASC",
-        )?;
-        let rows = stmt.query_map(
-            rusqlite::params![start_ts, end_ts],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Option<f64>>(1)?,
-                    r.get::<_, Option<f64>>(2)?,
-                ))
-            },
-        )?;
-        let mut out: Vec<serde_json::Value> = Vec::new();
-        for row in rows {
-            let (ts, interior, exterior) = row?;
-            let mut obj = serde_json::Map::new();
-            // Ship ts in milliseconds — JS Date and recharts work in ms,
-            // saves the frontend a multiply per row.
-            obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
-            if let Some(v) = interior {
-                obj.insert("interiorC".to_string(), serde_json::json!(v));
-            }
-            if let Some(v) = exterior {
-                obj.insert("exteriorC".to_string(), serde_json::json!(v));
-            }
-            out.push(serde_json::Value::Object(obj));
-        }
-        Ok::<_, anyhow::Error>(out)
-    });
+            let points = store.with_locked_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT ts, interior_temp_c, exterior_temp_c \
+                     FROM telemetry_samples \
+                     WHERE ts BETWEEN ?1 AND ?2 \
+                       AND (interior_temp_c IS NOT NULL OR exterior_temp_c IS NOT NULL) \
+                     ORDER BY ts ASC",
+                )?;
+                let rows = stmt.query_map(
+                    rusqlite::params![start_ts, end_ts],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<f64>>(1)?,
+                            r.get::<_, Option<f64>>(2)?,
+                        ))
+                    },
+                )?;
+                let mut out: Vec<serde_json::Value> = Vec::new();
+                for row in rows {
+                    let (ts, interior, exterior) = row?;
+                    let mut obj = serde_json::Map::new();
+                    // Ship ts in milliseconds — JS Date and recharts work in
+                    // ms, saves the frontend a multiply per row.
+                    obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
+                    if let Some(v) = interior {
+                        obj.insert("interiorC".to_string(), serde_json::json!(v));
+                    }
+                    if let Some(v) = exterior {
+                        obj.insert("exteriorC".to_string(), serde_json::json!(v));
+                    }
+                    out.push(serde_json::Value::Object(obj));
+                }
+                Ok::<_, anyhow::Error>(out)
+            })?;
+            Ok(Some(serde_json::json!({ "points": points })))
+        })
+        .await;
 
     match result {
-        Ok(points) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "points": points })),
+        Ok(Ok(Some(v))) => (StatusCode::OK, Json(v)),
+        Ok(Ok(None)) => crate::json_error(
+            StatusCode::NOT_FOUND,
+            &format!("drive not found for id='{}'", id_err),
         ),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("series task: {}", e))
+        }
     }
 }
 
@@ -1116,67 +1177,72 @@ pub async fn battery_series(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let files = match state
-        .drives
-        .store
-        .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))
-    {
-        Ok(Some((_idx, f))) => f,
-        Ok(None) => {
-            return crate::json_error(
-                StatusCode::NOT_FOUND,
-                &format!("drive not found for id='{}'", id),
-            )
-        }
-        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
+    // Find files + derive window + query — all touch the connection
+    // mutex, so run the whole chain on the blocking pool.
+    let store = state.drives.store.clone();
+    let id_err = id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
+            let files = match store
+                .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))?
+            {
+                Some((_idx, f)) => f,
+                None => return Ok(None),
+            };
 
-    // Same window-derivation as temperature_series — min/max of the
-    // clip-file timestamps that make up this drive.
-    let mut start_ts: Option<i64> = None;
-    let mut end_ts: Option<i64> = None;
-    for f in &files {
-        if let Some((s, e)) = aggregate_telemetry::window_for_route_file(f) {
-            start_ts = Some(start_ts.map_or(s, |cur| cur.min(s)));
-            end_ts = Some(end_ts.map_or(e, |cur| cur.max(e)));
-        }
-    }
-    let (start_ts, end_ts) = match (start_ts, end_ts) {
-        (Some(s), Some(e)) => (s, e),
-        _ => return (StatusCode::OK, Json(serde_json::json!({ "points": [] }))),
-    };
-
-    let result = state.drives.store.with_locked_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT ts, battery_pct \
-             FROM telemetry_samples \
-             WHERE ts BETWEEN ?1 AND ?2 \
-               AND battery_pct IS NOT NULL \
-             ORDER BY ts ASC",
-        )?;
-        let rows = stmt.query_map(
-            rusqlite::params![start_ts, end_ts],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?)),
-        )?;
-        let mut out: Vec<serde_json::Value> = Vec::new();
-        for row in rows {
-            let (ts, battery) = row?;
-            let mut obj = serde_json::Map::new();
-            obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
-            if let Some(v) = battery {
-                obj.insert("batteryPct".to_string(), serde_json::json!(v));
+            // Same window-derivation as temperature_series — min/max of the
+            // clip-file timestamps that make up this drive.
+            let mut start_ts: Option<i64> = None;
+            let mut end_ts: Option<i64> = None;
+            for f in &files {
+                if let Some((s, e)) = aggregate_telemetry::window_for_route_file(f) {
+                    start_ts = Some(start_ts.map_or(s, |cur| cur.min(s)));
+                    end_ts = Some(end_ts.map_or(e, |cur| cur.max(e)));
+                }
             }
-            out.push(serde_json::Value::Object(obj));
-        }
-        Ok::<_, anyhow::Error>(out)
-    });
+            let (start_ts, end_ts) = match (start_ts, end_ts) {
+                (Some(s), Some(e)) => (s, e),
+                _ => return Ok(Some(serde_json::json!({ "points": [] }))),
+            };
+
+            let points = store.with_locked_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT ts, battery_pct \
+                     FROM telemetry_samples \
+                     WHERE ts BETWEEN ?1 AND ?2 \
+                       AND battery_pct IS NOT NULL \
+                     ORDER BY ts ASC",
+                )?;
+                let rows = stmt.query_map(
+                    rusqlite::params![start_ts, end_ts],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?)),
+                )?;
+                let mut out: Vec<serde_json::Value> = Vec::new();
+                for row in rows {
+                    let (ts, battery) = row?;
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
+                    if let Some(v) = battery {
+                        obj.insert("batteryPct".to_string(), serde_json::json!(v));
+                    }
+                    out.push(serde_json::Value::Object(obj));
+                }
+                Ok::<_, anyhow::Error>(out)
+            })?;
+            Ok(Some(serde_json::json!({ "points": points })))
+        })
+        .await;
 
     match result {
-        Ok(points) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "points": points })),
+        Ok(Ok(Some(v))) => (StatusCode::OK, Json(v)),
+        Ok(Ok(None)) => crate::json_error(
+            StatusCode::NOT_FOUND,
+            &format!("drive not found for id='{}'", id_err),
         ),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("series task: {}", e))
+        }
     }
 }
 
@@ -1220,54 +1286,61 @@ pub async fn tire_history(
         .unwrap_or(0);
     let cutoff = now - (days as i64) * 86_400;
 
-    let result = state.drives.store.with_locked_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
-             FROM telemetry_samples \
-             WHERE ts >= ?1 \
-               AND (tire_fl_psi IS NOT NULL OR tire_fr_psi IS NOT NULL \
-                    OR tire_rl_psi IS NOT NULL OR tire_rr_psi IS NOT NULL) \
-             ORDER BY ts ASC",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<f64>>(1)?,
-                r.get::<_, Option<f64>>(2)?,
-                r.get::<_, Option<f64>>(3)?,
-                r.get::<_, Option<f64>>(4)?,
-            ))
-        })?;
-        let mut out: Vec<serde_json::Value> = Vec::new();
-        for row in rows {
-            let (ts, fl, fr, rl, rr) = row?;
-            let mut obj = serde_json::Map::new();
-            obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
-            if let Some(v) = fl {
-                obj.insert("fl".to_string(), serde_json::json!(v));
+    let store = state.drives.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store.with_locked_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
+                 FROM telemetry_samples \
+                 WHERE ts >= ?1 \
+                   AND (tire_fl_psi IS NOT NULL OR tire_fr_psi IS NOT NULL \
+                        OR tire_rl_psi IS NOT NULL OR tire_rr_psi IS NOT NULL) \
+                 ORDER BY ts ASC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<f64>>(1)?,
+                    r.get::<_, Option<f64>>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, Option<f64>>(4)?,
+                ))
+            })?;
+            let mut out: Vec<serde_json::Value> = Vec::new();
+            for row in rows {
+                let (ts, fl, fr, rl, rr) = row?;
+                let mut obj = serde_json::Map::new();
+                obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
+                if let Some(v) = fl {
+                    obj.insert("fl".to_string(), serde_json::json!(v));
+                }
+                if let Some(v) = fr {
+                    obj.insert("fr".to_string(), serde_json::json!(v));
+                }
+                if let Some(v) = rl {
+                    obj.insert("rl".to_string(), serde_json::json!(v));
+                }
+                if let Some(v) = rr {
+                    obj.insert("rr".to_string(), serde_json::json!(v));
+                }
+                out.push(serde_json::Value::Object(obj));
             }
-            if let Some(v) = fr {
-                obj.insert("fr".to_string(), serde_json::json!(v));
-            }
-            if let Some(v) = rl {
-                obj.insert("rl".to_string(), serde_json::json!(v));
-            }
-            if let Some(v) = rr {
-                obj.insert("rr".to_string(), serde_json::json!(v));
-            }
-            out.push(serde_json::Value::Object(obj));
-        }
-        Ok::<_, anyhow::Error>(out)
-    });
+            Ok::<_, anyhow::Error>(out)
+        })
+    })
+    .await;
 
     match result {
-        Ok(points) => (
+        Ok(Ok(points)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "points": points,
                 "days": days,
             })),
         ),
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("tire-history task: {}", e))
+        }
     }
 }
