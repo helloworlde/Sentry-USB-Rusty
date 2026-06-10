@@ -19,12 +19,20 @@ interface GodotRendererProps {
  *
  * Communication: React <-> iframe via postMessage <-> Godot bridge <-> Godot WASM
  */
+// The renderer iframe is served from the SentryUSB cloud (not the local Pi).
+// Pin every postMessage hop to this exact origin: send only TO it (was "*",
+// which any document the iframe later navigated to could read) and accept
+// inbound messages only FROM it (the listener below was unauthenticated, so
+// any page that could postMessage to this window could forge a
+// `capture_result` and inject an arbitrary image data-URL into the upload).
+const GODOT_ORIGIN = "https://api.sentry-six.com"
+
 const GodotRenderer = forwardRef<GodotRendererHandle, GodotRendererProps>(
   ({ onReady, onCapture, onError, onCarLoaded }, ref) => {
     const iframeRef = useRef<HTMLIFrameElement>(null)
 
     const sendToGodot = useCallback((message: Record<string, unknown>) => {
-      iframeRef.current?.contentWindow?.postMessage(message, "*")
+      iframeRef.current?.contentWindow?.postMessage(message, GODOT_ORIGIN)
     }, [])
 
     useImperativeHandle(ref, () => ({
@@ -49,6 +57,8 @@ const GodotRenderer = forwardRef<GodotRendererHandle, GodotRendererProps>(
 
     useEffect(() => {
       const handleMessage = (e: MessageEvent) => {
+        // Only trust messages from the renderer iframe's own origin.
+        if (e.origin !== GODOT_ORIGIN) return
         if (!e.data || !e.data.type) return
 
         switch (e.data.type) {
@@ -78,7 +88,7 @@ const GodotRenderer = forwardRef<GodotRendererHandle, GodotRendererProps>(
     return (
       <iframe
         ref={iframeRef}
-        src="https://api.sentry-six.com/wraps/godot/index.html"
+        src={`${GODOT_ORIGIN}/wraps/godot/index.html`}
         title="Wrap 3D Preview Renderer"
         style={{
           position: "absolute",
