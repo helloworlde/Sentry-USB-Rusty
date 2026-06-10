@@ -555,8 +555,11 @@ fn load_config() -> Result<(String, Option<String>)> {
 
 fn unquote(s: &str) -> String {
     let t = s.trim();
-    if (t.starts_with('"') && t.ends_with('"'))
-        || (t.starts_with('\'') && t.ends_with('\''))
+    // len >= 2 so a value that is a single quote character can't
+    // underflow the slice below.
+    if t.len() >= 2
+        && ((t.starts_with('"') && t.ends_with('"'))
+            || (t.starts_with('\'') && t.ends_with('\'')))
     {
         t[1..t.len() - 1].to_string()
     } else {
