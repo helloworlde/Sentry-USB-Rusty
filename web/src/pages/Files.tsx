@@ -40,7 +40,12 @@ interface FileEntry {
   path: string
   is_dir: boolean
   size: number
-  modified: string
+  // Matches the backend's serialized field name (files.rs FileEntry).
+  // This was previously declared as `modified`, which doesn't exist in
+  // the response — the Date column rendered blank for every file and
+  // the two date sorts quietly degraded to name order (NaN timestamps
+  // made the name tiebreaker always win).
+  mod_time: string
 }
 
 interface DriveTab {
@@ -215,9 +220,9 @@ export default function Files() {
         case "name-desc":
           return -nameCmp
         case "date-newest":
-          return (new Date(b.modified).getTime() - new Date(a.modified).getTime()) || -nameCmp
+          return (new Date(b.mod_time).getTime() - new Date(a.mod_time).getTime()) || -nameCmp
         case "date-oldest":
-          return (new Date(a.modified).getTime() - new Date(b.modified).getTime()) || nameCmp
+          return (new Date(a.mod_time).getTime() - new Date(b.mod_time).getTime()) || nameCmp
         case "size-largest":
           return b.size - a.size
         case "size-smallest":
@@ -670,7 +675,7 @@ export default function Files() {
                     </td>
                     <td className="min-w-0 truncate py-3 text-slate-300">{f.name}</td>
                     <td className="hidden px-3 py-3 text-right text-xs text-slate-600 sm:table-cell">
-                      {f.modified ? new Date(f.modified).toLocaleDateString() : ""}
+                      {f.mod_time ? new Date(f.mod_time).toLocaleDateString() : ""}
                     </td>
                     <td className="px-3 py-3 text-right text-xs text-slate-600">
                       {f.is_dir ? "" : formatSize(f.size)}
