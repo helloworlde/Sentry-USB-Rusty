@@ -94,9 +94,11 @@ html[data-style="liquid"] .glass-sidebar {
   border-right: 1px solid rgba(255, 255, 255, 0.10);
 }
 html[data-style="liquid"] .tab-bar {
+  /* 1rem outer radius; the pill stays concentric via the shared var. */
+  --tab-radius: 1rem;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid rgba(255, 255, 255, 0.10);
-  border-radius: 1rem;
+  border-radius: var(--tab-radius);
   backdrop-filter: blur(16px) saturate(180%);
   -webkit-backdrop-filter: blur(16px) saturate(180%);
 }
@@ -203,18 +205,24 @@ code, pre, .font-mono {
 
 /* ── Tab bar ───────────────────────────────────────────────────── */
 .tab-bar {
+  /* Outer corner radius. The active pill derives its radius from this so
+     the two curves stay concentric (see .tab-item border-radius). */
+  --tab-radius: 12px;
   display: flex;
   gap: 2px;
   padding: 3px;
   background: #0b0e13;
-  border-radius: 12px;
+  border-radius: var(--tab-radius);
   border: 1px solid #1e242f;
 }
 
 .tab-item {
   flex: 1;
   padding: 8px 12px;
-  border-radius: 9px;
+  /* Concentric with the container: subtract the 1px border + 3px padding
+     that sit between the outer edge and the pill, so the pill's corners
+     follow the container's curve instead of bulging past it. */
+  border-radius: calc(var(--tab-radius) - 4px);
   font-size: 13px;
   font-weight: 500;
   font-family: "Inter", -apple-system, system-ui, sans-serif;
