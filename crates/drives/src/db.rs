@@ -318,7 +318,9 @@ impl DriveStore {
         let files = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
-            .map(|f| normalize_path(&f))
+            // Rows are already normalized on write; reuse the owned String
+            // instead of re-allocating one per row through normalize_path.
+            .map(|f| if f.contains('\\') { f.replace('\\', "/") } else { f })
             .collect();
         Ok(files)
     }
@@ -327,25 +329,27 @@ impl DriveStore {
     pub fn mark_processed(&self, relative_path: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = now_unix();
-        conn.execute(
+        let inserted = conn.execute(
             "INSERT OR IGNORE INTO processed_files(file, added_at) VALUES(?1, ?2)",
             params![normalize_path(relative_path), now],
         )?;
         drop(conn);
-        self.refresh_counts()?;
+        // Counter maintained incrementally — this runs once per clip during
+        // ingest, where the old full COUNT(*) refresh added two table scans
+        // per call (see refresh_counts).
+        self.processed_count
+            .fetch_add(inserted as i64, Ordering::Relaxed);
         Ok(())
     }
 
     /// True if `file` has been processed.
     pub fn is_processed(&self, file: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let exists: i64 = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM processed_files WHERE file = ?1)",
-                params![normalize_path(file)],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        let exists: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM processed_files WHERE file = ?1)",
+            params![normalize_path(file)],
+            |row| row.get(0),
+        )?;
         Ok(exists != 0)
     }
 
@@ -376,11 +380,12 @@ impl DriveStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
-        tx.execute(
+        let pf_inserted = tx.execute(
             "INSERT OR IGNORE INTO processed_files(file, added_at) VALUES(?1, ?2)",
             params![norm, now],
         )?;
 
+        let mut route_inserted: i64 = 0;
         if !points.is_empty() {
             let route = Route {
                 file: relative_path.to_string(),
@@ -402,6 +407,14 @@ impl DriveStore {
                 ..Default::default()
             };
             let agg = compute_route_aggregates(&route);
+            // Indexed point lookup so the counter update below knows
+            // insert vs upsert — replaces a full COUNT(*) per clip.
+            let existed: i64 = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM routes WHERE file = ?1)",
+                params![norm],
+                |r| r.get(0),
+            )?;
+            route_inserted = 1 - existed;
             insert_or_update_route(&tx, &norm, &route, &agg, now)?;
 
             // v6 telemetry rollup: join the just-inserted clip's
@@ -424,7 +437,9 @@ impl DriveStore {
         tx.commit()?;
         drop(conn);
         self.drive_cache_dirty.store(true, Ordering::Release);
-        self.refresh_counts()?;
+        self.processed_count
+            .fetch_add(pf_inserted as i64, Ordering::Relaxed);
+        self.route_count.fetch_add(route_inserted, Ordering::Relaxed);
         Ok(())
     }
 
@@ -438,8 +453,9 @@ impl DriveStore {
         self.processed_count.load(Ordering::Relaxed)
     }
 
-    /// Fresh `Vec<Route>` decoded from the DB. Hot-path readers should
-    /// use [`with_routes`] instead to avoid the allocation.
+    /// Fresh `Vec<Route>` decoded from the DB — full BLOB decode, heavy.
+    /// Prefer [`Self::with_route_summaries`] for list-shaped reads and
+    /// [`Self::with_routes_by_files`] for single-drive reads.
     pub fn get_routes(&self) -> Result<Vec<Route>> {
         let conn = self.conn.lock().unwrap();
         select_all_routes(&conn)
@@ -822,6 +838,7 @@ impl DriveStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut deleted: usize = 0;
+        let mut deleted_processed: usize = 0;
         if !files.is_empty() {
             let mut del_routes =
                 tx.prepare("DELETE FROM routes WHERE file = ?1")?;
@@ -830,7 +847,7 @@ impl DriveStore {
             for f in files {
                 let n = normalize_path(f);
                 deleted += del_routes.execute(params![n])?;
-                del_processed.execute(params![n])?;
+                deleted_processed += del_processed.execute(params![n])?;
             }
         }
         if !drive_keys.is_empty() {
@@ -844,7 +861,9 @@ impl DriveStore {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         drop(conn);
         self.drive_cache_dirty.store(true, Ordering::Release);
-        self.refresh_counts()?;
+        self.route_count.fetch_sub(deleted as i64, Ordering::Relaxed);
+        self.processed_count
+            .fetch_sub(deleted_processed as i64, Ordering::Relaxed);
         Ok(deleted)
     }
 
@@ -983,16 +1002,22 @@ impl DriveStore {
         if Path::new(DEFAULT_JSON_MIRROR_PATH).exists() {
             return Ok(());
         }
-        let src = std::fs::read(ARCHIVE_DATA_PATH).unwrap_or_default();
         if let Some(dir) = Path::new(DEFAULT_JSON_MIRROR_PATH).parent() {
             if !dir.as_os_str().is_empty() && dir != Path::new("/") {
                 std::fs::create_dir_all(dir)?;
             }
         }
-        std::fs::write(DEFAULT_JSON_MIRROR_PATH, &src)?;
+        // Stream the copy (tmp + rename for atomicity) — the archive JSON
+        // can be hundreds of MB; never buffer it in RAM.
+        let tmp = format!("{}.tmp", DEFAULT_JSON_MIRROR_PATH);
+        let copied = std::fs::copy(ARCHIVE_DATA_PATH, &tmp)?;
+        if let Err(e) = std::fs::rename(&tmp, DEFAULT_JSON_MIRROR_PATH) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         info!(
             "[drives] Restored drive-data.json from archive ({} bytes); next Load() will import it",
-            src.len()
+            copied
         );
         Ok(())
     }
@@ -1122,7 +1147,11 @@ impl DriveStore {
         Ok(schema::meta_get(&conn, "fsd_analytics_cache")?.unwrap_or_else(|| "{}".to_string()))
     }
 
-    /// Refresh the cached row counts. Called after every mutation.
+    /// Refresh the cached row counts with full COUNT(*) queries. Called
+    /// after bulk mutations (load / replace_data / clear_* / JSON import);
+    /// the per-clip paths (add_route / mark_processed /
+    /// delete_routes_by_files) maintain the counters incrementally so
+    /// ingest doesn't pay two table scans per clip.
     fn refresh_counts(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let rc: i64 = conn.query_row("SELECT COUNT(*) FROM routes", [], |r| r.get(0))?;
@@ -1153,9 +1182,13 @@ fn open_readonly_connection(path: &str) -> Result<Connection> {
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
+    // mmap_size matches apply_pragmas — this connection serves the
+    // BLOB-heavy full-table scans (JSON export, cache-rebuild snapshot),
+    // which benefit most from skipping the pager-buffer copy.
     conn.execute_batch(
         "PRAGMA query_only = ON;
-         PRAGMA busy_timeout = 5000;",
+         PRAGMA busy_timeout = 5000;
+         PRAGMA mmap_size = 67108864;",
     )?;
     Ok(conn)
 }
@@ -2051,9 +2084,10 @@ fn rename_or_copy(src: &str, dst: &str) -> Result<()> {
     if std::fs::rename(src, dst).is_ok() {
         return Ok(());
     }
-    // Cross-filesystem fallback.
-    let data = std::fs::read(src)?;
-    std::fs::write(dst, &data)?;
+    // Cross-filesystem fallback. fs::copy streams in fixed-size chunks —
+    // the export JSON can reach hundreds of MB and some Pis have 1 GB of
+    // RAM, so never buffer the whole file in memory.
+    std::fs::copy(src, dst)?;
     // Best-effort fsync the destination so a crash doesn't lose data.
     if let Ok(f) = std::fs::File::open(dst) {
         let _ = f.sync_all();
