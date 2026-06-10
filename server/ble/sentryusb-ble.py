@@ -23,6 +23,7 @@ import sys
 import signal
 import logging
 import time
+import hmac
 import urllib.request
 import urllib.error
 import threading
@@ -120,8 +121,19 @@ API_BASE = None
 PIN_FILE = '/root/.sentryusb/ble-pin'
 BOOT_PIN_FILE = '/boot/firmware/BLE_PIN'
 
-# Track authenticated BLE peers (by D-Bus device path)
+# Track authenticated BLE peers (by D-Bus device path). Cleared per peer
+# on disconnect (see setup_connection_logging) so a session always
+# re-authenticates and the set can't grow unbounded.
 authenticated_peers = set()
+
+# Per-peer failed-PIN throttle. The passcode is only 4-6 digits
+# (<=1,000,000 combinations, 10,000 for the 4-digit default), so without
+# a lockout a BLE-range attacker could brute-force it. Policy mirrors the
+# web login / terminal: AUTH_MAX_FAILS failures within AUTH_FAIL_WINDOW
+# locks that peer out until the window drains. Keyed by D-Bus device path.
+auth_failures = {}
+AUTH_MAX_FAILS = 5
+AUTH_FAIL_WINDOW = 300  # seconds
 
 mainloop = None
 
@@ -175,9 +187,44 @@ def is_claimed():
 
 
 def check_pin(pin):
-    """Verify a passcode against the stored one."""
+    """Verify a passcode against the stored one, in constant time.
+
+    `hmac.compare_digest` avoids the early-exit byte comparison of `==`,
+    which would otherwise leak how many leading characters matched via
+    response timing — letting an attacker recover the PIN digit by digit.
+    """
     stored = load_pin()
-    return stored is not None and stored == pin
+    if stored is None:
+        return False
+    return hmac.compare_digest(str(stored), str(pin))
+
+
+def auth_rate_limited(device):
+    """True when this peer has too many recent failed PIN attempts."""
+    if not device:
+        return False
+    now = time.monotonic()
+    times = [t for t in auth_failures.get(device, []) if now - t < AUTH_FAIL_WINDOW]
+    if times:
+        auth_failures[device] = times
+    else:
+        auth_failures.pop(device, None)
+    return len(times) >= AUTH_MAX_FAILS
+
+
+def record_auth_failure(device):
+    """Record a failed PIN attempt for the per-peer lockout."""
+    if not device:
+        return
+    auth_failures.setdefault(device, []).append(time.monotonic())
+
+
+def clear_peer_auth(device):
+    """Drop a peer's authenticated + rate-limit state (on disconnect)."""
+    if not device:
+        return
+    authenticated_peers.discard(str(device))
+    auth_failures.pop(str(device), None)
 
 
 def is_authenticated(options):
@@ -852,12 +899,17 @@ class AuthCharacteristic(Characteristic):
                     log.error(f'Failed to save PIN: {e}')
                     result = {'success': False, 'error': 'save_failed'}
         elif action == 'authenticate':
+            device = options.get('device', '')
             if not is_claimed():
                 result = {'success': False, 'error': 'not_claimed'}
+            elif auth_rate_limited(str(device)):
+                result = {'success': False, 'error': 'too_many_attempts'}
+                log.warning(f'Authentication blocked: too many attempts from {device}')
             elif check_pin(pin):
                 mark_authenticated(options)
                 result = {'success': True}
             else:
+                record_auth_failure(str(device))
                 result = {'success': False, 'error': 'wrong_pin'}
                 log.warning('Authentication failed: wrong pin')
         else:
@@ -1251,6 +1303,11 @@ def setup_connection_monitoring(bus, adapter_path):
             log.info(f'BLE central connected: {path}')
         else:
             log.info(f'BLE central disconnected: {path}')
+            # Drop this peer's auth + failed-attempt state so the next
+            # session must re-enter the PIN (a reconnecting/spoofed
+            # address can't inherit a prior session's authentication) and
+            # the tracking sets don't grow unbounded.
+            clear_peer_auth(str(path))
 
     bus.add_signal_receiver(
         on_properties_changed,
