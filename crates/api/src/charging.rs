@@ -1154,6 +1154,12 @@ pub async fn bulk_delete_charges(
                     "DELETE FROM charge_tags WHERE session_ts = ?1",
                     rusqlite::params![start],
                 )?;
+                // The manual cost override is keyed the same way — drop it
+                // too, or it lingers orphaned after the session is gone.
+                conn.execute(
+                    "DELETE FROM charge_costs WHERE session_ts = ?1",
+                    rusqlite::params![start],
+                )?;
                 sessions += 1;
             }
             Ok((deleted, sessions))
