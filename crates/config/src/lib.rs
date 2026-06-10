@@ -51,6 +51,16 @@ pub fn parse_file(path: &str) -> Result<(SetupConfig, SetupConfig)> {
 /// Variables in `new_config` will be written as active exports. Variables not in
 /// `new_config` that were previously active will be commented out.
 pub fn write_file(path: &str, new_config: &SetupConfig) -> Result<()> {
+    // Keys are written into `export KEY=...` lines unquoted. `quote()`
+    // neutralizes hostile *values*, but a hostile *key* — e.g. one
+    // containing a newline or `=` — would inject an extra export line
+    // into the bash-sourced config. Reject the whole write if any key
+    // isn't a plain shell identifier (the same rule parse_key_value
+    // enforces on read), so a crafted key can't smuggle in (say) a
+    // WEB_PASSWORD override through the pre-setup /api/setup/config PUT.
+    if let Some(bad) = new_config.keys().find(|k| !is_valid_key(k)) {
+        anyhow::bail!("refusing to write config: invalid key {:?}", bad);
+    }
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to open config file: {}", path))?;
 
@@ -132,20 +142,24 @@ fn parse_commented_export_line(line: &str) -> Option<(String, String)> {
     parse_key_value(rest)
 }
 
+/// True when `key` is a plain shell identifier: `[A-Za-z_][A-Za-z0-9_]*`.
+/// The single source of truth for key validity, used on both the parse
+/// (read) and write paths.
+fn is_valid_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    match bytes.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// Parses `KEY=VALUE` from a string.
 fn parse_key_value(s: &str) -> Option<(String, String)> {
     let eq_pos = s.find('=')?;
     let key = &s[..eq_pos];
 
-    // Validate key: must be [A-Za-z_][A-Za-z0-9_]*
-    if key.is_empty() {
-        return None;
-    }
-    let first = key.as_bytes()[0];
-    if !first.is_ascii_alphabetic() && first != b'_' {
-        return None;
-    }
-    if !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    if !is_valid_key(key) {
         return None;
     }
 
@@ -269,5 +283,38 @@ mod tests {
     #[test]
     fn test_parse_invalid_key() {
         assert_eq!(parse_export_line("export 123=bad"), None);
+    }
+
+    #[test]
+    fn write_file_rejects_injection_key() {
+        // A key carrying a newline + a second export would inject an
+        // arbitrary variable (e.g. WEB_PASSWORD) into the bash-sourced
+        // config. write_file must refuse the whole write.
+        let dir = std::env::temp_dir().join(format!(
+            "sentryusb-cfg-inject-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sentryusb.conf");
+        std::fs::write(&path, "export GOOD=1\n").unwrap();
+
+        let mut cfg = SetupConfig::new();
+        cfg.insert("EVIL\nexport WEB_PASSWORD".to_string(), "x".to_string());
+        let r = write_file(path.to_str().unwrap(), &cfg);
+        assert!(r.is_err(), "injection key must be rejected");
+        // The file must be untouched (no WEB_PASSWORD smuggled in).
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("WEB_PASSWORD"), "config must be unchanged");
+
+        let mut ok = SetupConfig::new();
+        ok.insert("GOOD".to_string(), "2".to_string());
+        assert!(write_file(path.to_str().unwrap(), &ok).is_ok());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
