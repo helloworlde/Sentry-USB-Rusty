@@ -39,6 +39,17 @@ pub async fn make_readonly(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
     for svc in &["apt-daily.timer", "apt-daily-upgrade.timer"] {
         let _ = sentryusb_shell::run("systemctl", &["disable", svc]).await;
     }
+    // Debian housekeeping timers that are pointless on a read-only dashcam
+    // appliance and only burn boot/runtime CPU + I/O competing with the
+    // services the car actually needs (and try to write to the now-read-only
+    // root, failing harmlessly): man-db rebuilds the manpage cache nobody
+    // reads, dpkg-db-backup snapshots a package DB that never changes
+    // post-setup, e2scrub does online ext4 scrubbing the boot-time fsck
+    // already covers. Disabling the timers stops both the periodic runs and
+    // the boot-time run. (Same intent as the apt-daily timers above.)
+    for svc in &["man-db.timer", "dpkg-db-backup.timer", "e2scrub_all.timer"] {
+        let _ = sentryusb_shell::run("systemctl", &["disable", svc]).await;
+    }
     // Conflict with USB gadget / not needed on read-only setups.
     for svc in &["amlogic-adbd", "radxa-adbd", "radxa-usbnet", "armbian-led-state"] {
         let _ = sentryusb_shell::run("systemctl", &["disable", svc]).await;
