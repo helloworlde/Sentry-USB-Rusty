@@ -78,11 +78,6 @@ impl Hub {
         let prev = self.client_count.fetch_sub(1, Ordering::Relaxed);
         debug!("WebSocket client disconnected ({} total)", prev - 1);
     }
-
-    /// Returns the current number of connected clients.
-    pub fn client_count(&self) -> usize {
-        self.client_count.load(Ordering::Relaxed)
-    }
 }
 
 impl Default for Hub {

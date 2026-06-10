@@ -346,24 +346,20 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Returns true if `new_toc` has any path that isn't in `old_toc`.
+/// Returns true if `new_toc` has any line that isn't in `old_toc`.
 /// Mirrors the bash `diff old new | grep -qe '^>'` check at line 310.
+/// Lines are `<size> <path>`, compared whole: a clip that merely grew
+/// (same name, new size — e.g. it was still being written during the
+/// previous snapshot) must count as new, otherwise the fuller copy gets
+/// discarded as a duplicate.
 fn toc_has_additions(old_toc: &str, new_toc: &str) -> Result<bool> {
     let old = std::fs::read_to_string(old_toc).unwrap_or_default();
     let new = std::fs::read_to_string(new_toc)?;
-    let old_set: std::collections::HashSet<&str> = old
+    let old_set: std::collections::HashSet<&str> =
+        old.lines().filter(|l| !l.is_empty()).collect();
+    Ok(new
         .lines()
-        .map(|l| l.split_once(' ').map(|x| x.1).unwrap_or(""))
-        .filter(|s| !s.is_empty())
-        .collect();
-    for line in new.lines() {
-        if let Some((_, path)) = line.split_once(' ') {
-            if !path.is_empty() && !old_set.contains(path) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+        .any(|line| !line.is_empty() && !old_set.contains(line)))
 }
 
 /// Build `/mutable/TeslaCam/{RecentClips,SavedClips,SentryClips,TeslaTrackMode}`
@@ -655,7 +651,7 @@ async fn apply_bookworm_32bit_timestamp_fix(snap_file: &str) -> Result<()> {
         return Ok(());
     }
     let cmd = format!(
-        "find {} -newerat 20380101 | xargs -r touch",
+        "find {} -newerat 20380101 -print0 | xargs -r -0 touch",
         shell_escape(&tmpmnt)
     );
     let _ = sentryusb_shell::run("bash", &["-c", &cmd]).await;

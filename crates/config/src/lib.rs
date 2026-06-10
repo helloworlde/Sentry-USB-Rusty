@@ -21,8 +21,6 @@ const LEGACY_BOOT_PATH: &str = "/boot/sentryusb.conf";
 pub fn find_config_path() -> &'static str {
     for p in [DEFAULT_CONFIG_PATH, BOOT_CONFIG_PATH, LEGACY_BOOT_PATH] {
         if Path::new(p).exists() {
-            // Leak the string so we can return a static reference.
-            // This is called once at startup, so it's fine.
             return p;
         }
     }
@@ -185,8 +183,11 @@ fn quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
-    // If value contains no special characters, leave it bare
-    const SPECIAL: &str = " \t'\"\\$!#&|;(){}[]<>?*~`";
+    // If value contains no special characters, leave it bare.
+    // \n and \r are included so an embedded newline gets quoted — the file
+    // stays valid bash for `source` consumers. (parse_file is line-based
+    // and still can't round-trip multi-line values; see review ledger.)
+    const SPECIAL: &str = " \t\n\r'\"\\$!#&|;(){}[]<>?*~`";
     if !s.chars().any(|c| SPECIAL.contains(c)) {
         return s.to_string();
     }

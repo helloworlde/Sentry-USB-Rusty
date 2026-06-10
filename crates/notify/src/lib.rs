@@ -77,6 +77,11 @@ pub struct NotifyConfig {
     pub sns_enabled: bool,
     pub sns_topic_arn: String,
     pub sns_region: String,
+    // Passed to the SNS signer because systemd starts the server without
+    // sourcing sentryusb.conf — env-only AWS credential lookups never
+    // resolve on a normal install (see sns.rs).
+    pub sns_access_key: String,
+    pub sns_secret_key: String,
 
     pub mobile_push_enabled: bool,
     pub mobile_push_device_id: String,
@@ -160,6 +165,8 @@ impl NotifyConfig {
             sns_enabled: is_true("SNS_ENABLED"),
             sns_topic_arn: get("AWS_SNS_TOPIC_ARN"),
             sns_region: get("AWS_REGION"),
+            sns_access_key: get("AWS_ACCESS_KEY_ID"),
+            sns_secret_key: get("AWS_SECRET_ACCESS_KEY"),
 
             mobile_push_enabled,
             mobile_push_device_id,
@@ -199,21 +206,6 @@ pub struct NotifyRequest<'a> {
     /// Total clip count for the pending archive run — enables the
     /// live_activity payload on `archive_start`.
     pub archive_total_count: Option<u32>,
-}
-
-/// Send a notification to all enabled providers using only title + message.
-/// Kept for callers (e.g. the `/api/notifications/test` endpoint) that
-/// don't need to drive live-activity or notification-type plumbing.
-pub async fn send_to_all(
-    config: &NotifyConfig,
-    title: &str,
-    message: &str,
-) -> Vec<(String, Result<()>)> {
-    send_to_all_with_context(
-        config,
-        &NotifyRequest { title, message, ..Default::default() },
-    )
-    .await
 }
 
 /// Process-wide shared client for outbound notification dispatches.
@@ -344,7 +336,7 @@ pub async fn send_to_all_with_context(
 
     if config.sns_enabled {
         sends.push(("SNS", "sns".into(), Box::pin(
-            sns::send(&config.sns_topic_arn, title, message),
+            sns::send(client, &config.sns_topic_arn, &config.sns_region, &config.sns_access_key, &config.sns_secret_key, title, message),
         )));
     }
 

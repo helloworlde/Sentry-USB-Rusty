@@ -143,14 +143,24 @@ pub fn enable() -> Result<()> {
             // On kernel 6.18+, a UDC unbind closes the LUN backing file.
             // Rebinding without refreshing the LUN produces "(no medium)".
             // Clear and rewrite each LUN file so the kernel re-opens it.
+            //
+            // Read the path each LUN currently holds and rewrite that same
+            // path — LUN numbering is compact (enable() skips missing
+            // images), so indexing DISK_IMAGES positionally here would
+            // refresh the wrong LUN (or none) whenever an image is absent.
             let func_dir = gadget.join("functions/mass_storage.0");
-            for (i, (image_path, _)) in DISK_IMAGES.iter().enumerate() {
+            for i in 0..DISK_IMAGES.len() {
                 let lun_file = func_dir.join(format!("lun.{}/file", i));
-                if lun_file.exists() && Path::new(image_path).exists() {
-                    let _ = fs::write(&lun_file, "\n");
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    let _ = fs::write(&lun_file, image_path);
+                let current = match fs::read_to_string(&lun_file) {
+                    Ok(s) => s.trim().to_string(),
+                    Err(_) => continue,
+                };
+                if current.is_empty() || !Path::new(&current).exists() {
+                    continue;
                 }
+                let _ = fs::write(&lun_file, "\n");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let _ = fs::write(&lun_file, &current);
             }
             std::thread::sleep(std::time::Duration::from_secs(3));
             return bind_udc(&gadget);

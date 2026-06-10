@@ -16,7 +16,6 @@ use tower_http::compression::{
 use tracing::info;
 
 mod embed;
-mod state;
 mod migrate;
 
 #[derive(Parser)]
@@ -29,10 +28,6 @@ struct Args {
     /// Development mode (don't serve embedded static files)
     #[arg(long)]
     dev: bool,
-
-    /// Path to static files directory (overrides embedded)
-    #[arg(long)]
-    r#static: Option<String>,
 
     /// Optional subcommand. Without one, the HTTP server runs.
     ///
@@ -381,6 +376,19 @@ async fn main() {
 }
 
 async fn shutdown_signal() {
+    // systemd stops the service with SIGTERM — without listening for it
+    // the graceful drain below only ever ran on interactive Ctrl+C.
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c()
         .await
         .expect("failed to install CTRL+C handler");

@@ -1,22 +1,43 @@
 //! AWS SNS Publish — native SigV4 signed request.
 //!
-//! Reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and optional
-//! AWS_SESSION_TOKEN) from the environment the same way boto3 does.
-//! Region is parsed from the topic ARN if `sns_region` is empty.
+//! Credentials come from the environment (AWS_ACCESS_KEY_ID /
+//! AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN) when set, falling
+//! back to the values from sentryusb.conf. The fallback matters: systemd
+//! starts the server without sourcing the conf, so env-only lookups left
+//! SNS permanently broken for installs configured through the web UI.
+//! Region is parsed from the topic ARN, then the conf, then AWS_REGION.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use chrono::Utc;
+use reqwest::Client;
 use ring::hmac;
 
-pub async fn send(topic_arn: &str, title: &str, message: &str) -> Result<()> {
-    let access_key = std::env::var("AWS_ACCESS_KEY_ID")
-        .context("AWS_ACCESS_KEY_ID not set")?;
-    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .context("AWS_SECRET_ACCESS_KEY not set")?;
-    let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+fn env_or_conf(env_key: &str, conf_val: &str) -> Option<String> {
+    std::env::var(env_key)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| (!conf_val.is_empty()).then(|| conf_val.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn send(
+    client: &Client,
+    topic_arn: &str,
+    region_conf: &str,
+    access_key_conf: &str,
+    secret_key_conf: &str,
+    title: &str,
+    message: &str,
+) -> Result<()> {
+    let access_key = env_or_conf("AWS_ACCESS_KEY_ID", access_key_conf)
+        .ok_or_else(|| anyhow::anyhow!("AWS_ACCESS_KEY_ID not set (env or sentryusb.conf)"))?;
+    let secret_key = env_or_conf("AWS_SECRET_ACCESS_KEY", secret_key_conf)
+        .ok_or_else(|| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY not set (env or sentryusb.conf)"))?;
+    let session_token = std::env::var("AWS_SESSION_TOKEN").ok().filter(|v| !v.is_empty());
 
     let region = region_from_arn(topic_arn)
-        .or_else(|| std::env::var("AWS_REGION").ok())
+        .or_else(|| (!region_conf.is_empty()).then(|| region_conf.to_string()))
+        .or_else(|| std::env::var("AWS_REGION").ok().filter(|v| !v.is_empty()))
         .unwrap_or_else(|| "us-east-1".to_string());
 
     let host = format!("sns.{}.amazonaws.com", region);
@@ -73,9 +94,6 @@ pub async fn send(topic_arn: &str, title: &str, message: &str) -> Result<()> {
         access_key, credential_scope, signed_headers, signature,
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
     let mut req = client
         .post(&url)
         .header("Content-Type", "application/x-www-form-urlencoded")
