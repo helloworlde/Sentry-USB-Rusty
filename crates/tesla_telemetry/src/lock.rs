@@ -57,15 +57,35 @@ const NUDGE_PID_FILE: &str = "/tmp/keep_awake_nudge_pid";
 /// hold the lock for seconds-to-minutes at a time, and the cost of a
 /// lost race is just one extra retry on the next 5-second tick.
 pub fn try_acquire(owner: &str) -> Result<bool> {
+    try_acquire_at(
+        Path::new(LOCK_PATH),
+        Path::new(ARCHIVE_STATUS_PATH),
+        Path::new(NUDGE_PID_FILE),
+        owner,
+    )
+}
+
+/// Path-parameterized core of [`try_acquire`]. Production goes through
+/// the wrapper above; tests pass temp paths so `cargo test` never
+/// touches the real `/tmp/ble_radio_owner` — on a live Pi that file is
+/// owned by the running daemon, so tests against the real path either
+/// fail with EPERM (unprivileged) or, worse, steal the production lock
+/// (root).
+fn try_acquire_at(
+    lock_path: &Path,
+    archive_status: &Path,
+    nudge_pid: &Path,
+    owner: &str,
+) -> Result<bool> {
     let now = now_secs();
 
-    if Path::new(LOCK_PATH).exists() {
-        match read_lock() {
+    if lock_path.exists() {
+        match read_lock(lock_path) {
             Ok((existing_owner, ts)) => {
                 if existing_owner == owner {
                     // Re-acquire — refresh the timestamp so a long
                     // hold doesn't appear stale.
-                    write_lock(owner, now)?;
+                    write_lock(lock_path, owner, now)?;
                     return Ok(true);
                 }
                 let age = now - ts;
@@ -74,7 +94,7 @@ pub fn try_acquire(owner: &str) -> Result<bool> {
                         "BLE radio lock held by '{}' for {}s — assuming crashed, taking over",
                         existing_owner, age
                     );
-                    write_lock(owner, now)?;
+                    write_lock(lock_path, owner, now)?;
                     return Ok(true);
                 }
                 // Orphan check for keep_awake: archiveloop bails on
@@ -85,27 +105,27 @@ pub fn try_acquire(owner: &str) -> Result<bool> {
                 // wait the full 24h.
                 if existing_owner == "keep_awake"
                     && age >= KEEP_AWAKE_ORPHAN_GRACE_SECS
-                    && !is_archive_active()
-                    && !is_nudge_alive()
+                    && !is_archive_active_at(archive_status)
+                    && !is_nudge_alive_at(nudge_pid)
                 {
                     warn!(
                         "BLE radio lock owned by keep_awake but no active archive/nudge ({}s old) — orphan, taking over",
                         age
                     );
-                    write_lock(owner, now)?;
+                    write_lock(lock_path, owner, now)?;
                     return Ok(true);
                 }
                 return Ok(false);
             }
             Err(e) => {
                 warn!("BLE radio lock file unreadable ({}) — overwriting", e);
-                write_lock(owner, now)?;
+                write_lock(lock_path, owner, now)?;
                 return Ok(true);
             }
         }
     }
 
-    write_lock(owner, now)?;
+    write_lock(lock_path, owner, now)?;
     info!("BLE radio lock acquired by '{}'", owner);
     Ok(true)
 }
@@ -114,13 +134,17 @@ pub fn try_acquire(owner: &str) -> Result<bool> {
 /// or owned by someone else (some other component may have taken it
 /// over due to staleness).
 pub fn release(owner: &str) -> Result<()> {
-    if !Path::new(LOCK_PATH).exists() {
+    release_at(Path::new(LOCK_PATH), owner)
+}
+
+fn release_at(lock_path: &Path, owner: &str) -> Result<()> {
+    if !lock_path.exists() {
         return Ok(());
     }
-    match read_lock() {
+    match read_lock(lock_path) {
         Ok((existing_owner, _)) if existing_owner == owner => {
-            fs::remove_file(LOCK_PATH)
-                .with_context(|| format!("failed to remove {}", LOCK_PATH))?;
+            fs::remove_file(lock_path)
+                .with_context(|| format!("failed to remove {}", lock_path.display()))?;
             info!("BLE radio lock released by '{}'", owner);
         }
         Ok((other, _)) => {
@@ -140,12 +164,16 @@ pub fn release(owner: &str) -> Result<()> {
 /// Diagnostic helper — never use this to decide whether to acquire
 /// (use [`try_acquire`] for that, which handles staleness).
 pub fn current_owner() -> Option<String> {
-    read_lock().ok().map(|(owner, _)| owner)
+    current_owner_at(Path::new(LOCK_PATH))
 }
 
-fn read_lock() -> Result<(String, i64)> {
-    let contents = fs::read_to_string(LOCK_PATH)
-        .with_context(|| format!("failed to read {}", LOCK_PATH))?;
+fn current_owner_at(lock_path: &Path) -> Option<String> {
+    read_lock(lock_path).ok().map(|(owner, _)| owner)
+}
+
+fn read_lock(lock_path: &Path) -> Result<(String, i64)> {
+    let contents = fs::read_to_string(lock_path)
+        .with_context(|| format!("failed to read {}", lock_path.display()))?;
     let mut lines = contents.lines();
     let owner = lines
         .next()
@@ -159,18 +187,19 @@ fn read_lock() -> Result<(String, i64)> {
     Ok((owner, ts))
 }
 
-fn write_lock(owner: &str, ts: i64) -> Result<()> {
+fn write_lock(lock_path: &Path, owner: &str, ts: i64) -> Result<()> {
     // Atomic-ish: write to .tmp then rename. Cheap because /tmp is
     // tmpfs.
-    let tmp = format!("{}.tmp", LOCK_PATH);
+    let tmp = lock_path.with_extension("tmp");
     {
         let mut f = fs::File::create(&tmp)
-            .with_context(|| format!("failed to create {}", tmp))?;
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
         writeln!(f, "{}", owner)?;
         writeln!(f, "{}", ts)?;
     }
-    fs::rename(&tmp, LOCK_PATH)
-        .with_context(|| format!("failed to rename {} -> {}", tmp, LOCK_PATH))?;
+    fs::rename(&tmp, lock_path).with_context(|| {
+        format!("failed to rename {} -> {}", tmp.display(), lock_path.display())
+    })?;
     Ok(())
 }
 
@@ -185,7 +214,11 @@ fn now_secs() -> i64 {
 /// within 120s). Used by the orphan-lock check to distinguish a
 /// stuck "keep_awake" lock from a real archive cycle.
 pub fn is_archive_active() -> bool {
-    let Ok(meta) = std::fs::metadata(ARCHIVE_STATUS_PATH) else {
+    is_archive_active_at(Path::new(ARCHIVE_STATUS_PATH))
+}
+
+fn is_archive_active_at(status_path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(status_path) else {
         return false;
     };
     let Ok(modified) = meta.modified() else {
@@ -203,7 +236,11 @@ pub fn is_archive_active() -> bool {
 /// is rare on a Pi with a sparse process table; in that case we
 /// just don't steal the lock and fall through to the 24h safety net.
 fn is_nudge_alive() -> bool {
-    let Ok(pid_str) = std::fs::read_to_string(NUDGE_PID_FILE) else {
+    is_nudge_alive_at(Path::new(NUDGE_PID_FILE))
+}
+
+fn is_nudge_alive_at(pid_file: &Path) -> bool {
+    let Ok(pid_str) = std::fs::read_to_string(pid_file) else {
         return false;
     };
     let Ok(pid) = pid_str.trim().parse::<u32>() else {
@@ -227,103 +264,133 @@ pub fn keep_awake_requested() -> bool {
 mod tests {
     use super::*;
 
-    // The lock path is global — tests that mutate it serialize via
-    // this mutex to avoid cross-test interference.
-    use std::sync::Mutex;
-    static LOCK: Mutex<()> = Mutex::new(());
+    /// Hermetic per-test path set: everything under a fresh temp dir,
+    /// so `cargo test` never touches the real /tmp/ble_radio_owner —
+    /// on a live Pi that file belongs to the running daemon (tests
+    /// against it fail with EPERM unprivileged, or steal the
+    /// production lock as root).
+    struct Env {
+        _dir: tempfile::TempDir,
+        lock: std::path::PathBuf,
+        archive: std::path::PathBuf,
+        nudge: std::path::PathBuf,
+    }
 
-    fn with_tmp_lock<F: FnOnce()>(f: F) {
-        let _g = LOCK.lock().unwrap();
-        let _ = fs::remove_file(LOCK_PATH);
-        f();
-        let _ = fs::remove_file(LOCK_PATH);
+    impl Env {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            Env {
+                lock: dir.path().join("ble_radio_owner"),
+                archive: dir.path().join("archive_status.json"),
+                nudge: dir.path().join("keep_awake_nudge_pid"),
+                _dir: dir,
+            }
+        }
+        fn acquire(&self, owner: &str) -> bool {
+            try_acquire_at(&self.lock, &self.archive, &self.nudge, owner).unwrap()
+        }
+        fn owner(&self) -> Option<String> {
+            current_owner_at(&self.lock)
+        }
     }
 
     #[test]
     fn acquire_when_unheld_succeeds() {
-        with_tmp_lock(|| {
-            assert!(try_acquire("telemetry").unwrap());
-            assert_eq!(current_owner().as_deref(), Some("telemetry"));
-        });
+        let env = Env::new();
+        assert!(env.acquire("telemetry"));
+        assert_eq!(env.owner().as_deref(), Some("telemetry"));
     }
 
     #[test]
     fn acquire_when_we_already_own_succeeds() {
-        with_tmp_lock(|| {
-            try_acquire("telemetry").unwrap();
-            assert!(try_acquire("telemetry").unwrap(), "self-reacquire should succeed");
-        });
+        let env = Env::new();
+        env.acquire("telemetry");
+        assert!(env.acquire("telemetry"), "self-reacquire should succeed");
     }
 
     #[test]
     fn acquire_when_other_owner_fresh_fails() {
-        with_tmp_lock(|| {
-            try_acquire("keep_awake").unwrap();
-            assert!(!try_acquire("telemetry").unwrap());
-            assert_eq!(current_owner().as_deref(), Some("keep_awake"));
-        });
+        let env = Env::new();
+        env.acquire("keep_awake");
+        assert!(!env.acquire("telemetry"));
+        assert_eq!(env.owner().as_deref(), Some("keep_awake"));
     }
 
     #[test]
     fn acquire_steals_stale_lock() {
-        with_tmp_lock(|| {
-            // Write a stale lock from another owner.
-            write_lock("keep_awake", now_secs() - STALE_AFTER_SECS - 1).unwrap();
-            assert!(try_acquire("telemetry").unwrap(), "stale lock should be stealable");
-            assert_eq!(current_owner().as_deref(), Some("telemetry"));
-        });
+        let env = Env::new();
+        // Write a stale lock from another owner.
+        write_lock(&env.lock, "keep_awake", now_secs() - STALE_AFTER_SECS - 1).unwrap();
+        assert!(env.acquire("telemetry"), "stale lock should be stealable");
+        assert_eq!(env.owner().as_deref(), Some("telemetry"));
     }
 
     #[test]
     fn acquire_steals_orphaned_keep_awake_lock() {
-        with_tmp_lock(|| {
-            // Simulate: archive crashed mid-cycle (or set -e killed it
-            // pre-trap). Lock is keep_awake, well past the grace
-            // window, but no fresh archive status and no nudge PID
-            // (default for an in-memory test harness).
-            write_lock(
-                "keep_awake",
-                now_secs() - KEEP_AWAKE_ORPHAN_GRACE_SECS - 5,
-            )
-            .unwrap();
-            assert!(
-                try_acquire("telemetry").unwrap(),
-                "orphaned keep_awake lock should be stealable after grace",
-            );
-            assert_eq!(current_owner().as_deref(), Some("telemetry"));
-        });
+        let env = Env::new();
+        // Simulate: archive crashed mid-cycle (or set -e killed it
+        // pre-trap). Lock is keep_awake, well past the grace window,
+        // but no fresh archive status and no nudge PID (both paths
+        // absent in the hermetic temp dir).
+        write_lock(
+            &env.lock,
+            "keep_awake",
+            now_secs() - KEEP_AWAKE_ORPHAN_GRACE_SECS - 5,
+        )
+        .unwrap();
+        assert!(
+            env.acquire("telemetry"),
+            "orphaned keep_awake lock should be stealable after grace",
+        );
+        assert_eq!(env.owner().as_deref(), Some("telemetry"));
+    }
+
+    #[test]
+    fn acquire_waits_for_fresh_archive_even_past_grace() {
+        let env = Env::new();
+        // Past the grace window but an archive IS running (fresh
+        // status file) — the lock must NOT be stolen.
+        write_lock(
+            &env.lock,
+            "keep_awake",
+            now_secs() - KEEP_AWAKE_ORPHAN_GRACE_SECS - 5,
+        )
+        .unwrap();
+        std::fs::write(&env.archive, b"{}").unwrap();
+        assert!(
+            !env.acquire("telemetry"),
+            "keep_awake lock with a live archive must not be stolen",
+        );
+        assert_eq!(env.owner().as_deref(), Some("keep_awake"));
     }
 
     #[test]
     fn acquire_respects_grace_window_on_keep_awake_lock() {
-        with_tmp_lock(|| {
-            // Within the grace window — even with no archive/nudge,
-            // don't steal. Avoids a race where archiveloop just ran
-            // awake_start and hasn't written archive_status.json yet.
-            write_lock("keep_awake", now_secs()).unwrap();
-            assert!(
-                !try_acquire("telemetry").unwrap(),
-                "fresh keep_awake lock should NOT be stolen during grace",
-            );
-            assert_eq!(current_owner().as_deref(), Some("keep_awake"));
-        });
+        let env = Env::new();
+        // Within the grace window — even with no archive/nudge,
+        // don't steal. Avoids a race where archiveloop just ran
+        // awake_start and hasn't written archive_status.json yet.
+        write_lock(&env.lock, "keep_awake", now_secs()).unwrap();
+        assert!(
+            !env.acquire("telemetry"),
+            "fresh keep_awake lock should NOT be stolen during grace",
+        );
+        assert_eq!(env.owner().as_deref(), Some("keep_awake"));
     }
 
     #[test]
     fn release_removes_when_we_own() {
-        with_tmp_lock(|| {
-            try_acquire("telemetry").unwrap();
-            release("telemetry").unwrap();
-            assert!(current_owner().is_none());
-        });
+        let env = Env::new();
+        env.acquire("telemetry");
+        release_at(&env.lock, "telemetry").unwrap();
+        assert!(env.owner().is_none());
     }
 
     #[test]
     fn release_noop_when_other_owns() {
-        with_tmp_lock(|| {
-            try_acquire("keep_awake").unwrap();
-            release("telemetry").unwrap();
-            assert_eq!(current_owner().as_deref(), Some("keep_awake"));
-        });
+        let env = Env::new();
+        env.acquire("keep_awake");
+        release_at(&env.lock, "telemetry").unwrap();
+        assert_eq!(env.owner().as_deref(), Some("keep_awake"));
     }
 }

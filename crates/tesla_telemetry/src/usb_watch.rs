@@ -4,7 +4,7 @@
 //! No writes for several minutes = car asleep.
 
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 /// Path to the dashcam disk image — same constant used by the
 /// `usb_gadget` crate. The car writes to this file via the USB
@@ -59,17 +59,6 @@ pub fn observe_path(path: &Path) -> CarState {
     } else {
         CarState::Asleep
     }
-}
-
-/// Convenience: unix-seconds mtime, for logging.
-#[allow(dead_code)]
-pub fn last_write_ts(path: &Path) -> Option<i64> {
-    path.metadata()
-        .and_then(|m| m.modified())
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs() as i64)
 }
 
 #[cfg(test)]

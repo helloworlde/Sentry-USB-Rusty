@@ -8,9 +8,10 @@
 //! dependency on NTP or internet access.
 //!
 //! Design:
-//!   * Latency-compensated: applies half the round-trip-time to the
-//!     vehicle timestamp, so we land within ~50 ms of the true time
-//!     even though the BLE call took 1-5 s.
+//!   * Latency-compensated: adds a fixed ~50 ms transmit latency to the
+//!     vehicle timestamp (empirically constant regardless of RTT — see
+//!     RESPONSE_LATENCY_COMPENSATION_MS), landing within ~12 ms of an
+//!     NTP reference even though the BLE call took 1-5 s.
 //!   * NTP-friendly: only adjusts when local-vs-vehicle delta exceeds
 //!     a threshold (default 5 min). Avoids fighting NTP's normal sub-
 //!     second drift correction.
@@ -43,72 +44,9 @@ const ADJUSTMENT_THRESHOLD_MS: i64 = 300_000;
 /// brings our clock-sync accuracy from ~54ms to ~12ms vs NTP.
 const RESPONSE_LATENCY_COMPENSATION_MS: i64 = 50;
 
-/// Parse the RFC 3339 / ISO 8601 timestamp Tesla emits in state
-/// responses (e.g. `"2026-05-25T04:31:59.107Z"`). Returns unix-secs.
-///
-/// We don't use chrono here to avoid adding a heavy dep for one
-/// fixed-format parse. The format Tesla uses is rigid: YYYY-MM-DD
-/// 'T' HH:MM:SS '.' fff 'Z' (UTC, always). Anything else returns None.
-/// Like `parse_rfc3339_secs` but preserves the fractional-second
-/// precision Tesla emits (e.g. `.794Z` → 794 milliseconds). Needed
-/// because second-rounding alone introduces up to 999ms of error,
-/// which dominates the actual ~50ms BLE latency we're trying to
-/// compensate for.
-pub fn parse_rfc3339_ms(s: &str) -> Option<i64> {
-    let secs = parse_rfc3339_secs(s)?;
-    let frac_ms = if let Some(dot_pos) = s.find('.') {
-        // `s` ends with 'Z' (parse_rfc3339_secs guarantees), so the
-        // fractional part is between '.' and that 'Z'.
-        let frac_str = &s[dot_pos + 1..s.len() - 1];
-        match frac_str.parse::<u32>() {
-            Ok(n) => match frac_str.len() {
-                1 => (n as i64) * 100,
-                2 => (n as i64) * 10,
-                3 => n as i64,
-                // Microsecond/nanosecond precision — truncate to ms.
-                len => (n as i64) / 10_i64.pow((len - 3) as u32),
-            },
-            Err(_) => 0,
-        }
-    } else {
-        0
-    };
-    Some(secs * 1000 + frac_ms)
-}
-
-pub fn parse_rfc3339_secs(s: &str) -> Option<i64> {
-    // Expected length: "2026-05-25T04:31:59.107Z" = 24 chars typically.
-    // Accept either with or without fractional seconds, both ending Z.
-    if s.len() < 20 || !s.ends_with('Z') {
-        return None;
-    }
-    let b = s.as_bytes();
-    // Sanity-check separator positions.
-    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T'
-        || b[13] != b':' || b[16] != b':'
-    {
-        return None;
-    }
-    let year: i32 = s.get(0..4)?.parse().ok()?;
-    let month: u32 = s.get(5..7)?.parse().ok()?;
-    let day: u32 = s.get(8..10)?.parse().ok()?;
-    let hour: u32 = s.get(11..13)?.parse().ok()?;
-    let minute: u32 = s.get(14..16)?.parse().ok()?;
-    let second: u32 = s.get(17..19)?.parse().ok()?;
-
-    // Days-since-epoch for the given Y/M/D, handling leap years.
-    // Algorithm: Howard Hinnant's "Date Algorithms" days_from_civil.
-    // Same formula used by C++'s <chrono> and Linux kernel
-    // mktime64 — handles every Gregorian date correctly.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32;
-    let m = month as i32;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i32 - 1;
-    let doe = (yoe * 365 + yoe / 4 - yoe / 100) as i32 + doy;
-    let days_since_epoch = (era as i64) * 146097 + (doe as i64) - 719468;
-    Some(days_since_epoch * 86400 + (hour as i64) * 3600 + (minute as i64) * 60 + second as i64)
-}
+// The hand-rolled RFC 3339 parsers that used to live here served the
+// shell-out sampler's JSON timestamps; the in-process BLE path reads
+// protobuf Timestamps directly, so they were removed with it.
 
 /// If the local clock is meaningfully wrong (>5 min from vehicle), set
 /// it to vehicle time. Optionally persist to RTC.
@@ -192,36 +130,3 @@ pub fn maybe_set_clock_from_vehicle(
     true
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_standard_tesla_timestamp() {
-        // From actual Tesla state-drive response in our captures.
-        let ts = parse_rfc3339_secs("2026-05-25T04:32:23.794Z").unwrap();
-        // 2026-05-25T04:32:23Z = 1779683543
-        assert_eq!(ts, 1779683543);
-    }
-
-    #[test]
-    fn parses_without_fractional_seconds() {
-        let ts = parse_rfc3339_secs("2024-01-15T10:00:00Z").unwrap();
-        // 2024-01-15T10:00:00Z = 1705312800 (verified against `date -u -d`)
-        assert_eq!(ts, 1705312800);
-    }
-
-    #[test]
-    fn rejects_bad_format() {
-        assert!(parse_rfc3339_secs("not a timestamp").is_none());
-        assert!(parse_rfc3339_secs("2024-13-01T00:00:00Z").is_some()); // we don't range-check month
-        assert!(parse_rfc3339_secs("2024-01-15 10:00:00Z").is_none()); // space instead of T
-    }
-
-    #[test]
-    fn handles_leap_year() {
-        // Feb 29 2024 was a real day.
-        let ts = parse_rfc3339_secs("2024-02-29T00:00:00Z").unwrap();
-        assert_eq!(ts, 1709164800);
-    }
-}

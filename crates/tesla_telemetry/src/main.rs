@@ -513,6 +513,37 @@ async fn tick(
         }
     };
 
+    // Disabled / unconfigured checks BEFORE the session spawn. The old
+    // order ensured the session first, which (a) kept a warm GATT
+    // connection to the car alive forever after the user disabled BLE
+    // in settings, and (b) on a Pi with no BLE key file turned the
+    // intended 60s idle poll into a 5s retry spin with a warning logged
+    // every cycle.
+    if !cfg.enabled {
+        if *held_radio {
+            info!("BLE disabled in settings — releasing radio");
+            release_radio().await;
+            *held_radio = false;
+        }
+        // Drop the persistent session so disabling BLE actually closes
+        // the BLE connection to the car.
+        *ble_session = None;
+        *parked_polls = 0;
+        *last_user_presence = None;
+        return (DISABLED_POLL, Some(cfg));
+    }
+    if cfg.vin.is_empty() {
+        debug!("no TESLA_BLE_VIN configured, idling");
+        if *held_radio {
+            release_radio().await;
+            *held_radio = false;
+        }
+        *ble_session = None;
+        *parked_polls = 0;
+        *last_user_presence = None;
+        return (DISABLED_POLL, Some(cfg));
+    }
+
     // Lazy-spawn / recreate-on-VIN-change the persistent BLE session.
     // Cheap when it exists (a VIN compare); the first call does the
     // key-load + scan + connect + handshake.
@@ -524,27 +555,6 @@ async fn tick(
         .as_ref()
         .expect("ensure_session_for set it on success")
         .session;
-
-    if !cfg.enabled {
-        if *held_radio {
-            info!("BLE disabled in settings — releasing radio");
-            release_radio().await;
-            *held_radio = false;
-        }
-        *parked_polls = 0;
-        *last_user_presence = None;
-        return (DISABLED_POLL, Some(cfg));
-    }
-    if cfg.vin.is_empty() {
-        debug!("no TESLA_BLE_VIN configured, idling");
-        if *held_radio {
-            release_radio().await;
-            *held_radio = false;
-        }
-        *parked_polls = 0;
-        *last_user_presence = None;
-        return (DISABLED_POLL, Some(cfg));
-    }
 
     let observation = usb_watch::observe();
     let car_truly_asleep = observation == CarState::Asleep;

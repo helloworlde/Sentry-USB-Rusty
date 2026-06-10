@@ -19,7 +19,15 @@ pub fn open() -> Result<Connection> {
     }
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open {}", path))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    // busy_timeout matters here: this daemon shares the WAL DB with the
+    // main server process. Without it, a write that lands while the
+    // server holds the write lock fails instantly with SQLITE_BUSY and
+    // the sample is dropped; with it, rusqlite retries for up to 5s.
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA busy_timeout=5000;",
+    )?;
     sentryusb_drives::schema::migrate(&conn)
         .context("schema migrate failed in telemetry sampler")?;
     Ok(conn)
