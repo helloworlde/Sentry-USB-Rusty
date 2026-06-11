@@ -10,7 +10,22 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OpenFlags, ToSql};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, ToSql};
+
+/// Upsert a cloud-sync dirty row. `changed_at` is local wall-clock ms —
+/// used for last-writer-wins against the cloud, clamped server-side so
+/// a bad clock can't win forever.
+fn mark_mutable_dirty(conn: &Connection, kind: &str, key: &str) -> rusqlite::Result<usize> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT INTO mutable_dirty(kind, key, changed_at) VALUES(?1, ?2, ?3) \
+         ON CONFLICT(kind, key) DO UPDATE SET changed_at = excluded.changed_at",
+        params![kind, key, now_ms],
+    )
+}
 use tracing::{info, warn};
 
 use crate::aggregate::compute_route_aggregates;
@@ -586,8 +601,19 @@ impl DriveStore {
     }
 
     /// Replace the tags for `drive_key`. Empty/zero-length `tags` drops
-    /// the entry entirely.
+    /// the entry entirely. Queues the change for cloud sync.
     pub fn set_drive_tags(&self, drive_key: &str, tags: &[String]) -> Result<()> {
+        self.set_drive_tags_inner(drive_key, tags, true)
+    }
+
+    /// Same as `set_drive_tags` but does NOT queue the change for cloud
+    /// sync — used when APPLYING a change pulled from the cloud, so the
+    /// write doesn't echo straight back up.
+    pub fn set_drive_tags_from_sync(&self, drive_key: &str, tags: &[String]) -> Result<()> {
+        self.set_drive_tags_inner(drive_key, tags, false)
+    }
+
+    fn set_drive_tags_inner(&self, drive_key: &str, tags: &[String], mark_dirty: bool) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
@@ -604,6 +630,9 @@ impl DriveStore {
                 }
                 stmt.execute(params![drive_key, t])?;
             }
+        }
+        if mark_dirty {
+            mark_mutable_dirty(&tx, "drive", drive_key)?;
         }
         tx.commit()?;
         self.drive_cache_dirty.store(true, Ordering::Release);
@@ -656,8 +685,18 @@ impl DriveStore {
     // flag: charge tags don't feed the route cache.
 
     /// Replace the tags for charge session `session_ts`. Empty `tags`
-    /// drops the entry entirely.
+    /// drops the entry entirely. Queues the change for cloud sync.
     pub fn set_charge_tags(&self, session_ts: i64, tags: &[String]) -> Result<()> {
+        self.set_charge_tags_inner(session_ts, tags, true)
+    }
+
+    /// `set_charge_tags` without the cloud-sync dirty mark — for applying
+    /// changes pulled FROM the cloud (no echo loop).
+    pub fn set_charge_tags_from_sync(&self, session_ts: i64, tags: &[String]) -> Result<()> {
+        self.set_charge_tags_inner(session_ts, tags, false)
+    }
+
+    fn set_charge_tags_inner(&self, session_ts: i64, tags: &[String], mark_dirty: bool) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
@@ -674,6 +713,9 @@ impl DriveStore {
                 }
                 stmt.execute(params![session_ts, t])?;
             }
+        }
+        if mark_dirty {
+            mark_mutable_dirty(&tx, "charge", &session_ts.to_string())?;
         }
         tx.commit()?;
         Ok(())
@@ -730,7 +772,23 @@ impl DriveStore {
 
     /// Set, or clear when `cost` is `None`, the manual cost override for
     /// charge session `session_ts`. `cost` is `(amount, currency)`.
+    /// Queues the change for cloud sync (tags + cost share one envelope).
     pub fn set_charge_cost(&self, session_ts: i64, cost: Option<(f64, String)>) -> Result<()> {
+        self.set_charge_cost_inner(session_ts, cost, true)
+    }
+
+    /// `set_charge_cost` without the cloud-sync dirty mark — for applying
+    /// changes pulled FROM the cloud (no echo loop).
+    pub fn set_charge_cost_from_sync(&self, session_ts: i64, cost: Option<(f64, String)>) -> Result<()> {
+        self.set_charge_cost_inner(session_ts, cost, false)
+    }
+
+    fn set_charge_cost_inner(
+        &self,
+        session_ts: i64,
+        cost: Option<(f64, String)>,
+        mark_dirty: bool,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         match cost {
             Some((amount, currency)) => conn.execute(
@@ -743,6 +801,9 @@ impl DriveStore {
                 params![session_ts],
             )?,
         };
+        if mark_dirty {
+            mark_mutable_dirty(&conn, "charge", &session_ts.to_string())?;
+        }
         Ok(())
     }
 
@@ -782,6 +843,161 @@ impl DriveStore {
         for r in rows {
             let (k, amount, currency) = r?;
             out.insert(k, (amount, currency));
+        }
+        Ok(out)
+    }
+
+    // ── Cloud mutable sync ─────────────────────────────────────────────
+
+    /// Queue the per-Pi rate config for cloud push. Called by the api
+    /// crate whenever a `charging_*` preference changes.
+    pub fn mark_rate_config_dirty(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        mark_mutable_dirty(&conn, "rate", "")?;
+        Ok(())
+    }
+
+    /// Every locally-changed mutable awaiting push: (kind, key, changed_at ms).
+    pub fn dirty_mutables(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT kind, key, changed_at FROM mutable_dirty ORDER BY changed_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Drop a dirty row after a successful push — only if `changed_at`
+    /// still matches (a newer local edit during the push stays queued).
+    pub fn clear_mutable_dirty(&self, kind: &str, key: &str, changed_at: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM mutable_dirty WHERE kind = ?1 AND key = ?2 AND changed_at = ?3",
+            params![kind, key, changed_at],
+        )?;
+        Ok(())
+    }
+
+    /// Record a successful charge upload (or, with `uploaded_at = -1`,
+    /// a permanent skip). Caches the wrapped key for mutable sync.
+    pub fn charge_upload_mark(
+        &self,
+        session_ts: i64,
+        cloud_charge_id: &str,
+        wrapped_charge_key_b64: &str,
+        uploaded_at: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO charge_uploads(session_ts, cloud_charge_id, wrapped_charge_key, uploaded_at) \
+             VALUES(?1, ?2, ?3, ?4) \
+             ON CONFLICT(session_ts) DO UPDATE SET \
+               cloud_charge_id = ?2, wrapped_charge_key = ?3, uploaded_at = ?4",
+            params![session_ts, cloud_charge_id, wrapped_charge_key_b64, uploaded_at],
+        )?;
+        Ok(())
+    }
+
+    /// session_ts → (cloud_charge_id, wrapped_charge_key b64, uploaded_at)
+    /// for every uploaded (or skipped) charge session.
+    pub fn charge_uploads_map(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, (String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT session_ts, cloud_charge_id, wrapped_charge_key, uploaded_at FROM charge_uploads",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for r in rows {
+            let (ts, id, key, at) = r?;
+            out.insert(ts, (id, key, at));
+        }
+        Ok(out)
+    }
+
+    /// Reverse lookup: cloud chargeId → local session_ts.
+    pub fn charge_session_ts_for_cloud_id(&self, cloud_charge_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let v = conn
+            .query_row(
+                "SELECT session_ts FROM charge_uploads WHERE cloud_charge_id = ?1",
+                params![cloud_charge_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Cache the wrappedRouteKey (base64) produced at upload time so tag
+    /// sync can re-derive the routeKey without a cloud round-trip.
+    pub fn set_cloud_wrapped_route_key(&self, file: &str, wrapped_b64: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE routes SET cloud_wrapped_route_key = ?1 WHERE file = ?2",
+            params![wrapped_b64, file],
+        )?;
+        Ok(())
+    }
+
+    /// (file, cloud_wrapped_route_key) for a cloud routeId, if known.
+    pub fn route_sync_info_by_cloud_id(
+        &self,
+        cloud_route_id: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let v = conn
+            .query_row(
+                "SELECT file, cloud_wrapped_route_key FROM routes WHERE cloud_route_id = ?1",
+                params![cloud_route_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Per-file cloud sync info for tag push:
+    /// file → (cloud_route_id, cloud_wrapped_route_key, uploaded). Files
+    /// the DB doesn't know are absent from the map.
+    pub fn route_sync_info_for_files(
+        &self,
+        files: &[&str],
+    ) -> Result<std::collections::HashMap<String, (Option<String>, Option<String>, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT cloud_route_id, cloud_wrapped_route_key, cloud_uploaded_at \
+             FROM routes WHERE file = ?1",
+        )?;
+        let mut out = std::collections::HashMap::new();
+        for f in files {
+            let row = stmt
+                .query_row(params![f], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                })
+                .optional()?;
+            if let Some((id, key, uploaded_at)) = row {
+                out.insert(
+                    f.to_string(),
+                    (id, key, uploaded_at.is_some_and(|t| t > 0)),
+                );
+            }
         }
         Ok(out)
     }

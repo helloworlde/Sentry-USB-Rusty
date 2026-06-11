@@ -153,6 +153,35 @@ pub fn find_drive_files(
     None
 }
 
+/// Full drive_key → member-file mapping for cloud tag sync.
+/// drive_key is the canonical start_time string
+/// (`drive_tags.drive_key` join key, same formatting as
+/// `find_drive_start_time`); files are the deduped parent clip paths.
+/// One grouper pass for the whole store — the sync engine maps each
+/// dirty drive to its member routeIds (push) and each changed cloud
+/// route back to its drive (pull) from this.
+pub fn drive_key_file_map(summaries: &[RouteSummary]) -> Vec<(String, Vec<String>)> {
+    let groups = group_summary_clips(summaries);
+    let mut out = Vec::with_capacity(groups.len());
+    for group in groups.iter() {
+        let Some(first) = group.first() else { continue };
+        let key = first.timestamp.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let mut seen = std::collections::HashSet::new();
+        let files: Vec<String> = group
+            .iter()
+            .filter_map(|c| {
+                if seen.insert(c.summary.file.as_str()) {
+                    Some(c.summary.file.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.push((key, files));
+    }
+    out
+}
+
 /// Build the same `DriveSummary` the Drives list would emit for the
 /// drive at `idx`, using the BLOB-free aggregate path. The single-drive
 /// API handler uses this to overlay the canonical headline percentages

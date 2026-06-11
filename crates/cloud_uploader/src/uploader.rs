@@ -45,6 +45,26 @@ pub async fn run_sweep_loop(state: Arc<CloudStateInner>) {
                 *last_err = Some(format!("{:#}", e));
             }
         }
+
+        // Charge sessions ride the same wake/timer cadence. A charge
+        // failure must not block route uploads (and vice versa), so each
+        // sweep reports independently.
+        match crate::charges::sweep_once(state.clone()).await {
+            Ok(uploaded) if uploaded > 0 => {
+                info!("cloud charge sweep complete: {} sessions uploaded", uploaded);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("cloud charge sweep error: {}", e);
+                let mut last_err = state.last_upload_error.lock().await;
+                *last_err = Some(format!("{:#}", e));
+            }
+        }
+
+        // Two-way mutable sync (tags / cost overrides / rate config).
+        if let Err(e) = crate::sync::run_once(state.clone()).await {
+            warn!("cloud sync error: {}", e);
+        }
     }
 }
 
@@ -85,6 +105,9 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
         }
 
         let mut wire_routes: Vec<UploadRoute> = Vec::with_capacity(pending.len());
+        // file -> wrappedRouteKey b64, cached locally on ack so tag sync
+        // can rewrap without a cloud round-trip.
+        let mut wrapped_by_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut estimated_body_bytes: usize = 64;
         for p in &pending {
             let encrypted = encrypt::encrypt_route(
@@ -131,10 +154,12 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
             }
             estimated_body_bytes += route_json_size;
 
+            wrapped_by_file.insert(p.file.clone(), encrypted.wrapped_route_key_b64.clone());
             wire_routes.push(UploadRoute {
                 route_id: encrypted.route_id,
                 route_blob: encrypted.route_blob_b64,
                 wrapped_route_key: encrypted.wrapped_route_key_b64,
+                summary_ciphertext: encrypted.summary_ciphertext_b64,
             });
         }
 
@@ -238,6 +263,11 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                         if let Err(e) = db_ext::mark_uploaded(&state.store, f, now_unix) {
                             warn!("mark_uploaded failed for {}: {}", f, e);
                         }
+                        if let Some(wk) = wrapped_by_file.get(f) {
+                            if let Err(e) = state.store.set_cloud_wrapped_route_key(f, wk) {
+                                warn!("cache wrapped key failed for {}: {}", f, e);
+                            }
+                        }
                     }
                 }
                 "duplicate" => {
@@ -307,6 +337,11 @@ struct UploadRoute {
     route_blob: String,
     #[serde(rename = "wrappedRouteKey")]
     wrapped_route_key: String,
+    // Compact summary computed at upload time, so new rows arrive in
+    // the cloud summary-complete and the browser never has to fetch and
+    // decrypt the full blob just to render the drive list.
+    #[serde(rename = "summaryCiphertext")]
+    summary_ciphertext: String,
 }
 
 #[derive(Deserialize)]

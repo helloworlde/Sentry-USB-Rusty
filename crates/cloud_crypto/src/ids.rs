@@ -14,6 +14,15 @@ pub fn route_id_from_path(file_path: &str) -> String {
     hex::encode(h.as_ref())
 }
 
+/// Cloud charge-session id: sha256 of
+/// `"charge:" + <start ts, unix seconds, base-10>`. Stable across Pi
+/// reflashes because the timestamp lives in the USB telemetry DB.
+pub fn charge_id_from_start_ts(start_ts: i64) -> String {
+    let input = format!("charge:{}", start_ts);
+    let h = digest::digest(&digest::SHA256, input.as_bytes());
+    hex::encode(h.as_ref())
+}
+
 pub fn read_serial_number(path: &str) -> Result<Vec<u8>, CredentialsError> {
     let raw = std::fs::read(path).map_err(|_| CredentialsError::SerialMissing {
         path: path.to_string(),

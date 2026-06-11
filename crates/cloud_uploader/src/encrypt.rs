@@ -4,6 +4,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use ring::rand::{SecureRandom, SystemRandom};
 
 use sentryusb_cloud_crypto::{aad, aead, ids};
+use sentryusb_drives::charging::{ChargePoint, ChargeSessionSummary};
 use sentryusb_drives::types::Route;
 
 #[derive(Debug, Clone)]
@@ -11,6 +12,11 @@ pub struct EncryptedRoute {
     pub route_id: String,
     pub route_blob_b64: String,
     pub wrapped_route_key_b64: String,
+    /// Compact summary sealed under the same routeKey with
+    /// `aad::route_summary`. The plaintext shape mirrors the Sentry
+    /// Cloud web client's summary format (v3) exactly — the browser
+    /// can't tell which side wrote a summary.
+    pub summary_ciphertext_b64: String,
 
     pub source_file: String,
 }
@@ -38,6 +44,11 @@ pub fn encrypt_route(
     let route_key = aead::Key::from_bytes(&route_key_bytes)?;
     let route_blob = aead::seal(&route_key, &blob_aad, &route_json)?;
 
+    let summary_json =
+        serde_json::to_vec(&route_summary_json(route)).context("serialize route summary")?;
+    let summary_aad = aad::route_summary(user_id, pi_id, &route_id);
+    let summary_ct = aead::seal(&route_key, &summary_aad, &summary_json)?;
+
     let wrap_aad = aad::route_key(user_id, pi_id, &route_id);
     let pi_key_obj = aead::Key::from_bytes(pi_key)?;
     let wrapped = aead::seal(&pi_key_obj, &wrap_aad, &route_key_bytes)?;
@@ -48,8 +59,285 @@ pub fn encrypt_route(
         route_id,
         route_blob_b64: B64.encode(&route_blob),
         wrapped_route_key_b64: B64.encode(&wrapped),
+        summary_ciphertext_b64: B64.encode(&summary_ct),
         source_file: route.file.clone(),
     })
+}
+
+// ── Route summary ─────────────────────────────────────────────────────
+
+const AUTOPILOT_FSD: u8 = 1;
+const AUTOPILOT_AUTOSTEER: u8 = 2;
+const AUTOPILOT_TACC: u8 = 3;
+
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let r = 6_371_000.0_f64;
+    let d_lat = (lat2 - lat1).to_radians();
+    let d_lon = (lon2 - lon1).to_radians();
+    let a = (d_lat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (d_lon / 2.0).sin().powi(2);
+    r * 2.0 * a.sqrt().atan2((1.0 - a).sqrt())
+}
+
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
+/// Compact per-clip summary, format v3: aggregates + `gr` gear runs +
+/// optional BLE battery/location fields. The Sentry Cloud web client
+/// computes the same summary after a full decrypt — field names,
+/// rounding, and filters must stay identical between the two
+/// implementations, since the browser consumes this plaintext without
+/// knowing which side produced it.
+pub fn route_summary_json(route: &Route) -> serde_json::Value {
+    let len = route.points.len();
+    let ap = &route.autopilot_states;
+
+    let mut kept: u64 = 0;
+    let mut dist_m = 0.0_f64;
+    let mut prev: Option<(f64, f64)> = None;
+    let mut first: Option<(f64, f64)> = None;
+    let mut last: Option<(f64, f64)> = None;
+    let mut speed_sum = 0.0_f64;
+    let mut speed_count: u64 = 0;
+    let mut max_speed = 0.0_f64;
+    for i in 0..len {
+        let p = &route.points[i];
+        let (lat, lng) = (p[0], p[1]);
+        if !lat.is_finite() || !lng.is_finite() {
+            continue;
+        }
+        if lat == 0.0 && lng == 0.0 {
+            continue;
+        }
+        let sp = route.speeds.get(i).copied().map(|s| s as f64).unwrap_or(0.0);
+        let sp_val = if sp.is_finite() && sp > 0.0 { sp } else { 0.0 };
+        if let Some((plat, plng)) = prev {
+            let seg = haversine_m(plat, plng, lat, lng);
+            if seg > 0.0 && seg < 5000.0 {
+                dist_m += seg;
+            }
+        }
+        if first.is_none() {
+            first = Some((lat, lng));
+        }
+        last = Some((lat, lng));
+        prev = Some((lat, lng));
+        if sp_val > 0.0 {
+            speed_sum += sp_val;
+            speed_count += 1;
+            if sp_val > max_speed {
+                max_speed = sp_val;
+            }
+        }
+        kept += 1;
+    }
+
+    let mut fsd_ms = 0.0_f64;
+    let mut as_ms = 0.0_f64;
+    let mut tacc_ms = 0.0_f64;
+    let dur_ms = 60_000.0_f64;
+    let mut dis: u64 = 0;
+    if !ap.is_empty() {
+        let per_frame = 60_000.0 / ap.len() as f64;
+        let mut in_fsd = false;
+        for &v in ap {
+            if v == AUTOPILOT_FSD {
+                fsd_ms += per_frame;
+            } else if v == AUTOPILOT_AUTOSTEER {
+                as_ms += per_frame;
+            } else if v == AUTOPILOT_TACC {
+                tacc_ms += per_frame;
+            }
+            let is_fsd = v == AUTOPILOT_FSD;
+            if in_fsd && !is_fsd {
+                dis += 1;
+            }
+            in_fsd = is_fsd;
+        }
+    }
+
+    let mut gr: Vec<i64> = Vec::with_capacity(route.gear_runs.len() * 2);
+    for run in &route.gear_runs {
+        gr.push(run.gear as i64);
+        gr.push(run.frames as i64);
+    }
+
+    let mut out = serde_json::json!({
+        "v": 3,
+        "file": route.file,
+        "ptC": kept,
+        "dM": dist_m.round() as i64,
+        "dur": dur_ms.round() as i64,
+        "fsd": fsd_ms.round() as i64,
+        "asm": as_ms.round() as i64,
+        "tcc": tacc_ms.round() as i64,
+        "dis": dis,
+        "sS": round1(speed_sum),
+        "sN": speed_count,
+        "sMax": round1(max_speed),
+        "fLa": first.map(|p| p.0),
+        "fLn": first.map(|p| p.1),
+        "lLa": last.map(|p| p.0),
+        "lLn": last.map(|p| p.1),
+        "gr": gr,
+    });
+    let obj = out.as_object_mut().unwrap();
+    if let Some(bs) = route.battery_pct_start.filter(|v| v.is_finite()) {
+        obj.insert("bs".into(), serde_json::json!(round1(bs)));
+    }
+    if let Some(be) = route.battery_pct_end.filter(|v| v.is_finite()) {
+        obj.insert("be".into(), serde_json::json!(round1(be)));
+    }
+    if let Some(ls) = route.location_name_start.as_deref().filter(|s| !s.is_empty()) {
+        obj.insert("ls".into(), serde_json::json!(truncate_chars(ls, 80)));
+    }
+    if let Some(le) = route.location_name_end.as_deref().filter(|s| !s.is_empty()) {
+        obj.insert("le".into(), serde_json::json!(truncate_chars(le, 80)));
+    }
+    out
+}
+
+/// `String.prototype.slice(0, n)` equivalent — char-boundary-safe.
+fn truncate_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+// ── Charge sessions ───────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChargeBlobWire<'a> {
+    #[serde(flatten)]
+    summary: &'a ChargeSessionSummary,
+    points: &'a [ChargePoint],
+}
+
+#[derive(Debug, Clone)]
+pub struct EncryptedCharge {
+    pub charge_id: String,
+    pub charge_blob_b64: String,
+    pub wrapped_charge_key_b64: String,
+    pub summary_ciphertext_b64: String,
+    pub mutable_ciphertext_b64: Option<String>,
+}
+
+/// The rewritable `{ tags, costOverride }` envelope plaintext.
+/// camelCase to match the web client.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChargeMutable {
+    pub tags: Vec<String>,
+    pub cost_override: Option<CostOverride>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CostOverride {
+    pub amount: f64,
+    pub currency: String,
+}
+
+pub fn encrypt_charge(
+    summary: &ChargeSessionSummary,
+    points: &[ChargePoint],
+    mutable: Option<&ChargeMutable>,
+    pi_key: &[u8; 32],
+    user_id: &str,
+    pi_id: &str,
+) -> Result<EncryptedCharge> {
+    let charge_id = ids::charge_id_from_start_ts(summary.id);
+
+    let mut charge_key_bytes = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut charge_key_bytes)
+        .map_err(|_| anyhow::anyhow!("rng failure for charge key"))?;
+    let charge_key = aead::Key::from_bytes(&charge_key_bytes)?;
+
+    let blob_json = serde_json::to_vec(&ChargeBlobWire { summary, points })
+        .context("serialize charge blob")?;
+    let blob_ct = aead::seal(
+        &charge_key,
+        &aad::charge_blob(user_id, pi_id, &charge_id),
+        &blob_json,
+    )?;
+
+    let summary_json = serde_json::to_vec(summary).context("serialize charge summary")?;
+    let summary_ct = aead::seal(
+        &charge_key,
+        &aad::charge_summary(user_id, pi_id, &charge_id),
+        &summary_json,
+    )?;
+
+    let mutable_ct = match mutable {
+        Some(m) => {
+            let json = serde_json::to_vec(m).context("serialize charge mutable")?;
+            Some(aead::seal(
+                &charge_key,
+                &aad::charge_mutable(user_id, pi_id, &charge_id),
+                &json,
+            )?)
+        }
+        None => None,
+    };
+
+    let pi_key_obj = aead::Key::from_bytes(pi_key)?;
+    let wrapped = aead::seal(
+        &pi_key_obj,
+        &aad::charge_key(user_id, pi_id, &charge_id),
+        &charge_key_bytes,
+    )?;
+    charge_key_bytes.fill(0);
+
+    Ok(EncryptedCharge {
+        charge_id,
+        charge_blob_b64: B64.encode(&blob_ct),
+        wrapped_charge_key_b64: B64.encode(&wrapped),
+        summary_ciphertext_b64: B64.encode(&summary_ct),
+        mutable_ciphertext_b64: mutable_ct.map(|c| B64.encode(&c)),
+    })
+}
+
+// ── Mutable-sync seal/open helpers ────────────────────────────────────
+
+/// Unwrap a content key (routeKey or chargeKey) from its base64 wrapped
+/// form using this Pi's piKey + the matching key-wrap AAD.
+pub fn unwrap_content_key(
+    pi_key: &[u8; 32],
+    wrapped_b64: &str,
+    wrap_aad: &[u8],
+) -> Result<[u8; 32]> {
+    let wrapped = B64.decode(wrapped_b64).context("decode wrapped key b64")?;
+    let pi_key_obj = aead::Key::from_bytes(pi_key)?;
+    let raw = aead::open(&pi_key_obj, wrap_aad, &wrapped)?;
+    let key: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("unwrapped key is not 32 bytes"))?;
+    Ok(key)
+}
+
+/// Seal a JSON-serializable plaintext under a content key, returning b64.
+pub fn seal_json_b64<T: serde::Serialize>(
+    key_bytes: &[u8; 32],
+    aad_bytes: &[u8],
+    value: &T,
+) -> Result<String> {
+    let key = aead::Key::from_bytes(key_bytes)?;
+    let json = serde_json::to_vec(value)?;
+    Ok(B64.encode(&aead::seal(&key, aad_bytes, &json)?))
+}
+
+/// Open a b64 ciphertext under a content key and deserialize the JSON.
+pub fn open_json_b64<T: serde::de::DeserializeOwned>(
+    key_bytes: &[u8; 32],
+    aad_bytes: &[u8],
+    ct_b64: &str,
+) -> Result<T> {
+    let key = aead::Key::from_bytes(key_bytes)?;
+    let ct = B64.decode(ct_b64).context("decode ciphertext b64")?;
+    let plain = aead::open(&key, aad_bytes, &ct)?;
+    Ok(serde_json::from_slice(&plain)?)
 }
 
 #[cfg(test)]
@@ -179,6 +467,149 @@ mod tests {
         assert_eq!(recovered.odometer_mi_end, Some(12_346.2));
         assert_eq!(recovered.location_name_start.as_deref(), Some("Home"));
         assert_eq!(recovered.location_name_end.as_deref(), Some("123 Main St"));
+    }
+
+    fn sample_summary() -> ChargeSessionSummary {
+        let rows = vec![
+            sentryusb_drives::charging::ChargeRow {
+                ts: 1_750_000_000,
+                power_kw: Some(11),
+                current_a: Some(48),
+                voltage_v: Some(240),
+                rate_mph: Some(44.0),
+                energy_added_kwh: Some(1.0),
+                limit_soc: Some(80),
+                range_mi: Some(200.0),
+                battery_pct: Some(60.0),
+                location: Some("Home".to_string()),
+                lat: Some(53.5),
+                lon: Some(-113.5),
+                charging_state: Some("charging".to_string()),
+            },
+            sentryusb_drives::charging::ChargeRow {
+                ts: 1_750_003_600,
+                power_kw: Some(11),
+                current_a: Some(48),
+                voltage_v: Some(240),
+                rate_mph: Some(44.0),
+                energy_added_kwh: Some(11.5),
+                limit_soc: Some(80),
+                range_mi: Some(240.0),
+                battery_pct: Some(75.0),
+                location: Some("Home".to_string()),
+                lat: Some(53.5),
+                lon: Some(-113.5),
+                charging_state: Some("charging".to_string()),
+            },
+        ];
+        sentryusb_drives::charging::summarize(&rows)
+    }
+
+    #[test]
+    fn encrypt_charge_roundtrips_all_three_slots() {
+        let pi_key = [5u8; 32];
+        let user_id = "user-cuid-abc";
+        let pi_id = "pi-cuid-xyz";
+        let summary = sample_summary();
+        let points = vec![ChargePoint {
+            ts: summary.start_ms,
+            power_kw: Some(11),
+            current_a: Some(48),
+            voltage_v: Some(240),
+            rate_mph: Some(44.0),
+            soc: Some(60.0),
+            range_mi: Some(200.0),
+            energy_added_kwh: Some(1.0),
+        }];
+        let mutable = ChargeMutable {
+            tags: vec!["home".to_string()],
+            cost_override: Some(CostOverride { amount: 4.20, currency: "$".to_string() }),
+        };
+        let enc = encrypt_charge(&summary, &points, Some(&mutable), &pi_key, user_id, pi_id)
+            .unwrap();
+        assert_eq!(enc.charge_id, ids::charge_id_from_start_ts(summary.id));
+        assert_eq!(enc.charge_id.len(), 64);
+
+        // Unwrap the chargeKey like the browser/sync would.
+        let charge_key = unwrap_content_key(
+            &pi_key,
+            &enc.wrapped_charge_key_b64,
+            &aad::charge_key(user_id, pi_id, &enc.charge_id),
+        )
+        .unwrap();
+
+        // Summary slot: parses back to the same camelCase shape.
+        let summary_back: serde_json::Value = open_json_b64(
+            &charge_key,
+            &aad::charge_summary(user_id, pi_id, &enc.charge_id),
+            &enc.summary_ciphertext_b64,
+        )
+        .unwrap();
+        assert_eq!(summary_back["id"], serde_json::json!(summary.id));
+        assert_eq!(summary_back["energyAddedKwh"], serde_json::json!(10.5));
+        assert_eq!(summary_back["fastCharging"], serde_json::json!(false));
+
+        // Blob slot: summary fields flattened + points array.
+        let blob_back: serde_json::Value = open_json_b64(
+            &charge_key,
+            &aad::charge_blob(user_id, pi_id, &enc.charge_id),
+            &enc.charge_blob_b64,
+        )
+        .unwrap();
+        assert_eq!(blob_back["startMs"], serde_json::json!(summary.start_ms));
+        assert_eq!(blob_back["points"].as_array().unwrap().len(), 1);
+
+        // Mutable slot.
+        let mutable_back: ChargeMutable = open_json_b64(
+            &charge_key,
+            &aad::charge_mutable(user_id, pi_id, &enc.charge_id),
+            enc.mutable_ciphertext_b64.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mutable_back, mutable);
+
+        // Cross-slot replay must fail the AEAD check (distinct AADs).
+        let swapped: Result<serde_json::Value> = open_json_b64(
+            &charge_key,
+            &aad::charge_summary(user_id, pi_id, &enc.charge_id),
+            &enc.charge_blob_b64,
+        );
+        assert!(swapped.is_err());
+    }
+
+    /// Route summaries must match the v3 shape the Sentry Cloud web
+    /// client writes — pin the keys + rounding contract.
+    #[test]
+    fn route_summary_matches_web_v3_shape() {
+        let mut route = sample_route();
+        route.points = vec![[53.5, -113.5], [53.501, -113.5]];
+        route.speeds = vec![10.0, 12.5];
+        route.autopilot_states = vec![1, 1, 0, 3];
+        route.gear_runs = vec![];
+        route.battery_pct_start = Some(82.46);
+        route.location_name_start = Some("Home".to_string());
+
+        let v = route_summary_json(&route);
+        assert_eq!(v["v"], serde_json::json!(3));
+        assert_eq!(v["file"], serde_json::json!(route.file));
+        assert_eq!(v["ptC"], serde_json::json!(2));
+        // ~111m between the two points at this latitude.
+        let dm = v["dM"].as_i64().unwrap();
+        assert!((100..125).contains(&dm), "dM was {}", dm);
+        assert_eq!(v["dur"], serde_json::json!(60000));
+        // 2 of 4 frames FSD → 30000ms; 1 frame TACC → 15000ms.
+        assert_eq!(v["fsd"], serde_json::json!(30000));
+        assert_eq!(v["tcc"], serde_json::json!(15000));
+        assert_eq!(v["dis"], serde_json::json!(1));
+        assert_eq!(v["sS"], serde_json::json!(22.5));
+        assert_eq!(v["sN"], serde_json::json!(2));
+        assert_eq!(v["sMax"], serde_json::json!(12.5));
+        assert_eq!(v["fLa"], serde_json::json!(53.5));
+        assert_eq!(v["lLa"], serde_json::json!(53.501));
+        assert_eq!(v["bs"], serde_json::json!(82.5));
+        assert_eq!(v["ls"], serde_json::json!("Home"));
+        assert!(v.get("be").is_none());
+        assert!(v.get("le").is_none());
     }
 
     /// Routes without BLE telemetry should still serialize compactly —

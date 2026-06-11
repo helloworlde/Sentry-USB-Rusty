@@ -3,6 +3,7 @@ pub mod aggregate_telemetry;
 pub mod backfill;
 pub mod blob;
 pub mod calc;
+pub mod charging;
 pub mod db;
 pub mod extract;
 pub mod grouper;

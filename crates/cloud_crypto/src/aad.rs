@@ -27,6 +27,20 @@ const STR_PI_LOCAL_X25519: &[u8] = b"sentrycloud-pi-local-x25519-v1";
 
 const STR_REKEY: &[u8] = b"sentrycloud-rekey-v2";
 
+// Route tag/summary slots. The Sentry Cloud web client builds the same
+// AADs — the two implementations must match byte-for-byte. Same
+// routeKey as the route blob, distinct domain string per slot so
+// ciphertexts can't be replayed across slots.
+const STR_ROUTE_TAGS: &[u8] = b"sentrycloud-route-tags-v1";
+const STR_ROUTE_SUMMARY: &[u8] = b"sentrycloud-route-summary-v1";
+
+// Charge sessions.
+const STR_CHARGE: &[u8] = b"sentrycloud-charge-v1";
+const STR_CHARGEKEY: &[u8] = b"sentrycloud-chargekey-v1";
+const STR_CHARGE_SUMMARY: &[u8] = b"sentrycloud-charge-summary-v1";
+const STR_CHARGE_MUTABLE: &[u8] = b"sentrycloud-charge-mutable-v1";
+const STR_RATE_CONFIG: &[u8] = b"sentrycloud-rate-config-v1";
+
 pub fn wrapped_dek_password(user_id: &str) -> Vec<u8> {
     concat(&[STR_WRAP_PWD, user_id.as_bytes()])
 }
@@ -68,6 +82,47 @@ pub fn rekey(user_id: &str, pi_id: &str, new_generation: u32) -> Vec<u8> {
     let pi_lp = lp(pi_id.as_bytes());
     let gen_be = new_generation.to_be_bytes();
     concat(&[STR_REKEY, user_id.as_bytes(), &pi_lp, &gen_be])
+}
+
+pub fn route_tags(user_id: &str, uploaded_from_pi: &str, route_id: &str) -> Vec<u8> {
+    let pi_lp = lp(uploaded_from_pi.as_bytes());
+    let route_lp = lp(route_id.as_bytes());
+    concat(&[STR_ROUTE_TAGS, user_id.as_bytes(), &pi_lp, &route_lp])
+}
+
+pub fn route_summary(user_id: &str, uploaded_from_pi: &str, route_id: &str) -> Vec<u8> {
+    let pi_lp = lp(uploaded_from_pi.as_bytes());
+    let route_lp = lp(route_id.as_bytes());
+    concat(&[STR_ROUTE_SUMMARY, user_id.as_bytes(), &pi_lp, &route_lp])
+}
+
+pub fn charge_blob(user_id: &str, uploaded_from_pi: &str, charge_id: &str) -> Vec<u8> {
+    let pi_lp = lp(uploaded_from_pi.as_bytes());
+    let charge_lp = lp(charge_id.as_bytes());
+    concat(&[STR_CHARGE, user_id.as_bytes(), &pi_lp, &charge_lp])
+}
+
+pub fn charge_key(user_id: &str, uploaded_from_pi: &str, charge_id: &str) -> Vec<u8> {
+    let pi_lp = lp(uploaded_from_pi.as_bytes());
+    let charge_lp = lp(charge_id.as_bytes());
+    concat(&[STR_CHARGEKEY, user_id.as_bytes(), &pi_lp, &charge_lp])
+}
+
+pub fn charge_summary(user_id: &str, uploaded_from_pi: &str, charge_id: &str) -> Vec<u8> {
+    let pi_lp = lp(uploaded_from_pi.as_bytes());
+    let charge_lp = lp(charge_id.as_bytes());
+    concat(&[STR_CHARGE_SUMMARY, user_id.as_bytes(), &pi_lp, &charge_lp])
+}
+
+pub fn charge_mutable(user_id: &str, uploaded_from_pi: &str, charge_id: &str) -> Vec<u8> {
+    let pi_lp = lp(uploaded_from_pi.as_bytes());
+    let charge_lp = lp(charge_id.as_bytes());
+    concat(&[STR_CHARGE_MUTABLE, user_id.as_bytes(), &pi_lp, &charge_lp])
+}
+
+pub fn rate_config(user_id: &str, pi_id: &str) -> Vec<u8> {
+    let pi_lp = lp(pi_id.as_bytes());
+    concat(&[STR_RATE_CONFIG, user_id.as_bytes(), &pi_lp])
 }
 
 #[cfg(test)]

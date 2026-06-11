@@ -1,3 +1,4 @@
+pub mod charges;
 pub mod client;
 pub mod credentials_store;
 pub mod db_ext;
@@ -5,6 +6,7 @@ pub mod encrypt;
 pub mod pairing;
 pub mod rekey;
 pub mod state;
+pub mod sync;
 pub mod uploader;
 
 pub use sentryusb_cloud_crypto as crypto;
@@ -15,7 +17,7 @@ use tokio::sync::Notify;
 use sentryusb_drives::DriveStore;
 use sentryusb_ws::Hub;
 
-pub use crate::state::{CloudStatus, CloudStateInner, PairingState};
+pub use crate::state::{CloudStatus, CloudStateInner, PairingState, RateConfigAccess};
 
 pub const DEFAULT_CLOUD_BASE_URL: &str = "https://sentryusb.com";
 
@@ -44,6 +46,7 @@ impl CloudUploader {
             on_complete,
             opts.cloud_base_url,
             opts.credentials_path,
+            opts.rate_config,
         ));
         let me = Arc::new(CloudUploader { inner: inner.clone() });
 
@@ -94,6 +97,9 @@ impl CloudUploader {
 pub struct SpawnOptions {
     pub cloud_base_url: String,
     pub credentials_path: String,
+    /// Preferences hook for rate-config sync. None disables
+    /// rate-config sync (tests).
+    pub rate_config: Option<Arc<dyn state::RateConfigAccess>>,
 }
 
 impl Default for SpawnOptions {
@@ -101,6 +107,7 @@ impl Default for SpawnOptions {
         SpawnOptions {
             cloud_base_url: DEFAULT_CLOUD_BASE_URL.to_string(),
             credentials_path: DEFAULT_CREDENTIALS_PATH.to_string(),
+            rate_config: None,
         }
     }
 }

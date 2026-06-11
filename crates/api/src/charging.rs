@@ -20,109 +20,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::router::AppState;
 
-/// A gap larger than this between consecutive charging samples ends the
-/// session. The sampler polls charge state well inside this window while
-/// a car is plugged in; 30 minutes tolerates a missed poll or two
-/// without merging two genuinely separate plug-ins.
-const SESSION_GAP_SECS: i64 = 30 * 60;
+// Session derivation lives in the drives crate so the cloud uploader
+// derives the SAME sessions (identity + grouping) this API serves.
+// Rate/cost application stays here.
+use sentryusb_drives::charging::{
+    avg, display_current_a, group_sessions, is_charging, load_charge_rows,
+    phase_is_active, sample_power_kw, summarize, ChargePoint, ChargeRow,
+    ChargeSessionSummary,
+};
+// Test-only re-imports (the lib paths above are what production code uses).
+#[cfg(test)]
+use sentryusb_drives::charging::{
+    integrate_power_kwh, is_actively_charging, session_coord, FAST_CHARGE_THRESHOLD_KW,
+    SESSION_GAP_SECS,
+};
 
-/// Peak charger power (kW) above which a session counts as **fast
-/// charging** — DC fast charging (Supercharger, CCS). Set just above the
-/// AC Level 2 ceiling (19.2 kW in North America, 22 kW in Europe) with a
-/// strict `>`, so no home/destination AC charge ever trips it — including
-/// a 22 kW European 3-phase wallbox — while every DC charge (50 kW+) does.
-/// One threshold covers both regions, no locale setting needed.
-///
-/// The telemetry crate (`tesla_telemetry::main`) keeps its own copy to
-/// drive the adaptive poll cadence; it can't depend on this binary-less
-/// api crate, so the two are a deliberate string-/value-contract pair like
-/// `as_db_str` ⇄ `phase_is_active`. Keep them in sync.
-const FAST_CHARGE_THRESHOLD_KW: i64 = 22;
-
-/// One row pulled from `telemetry_samples`, already filtered to samples
-/// where the car was actively charging (see `is_actively_charging`).
-struct ChargeRow {
-    ts: i64,
-    power_kw: Option<i64>,
-    current_a: Option<i64>,
-    voltage_v: Option<i64>,
-    rate_mph: Option<f64>,
-    energy_added_kwh: Option<f64>,
-    limit_soc: Option<i64>,
-    range_mi: Option<f64>,
-    battery_pct: Option<f64>,
-    location: Option<String>,
-    lat: Option<f64>,
-    lon: Option<f64>,
-    /// Persisted Tesla charge phase (v14+, lowercase). `None` on pre-v14
-    /// rows or when the sampler couldn't decode it that tick. When
-    /// present, this is the authoritative signal — see
-    /// `is_actively_charging`.
-    charging_state: Option<String>,
-}
-
-/// Summary of one charge session for the list view.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ChargeSessionSummary {
-    /// Session id == start timestamp in unix seconds. Stable and
-    /// directly usable as the detail-endpoint key.
-    id: i64,
-    start_ms: i64,
-    end_ms: i64,
-    duration_secs: i64,
-    location: Option<String>,
-    location_lat: Option<f64>,
-    location_lon: Option<f64>,
-    energy_added_kwh: Option<f64>,
-    /// Energy drawn from the charger (wall-side), kWh. Trapezoidal
-    /// integral of per-sample charger power, each sample refined from
-    /// volts × amps when those agree with the car's coarse integer kW
-    /// (see `sample_power_kw`). Normally >= `energy_added_kwh` (the gap is
-    /// charging loss); on coarse data it can dip to/under it, which is why
-    /// `efficiency_pct` is clamped.
-    energy_used_kwh: Option<f64>,
-    /// Charging efficiency, percent = added / used, clamped to [0, 100].
-    efficiency_pct: Option<f64>,
-    peak_power_kw: Option<i64>,
-    start_soc: Option<f64>,
-    end_soc: Option<f64>,
-    start_range_mi: Option<f64>,
-    end_range_mi: Option<f64>,
-    charge_limit_soc: Option<i64>,
-    /// User-assigned tags + the cost derived from them. Filled per-session
-    /// by `apply_rates`; empty/None until then.
-    tags: Vec<String>,
-    cost: Option<f64>,
-    /// Resolved price-per-kWh used for `cost` (for UI transparency).
-    rate: Option<f64>,
-    /// Currency symbol for `cost` (from prefs, default "$").
-    currency: String,
-    /// Peak power exceeded `FAST_CHARGE_THRESHOLD_KW` — i.e. DC fast
-    /// charging. Drives the web "Fast charging" badge and unlocks the
-    /// manual per-charge cost (which is offered on fast charges only).
-    fast_charging: bool,
-    /// `cost` came from a user-entered per-charge override rather than the
-    /// tag/rate engine (see `apply_cost_override`). Lets the UI show the
-    /// cost as manually set and skip the "set a rate" hint.
-    cost_overridden: bool,
-}
-
-/// One point on the detail charts. Carries every per-sample series the
-/// charging view plots — all sourced from columns the sampler already
-/// records, so adding them costs nothing extra on the device.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ChargePoint {
-    ts: i64,
-    power_kw: Option<i64>,
-    current_a: Option<i64>,
-    voltage_v: Option<i64>,
-    rate_mph: Option<f64>,
-    soc: Option<f64>,
-    range_mi: Option<f64>,
-    energy_added_kwh: Option<f64>,
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -138,114 +50,6 @@ struct ChargeSessionDetail {
     points: Vec<ChargePoint>,
 }
 
-/// Mean of an iterator of values, or None when it yields nothing. Used
-/// for the detail view's average power / current / voltage / temp stats.
-fn avg(it: impl Iterator<Item = f64>) -> Option<f64> {
-    let mut sum = 0.0;
-    let mut n = 0u32;
-    for v in it {
-        sum += v;
-        n += 1;
-    }
-    if n == 0 { None } else { Some(sum / n as f64) }
-}
-
-/// Largest gap (kW) tolerated between volts × amps and the car's own
-/// integer `charger_power` before we distrust the fine-grained product.
-/// Integer rounding alone is at most ±0.5 kW; 1.0 kW leaves room for
-/// sensor noise while staying well below the ~2 kW-plus gap that 3-phase
-/// charging always produces (see `sample_power_kw`).
-const POWER_REFINE_TOLERANCE_KW: f64 = 1.0;
-
-/// Best per-sample charger power in kW for energy integration.
-///
-/// Tesla reports `charger_power` only as whole kilowatts. That's fine at a
-/// Supercharger (rounding 150.4 → 150 is <1%) but ruinous on a slow Level
-/// 1 charge: 121 V × 12 A is 1.45 kW yet arrives as `1`, a ~30% undercount
-/// that drags integrated "used" below the car's own battery-side "added"
-/// and pushes efficiency past 100%. When the sample also carries voltage
-/// and current we recover the fractional kW from V × I.
-///
-/// The guard: V × I is the true power only on a single-/split-phase charge
-/// (Level 1, and North-American 240 V Level 2). On European 3-phase AC the
-/// car reports *per-phase* volts/amps while `charger_power` already sums
-/// the phases, so a lone V × I would be ~1/3 of reality. We therefore use
-/// V × I only when it agrees with the integer power to within
-/// `POWER_REFINE_TOLERANCE_KW`; otherwise we keep the integer. A
-/// single-phase product lands within rounding of the integer, while a
-/// 3-phase one is always off by (2/3)·total ≈ 2 kW or more — so this
-/// refines exactly the low-power single/split-phase case that needs it and
-/// is a no-op for 3-phase, DC fast charging, and any sample whose fields
-/// disagree. It can only sharpen a value already consistent with the car's
-/// own number, never invent a new one.
-fn sample_power_kw(r: &ChargeRow) -> Option<f64> {
-    let coarse = r.power_kw? as f64;
-    match (r.voltage_v, r.current_a) {
-        (Some(v), Some(a)) => {
-            let fine = v as f64 * a as f64 / 1000.0;
-            if (fine - coarse).abs() <= POWER_REFINE_TOLERANCE_KW {
-                Some(fine)
-            } else {
-                Some(coarse)
-            }
-        }
-        _ => Some(coarse),
-    }
-}
-
-/// Charger current in amps for display. Tesla's `charger_actual_current`
-/// is the AC current into the **onboard charger**, so during DC fast
-/// charging (Supercharger / CCS) — where the onboard charger is bypassed
-/// and DC flows straight to the HV battery — the car reports a literal
-/// `0 A`. The true DC current isn't carried in any field; like Tessie we
-/// derive it as power ÷ voltage (e.g. 158 kW ÷ 389 V ≈ 406 A, matching
-/// Tessie's reading on the same charge).
-///
-/// We derive only when the reported current is absent or zero. AC charging
-/// always reports a real nonzero current (12 A on Level 1, 48 A on Level
-/// 2, per-phase amps on European 3-phase), so a genuine measurement is
-/// never overwritten — this sharpens exactly the DC case that needs it and
-/// is a no-op everywhere else.
-fn display_current_a(
-    power_kw: Option<i64>,
-    voltage_v: Option<i64>,
-    raw: Option<i64>,
-) -> Option<i64> {
-    match raw {
-        // Real AC measurement — trust it.
-        Some(a) if a > 0 => Some(a),
-        // Reported 0 (DC) or missing: derive P÷V when both are present.
-        _ => match (power_kw, voltage_v) {
-            (Some(p), Some(v)) if v > 0 && p > 0 => {
-                Some((p as f64 * 1000.0 / v as f64).round() as i64)
-            }
-            _ => raw,
-        },
-    }
-}
-
-/// Trapezoidal integral of charger power (kW) over a session's samples,
-/// in kWh. `None` with fewer than two power readings. In-session samples
-/// are <= `SESSION_GAP_SECS` apart by construction, so no gap guard is
-/// needed beyond skipping non-positive dt. Per-sample power is the
-/// V × I-refined estimate from `sample_power_kw`, not the raw integer kW.
-fn integrate_power_kwh(rows: &[ChargeRow]) -> Option<f64> {
-    let pts: Vec<(i64, f64)> = rows
-        .iter()
-        .filter_map(|r| sample_power_kw(r).map(|p| (r.ts, p)))
-        .collect();
-    if pts.len() < 2 {
-        return None;
-    }
-    let mut kwh = 0.0;
-    for w in pts.windows(2) {
-        let dt_h = (w[1].0 - w[0].0) as f64 / 3600.0;
-        if dt_h > 0.0 {
-            kwh += (w[0].1 + w[1].1) / 2.0 * dt_h;
-        }
-    }
-    if kwh > 0.0 { Some(kwh) } else { None }
-}
 
 /// One time-of-use price window for a tag, scoped by time-of-day, days of
 /// the week, and a month range — the device equivalent of a Tessie "rate
@@ -557,47 +361,6 @@ fn apply_cost_override(s: &mut ChargeSessionSummary, override_cost: Option<(f64,
     }
 }
 
-/// Heuristic "is this row charging?" for pre-v14 rows that don't carry a
-/// persisted Tesla phase. `rate_mph` is the authoritative truth when the
-/// car reports it: nonzero rate = energy is going into the battery; an
-/// explicit `Some(0.0)` rate means "not charging" even when `power_kw`
-/// is positive (cabin pre-conditioning, 12V top-up, and BMS thermal
-/// management all draw power without charging). Only when rate is
-/// missing entirely do we fall back to power — that covers the rare
-/// decode failure where the car is genuinely charging but the rate field
-/// didn't come through.
-///
-/// For v14+ rows callers should use `is_actively_charging`, which uses
-/// the persisted phase directly and falls back to this heuristic only
-/// when phase is `None`.
-fn is_charging(power_kw: Option<i64>, rate_mph: Option<f64>) -> bool {
-    match rate_mph {
-        Some(r) => r > 0.0,
-        None => power_kw.is_some_and(|p| p > 0),
-    }
-}
-
-/// Phase-first "is this row charging?" — the predicate `load_charge_rows`
-/// uses to decide whether a sample belongs in a charge session. When the
-/// row carries a persisted Tesla phase (v14+) it's authoritative:
-/// `charging`/`starting`/`calibrating` → yes, everything else → no.
-/// Pre-v14 rows fall back to `is_charging` over power and rate.
-///
-/// Why both layers: phase alone misses the entire pre-v14 fleet; the
-/// heuristic alone produces phantom sessions when the car wakes from
-/// sleep plugged in but full (it draws a couple of kW for cabin
-/// pre-conditioning, the old heuristic saw `power_kw > 0` and counted
-/// it as a charge session that added zero kWh).
-fn is_actively_charging(
-    phase: Option<&str>,
-    power_kw: Option<i64>,
-    rate_mph: Option<f64>,
-) -> bool {
-    match phase_is_active(phase) {
-        Some(active) => active,
-        None => is_charging(power_kw, rate_mph),
-    }
-}
 
 /// How stale the latest charge row may be before the banner gives up
 /// entirely. Generous (24h) because the only case that can leave a
@@ -606,177 +369,10 @@ fn is_actively_charging(
 /// the self-healing backstop for that.
 const CHARGE_STALE_SECS: i64 = 86_400;
 
-/// True/false if the persisted Tesla charge phase is an actively-charging
-/// one. `None` when there's no phase string (pre-v14 rows) so the caller
-/// can fall back to the old power/rate heuristic. The spellings mirror
-/// `ChargingState::as_db_str` in the telemetry crate (the api crate can't
-/// depend on that binary crate, so this is a deliberate string contract).
-fn phase_is_active(phase: Option<&str>) -> Option<bool> {
-    phase.map(|p| matches!(p, "charging" | "starting" | "calibrating"))
-}
 
-/// Pull charging samples in `[from, to]` ordered by time. `to` of
-/// `None` means "no upper bound".
-fn load_charge_rows(
-    conn: &rusqlite::Connection,
-    from: i64,
-    to: Option<i64>,
-) -> anyhow::Result<Vec<ChargeRow>> {
-    let upper = to.unwrap_or(i64::MAX);
-    // SQL pulls every row with any charge-related signal (phase OR power
-    // OR rate non-NULL); the Rust filter below decides whether each one
-    // is actually charging via `is_actively_charging`. This split keeps
-    // the SQL simple and the predicate unit-testable.
-    let mut stmt = conn.prepare(
-        "SELECT ts, charger_power_kw, charger_actual_current_a, charger_voltage_v, \
-                charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, \
-                battery_range_mi, battery_pct, location_name, \
-                latitude, longitude, charging_state \
-         FROM telemetry_samples \
-         WHERE ts BETWEEN ?1 AND ?2 \
-           AND (charging_state IS NOT NULL \
-                OR charger_power_kw IS NOT NULL \
-                OR charge_rate_mph IS NOT NULL) \
-         ORDER BY ts ASC",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![from, upper], |r| {
-        Ok(ChargeRow {
-            ts: r.get(0)?,
-            power_kw: r.get(1)?,
-            current_a: r.get(2)?,
-            voltage_v: r.get(3)?,
-            rate_mph: r.get(4)?,
-            energy_added_kwh: r.get(5)?,
-            limit_soc: r.get(6)?,
-            range_mi: r.get(7)?,
-            battery_pct: r.get(8)?,
-            location: r.get(9)?,
-            lat: r.get(10)?,
-            lon: r.get(11)?,
-            charging_state: r.get(12)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let row = row?;
-        if is_actively_charging(row.charging_state.as_deref(), row.power_kw, row.rate_mph) {
-            out.push(row);
-        }
-    }
-    Ok(out)
-}
 
-/// Split time-ordered, already-filtered charging rows into sessions on
-/// the gap threshold. Each inner Vec is one session, in time order.
-fn group_sessions(rows: Vec<ChargeRow>) -> Vec<Vec<ChargeRow>> {
-    let mut sessions: Vec<Vec<ChargeRow>> = Vec::new();
-    for row in rows {
-        match sessions.last_mut() {
-            Some(cur) if row.ts - cur.last().unwrap().ts <= SESSION_GAP_SECS => cur.push(row),
-            _ => sessions.push(vec![row]),
-        }
-    }
-    sessions
-}
 
-/// The session's representative GPS fix for the map pin: the most
-/// frequently reported `(lat, lon)` across its samples, ties broken toward
-/// the one seen latest.
-///
-/// Not the first non-null fix — at arrival the reverse-geocoded address
-/// (from `state drive`) updates a poll or two before the raw GPS (from the
-/// slower `state location` poll), so the first charge sample can carry the
-/// new charger's address but the *previous* location's coordinates (a
-/// just-left home pin on a Supercharge). Taking the mode pins the charger
-/// where the bulk of the session actually sat, and returning lat+lon
-/// together stops them coming from different fixes. Coordinates are stamped
-/// from a held value and repeat bit-for-bit, so grouping on exact bits is
-/// safe.
-fn session_coord(rows: &[ChargeRow]) -> (Option<f64>, Option<f64>) {
-    use std::collections::HashMap;
-    // (lat bits, lon bits) → (count, last index seen, lat, lon).
-    let mut seen: HashMap<(u64, u64), (usize, usize, f64, f64)> = HashMap::new();
-    for (i, r) in rows.iter().enumerate() {
-        if let (Some(lat), Some(lon)) = (r.lat, r.lon) {
-            let slot = seen
-                .entry((lat.to_bits(), lon.to_bits()))
-                .or_insert((0, i, lat, lon));
-            slot.0 += 1;
-            slot.1 = i;
-        }
-    }
-    seen.values()
-        .max_by_key(|(count, last_idx, _, _)| (*count, *last_idx))
-        .map(|(_, _, lat, lon)| (Some(*lat), Some(*lon)))
-        .unwrap_or((None, None))
-}
 
-/// Reduce one session's rows to a summary. `rows` is non-empty and
-/// time-ordered.
-fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
-    let first = &rows[0];
-    let last = &rows[rows.len() - 1];
-
-    // Energy is cumulative within a plug-in; the span between the first
-    // and last reading is what this session added. Clamp at zero so a
-    // mid-session counter reset can't produce a negative.
-    let energy_added_kwh = match (first.energy_added_kwh, last.energy_added_kwh) {
-        (Some(a), Some(b)) => Some((b - a).max(0.0)),
-        (None, Some(b)) => Some(b),
-        _ => None,
-    };
-
-    // Energy drawn from the charger ("used", wall-side): trapezoidal
-    // integral of per-sample power over the session, each sample refined
-    // from volts × amps where possible (`sample_power_kw`) so a slow Level
-    // 1 charge isn't undercounted by integer-kW rounding. Normally >=
-    // energy added (battery-side); the gap is charging loss.
-    let energy_used_kwh = integrate_power_kwh(rows);
-
-    // Charging efficiency = added / used. Clamp to [0, 100] as a residual
-    // safety net: V × I refinement removes the big low-power undercount,
-    // but coarse data can still nudge "used" a hair under "added" and
-    // yield a >100% artifact that reads as broken.
-    let efficiency_pct = match (energy_added_kwh, energy_used_kwh) {
-        (Some(added), Some(used)) if used > 0.0 => {
-            Some((added / used * 100.0).clamp(0.0, 100.0))
-        }
-        _ => None,
-    };
-
-    let peak_power_kw = rows.iter().filter_map(|r| r.power_kw).max();
-    // Map-pin coordinate: the session's dominant fix, not the first
-    // non-null one (which can be a stale arrival reading — see
-    // `session_coord`).
-    let (location_lat, location_lon) = session_coord(rows);
-
-    ChargeSessionSummary {
-        id: first.ts,
-        start_ms: first.ts * 1000,
-        end_ms: last.ts * 1000,
-        duration_secs: last.ts - first.ts,
-        location: rows.iter().find_map(|r| r.location.clone()),
-        location_lat,
-        location_lon,
-        energy_added_kwh,
-        energy_used_kwh,
-        efficiency_pct,
-        peak_power_kw,
-        start_soc: rows.iter().find_map(|r| r.battery_pct),
-        end_soc: rows.iter().rev().find_map(|r| r.battery_pct),
-        start_range_mi: rows.iter().find_map(|r| r.range_mi),
-        end_range_mi: rows.iter().rev().find_map(|r| r.range_mi),
-        charge_limit_soc: rows.iter().rev().find_map(|r| r.limit_soc),
-        // Filled by `apply_rates` once tags + the rate config are known.
-        tags: Vec::new(),
-        cost: None,
-        rate: None,
-        currency: String::new(),
-        fast_charging: peak_power_kw.is_some_and(|p| p > FAST_CHARGE_THRESHOLD_KW),
-        // Set true by `apply_cost_override` when a manual cost is stored.
-        cost_overridden: false,
-    }
-}
 
 /// GET /api/charging
 ///

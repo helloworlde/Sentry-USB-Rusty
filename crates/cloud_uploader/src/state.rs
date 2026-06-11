@@ -44,12 +44,26 @@ pub struct CloudStatus {
     pub credentials_load_error: Option<String>,
 }
 
+/// Read/write access to the local charging rate-config document (the
+/// `charging_*` preference keys as one JSON object). Lives behind a
+/// trait because the preferences store is in the api crate, which
+/// depends on this crate — the binary wires the implementation in at
+/// spawn time.
+pub trait RateConfigAccess: Send + Sync {
+    fn load_doc(&self) -> serde_json::Value;
+    fn store_doc(&self, doc: &serde_json::Value) -> anyhow::Result<()>;
+}
+
 pub struct CloudStateInner {
     pub store: Arc<DriveStore>,
     pub hub: Hub,
     pub notify: Arc<Notify>,
     pub cloud_base_url: String,
     pub credentials_path: String,
+
+    /// None when the binary didn't wire a preferences hook (tests).
+    /// Rate-config sync is skipped in that case.
+    pub rate_config: Option<Arc<dyn RateConfigAccess>>,
 
     pub creds: Mutex<Option<CloudCredentialsV1>>,
 
@@ -81,6 +95,7 @@ impl CloudStateInner {
         notify: Arc<Notify>,
         cloud_base_url: String,
         credentials_path: String,
+        rate_config: Option<Arc<dyn RateConfigAccess>>,
     ) -> Self {
         CloudStateInner {
             store,
@@ -88,6 +103,7 @@ impl CloudStateInner {
             notify,
             cloud_base_url,
             credentials_path,
+            rate_config,
             creds: Mutex::new(None),
             pairing: Mutex::new(PairingProgress::default()),
             pairing_cancel: Mutex::new(None),

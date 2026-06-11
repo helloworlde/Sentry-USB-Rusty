@@ -162,6 +162,14 @@ pub const V2_ROUTE_AGGREGATE_COLUMNS: &[(&str, &str)] = &[
 pub const V3_ROUTE_CLOUD_COLUMNS: &[(&str, &str)] = &[
     ("cloud_uploaded_at", "INTEGER"),
     ("cloud_route_id", "TEXT"),
+    // base64 of the wrappedRouteKey produced at upload time. The Pi
+    // forgets the raw routeKey immediately after encryption, but cloud
+    // tag sync needs to re-derive it to encrypt the tags ciphertext —
+    // caching the wrapped form (decryptable with the
+    // Pi's own piKey) avoids a cloud round-trip per push. NULL for
+    // routes uploaded before this column existed; sync backfills via
+    // POST /api/pi/sync/route-keys.
+    ("cloud_wrapped_route_key", "TEXT"),
 ];
 
 /// Partial index on `cloud_uploaded_at IS NULL` rows only â€” keeps the
@@ -359,6 +367,44 @@ pub const CHARGE_COSTS_TABLE: &[&str] = &[
     ) WITHOUT ROWID",
 ];
 
+/// Cloud charge-upload bookkeeping. One row per uploaded session,
+/// keyed by the session's start timestamp
+/// (the same stable id charge_tags/charge_costs use). `cloud_charge_id`
+/// is the hex64 chargeId; `wrapped_charge_key` is the base64
+/// wrappedChargeKey cached for mutable-envelope sync (same rationale as
+/// routes.cloud_wrapped_route_key). `uploaded_at` of -1 is the permanent-
+/// skip sentinel (rejected_too_large), mirroring routes. Standalone
+/// idempotent table — no CURRENT_SCHEMA_VERSION bump needed.
+pub const CHARGE_UPLOADS_TABLE: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS charge_uploads (
+        session_ts         INTEGER PRIMARY KEY,
+        cloud_charge_id    TEXT NOT NULL,
+        wrapped_charge_key TEXT NOT NULL,
+        uploaded_at        INTEGER NOT NULL
+    ) WITHOUT ROWID",
+    "CREATE INDEX IF NOT EXISTS idx_charge_uploads_cloud_id
+     ON charge_uploads(cloud_charge_id)",
+];
+
+/// Dirty queue for two-way cloud sync. A row per locally-changed
+/// mutable item awaiting push to the cloud:
+///   kind 'drive'  — key = drive_tags.drive_key (start_time string)
+///   kind 'charge' — key = charge session_ts (base-10 string); covers
+///                   both tags and the cost override (one envelope)
+///   kind 'rate'   — key = '' (the per-Pi rate config document)
+/// `changed_at` (unix ms) is the local edit time, used for last-writer-
+/// wins against the server. Rows are deleted after a successful push
+/// (only if changed_at is unchanged — a newer edit re-queues). Writes
+/// from sync PULL application bypass this table (no echo loop).
+pub const MUTABLE_DIRTY_TABLE: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS mutable_dirty (
+        kind       TEXT NOT NULL,
+        key        TEXT NOT NULL,
+        changed_at INTEGER NOT NULL,
+        PRIMARY KEY (kind, key)
+    ) WITHOUT ROWID",
+];
+
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open â€”
 /// idempotent by construction.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -399,6 +445,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     for stmt in CHARGE_COSTS_TABLE {
         conn.execute(stmt, []).with_context(|| {
             format!("migrate: applying charge_costs DDL {:?}", truncate(stmt, 60))
+        })?;
+    }
+
+    // Cloud charge-upload bookkeeping + mutable-sync dirty queue. Same
+    // idempotent standalone-table treatment; see the const docs.
+    for stmt in CHARGE_UPLOADS_TABLE.iter().chain(MUTABLE_DIRTY_TABLE.iter()) {
+        conn.execute(stmt, []).with_context(|| {
+            format!("migrate: applying cloud-sync DDL {:?}", truncate(stmt, 60))
         })?;
     }
 
