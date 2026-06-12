@@ -31,11 +31,19 @@ function log() {
 # DRIVE_DATA_SYNC_CACHE so the guard stays consistent across CIFS/NFS (Rust)
 # and rsync/rclone (shell) archive backends.
 #
-# The cache holds the byte count of the last successful sync. Before each
-# sync we refuse to overwrite if the new local file is less than 50% of
-# that recorded size AND the recorded size is above 10 MB. This catches
+# The cache holds "v2:<byte count>" of the last successful sync. Before
+# each sync we refuse to overwrite if the new local file is less than 50%
+# of that recorded size AND the recorded size is above 10 MB. This catches
 # the failure mode where a corrupted/empty local drive-data.json would
 # otherwise blow away a healthy archive backup.
+#
+# The v2: prefix versions the BASELINE FORMAT: pre-v2 baselines were bare
+# integers measured against the pretty-printed export, roughly 3x larger
+# than today's compact one — honoring them across the format change flagged
+# every upgrader's first compact export as phantom corruption and blocked
+# archive sync forever. Bare integers therefore read as "no baseline"
+# (fail open, re-baseline on next success). Keep in lockstep with
+# crates/drives/src/syncguard.rs.
 DRIVE_DATA_SYNC_CACHE="/mutable/.drive-data-last-sync"
 DRIVE_DATA_SYNC_MIN_THRESHOLD=$((10 * 1024 * 1024)) # 10 MB
 
@@ -64,8 +72,11 @@ function drive_data_size_guard_ok() {
   local last_size=0
   if [ -f "$DRIVE_DATA_SYNC_CACHE" ]; then
     last_size=$(cat "$DRIVE_DATA_SYNC_CACHE" 2>/dev/null | tr -d ' \n')
-    # Require non-empty, digits only — fail open on corrupt cache.
-    if ! [[ "$last_size" =~ ^[0-9]+$ ]]; then
+    # Require the v2 format — bare-integer (pre-v2) or corrupt baselines
+    # fail open and re-baseline on the next successful sync.
+    if [[ "$last_size" =~ ^v2:([0-9]+)$ ]]; then
+      last_size=${BASH_REMATCH[1]}
+    else
       last_size=0
     fi
   fi
@@ -105,7 +116,7 @@ function update_drive_data_sync_cache() {
   size=$(wc -c < "$local_file" 2>/dev/null | tr -d ' ')
   size=${size:-0}
   local tmp="${DRIVE_DATA_SYNC_CACHE}.tmp"
-  if echo -n "$size" > "$tmp" 2>/dev/null; then
+  if echo -n "v2:$size" > "$tmp" 2>/dev/null; then
     mv -f "$tmp" "$DRIVE_DATA_SYNC_CACHE" 2>/dev/null || rm -f "$tmp"
   fi
 }

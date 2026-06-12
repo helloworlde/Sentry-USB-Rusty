@@ -66,15 +66,29 @@ pub fn check_sync_size_guard(new_size: i64, last_size: i64) -> Result<(), SyncGu
     })
 }
 
+/// On-disk format tag for the cache. v2 baselines measure the compact
+/// JSON export (with telemetry sections); bare-integer baselines predate
+/// it and measured pretty-printed output roughly 3x larger. Honoring a
+/// bare baseline across that format change would flag every upgrader's
+/// first compact export as a phantom "corruption" and block archive sync
+/// forever — so bare integers read as "no baseline" (fail open, guard
+/// re-baselines on the next successful sync). The shell-side guard in
+/// `run/post-archive-process.sh` parses the same format and must stay in
+/// lockstep.
+const CACHE_FORMAT_PREFIX: &str = "v2:";
+
 /// Read the last-successful-sync size in bytes, or `0` if the cache file
-/// doesn't exist or is unreadable/corrupt. Fail-open by design: a
-/// corrupted cache must not block syncs.
+/// doesn't exist, is unreadable/corrupt, or holds a pre-v2 baseline.
+/// Fail-open by design: a corrupted cache must not block syncs.
 pub fn read_sync_cache<P: AsRef<Path>>(path: P) -> i64 {
     let data = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(_) => return 0, // missing or unreadable → fail open
     };
-    let n: i64 = match data.trim().parse() {
+    let Some(raw) = data.trim().strip_prefix(CACHE_FORMAT_PREFIX) else {
+        return 0; // pre-v2 (or garbage) baseline → fail open, re-baseline
+    };
+    let n: i64 = match raw.parse() {
         Ok(n) => n,
         Err(_) => return 0, // unparseable → fail open
     };
@@ -96,7 +110,7 @@ pub fn write_sync_cache<P: AsRef<Path>>(path: P, size: i64) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(size.to_string().as_bytes())?;
+        f.write_all(format!("{}{}", CACHE_FORMAT_PREFIX, size).as_bytes())?;
         f.sync_all()?;
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
@@ -174,6 +188,36 @@ mod tests {
         let tmp = TmpPath::new("corrupt");
         std::fs::write(tmp.path(), "not-a-number").unwrap();
         assert_eq!(read_sync_cache(tmp.path()), 0);
+    }
+
+    #[test]
+    fn cache_bare_integer_baseline_resets_on_format_upgrade() {
+        // Baselines written before the compact-JSON export were bare
+        // integers measured against pretty-printed output ~3x larger;
+        // honoring them would block every upgrader's first compact sync
+        // as a phantom "corruption". Bare integers read as "no baseline".
+        let tmp = TmpPath::new("legacy-bare");
+        std::fs::write(tmp.path(), "1491297340").unwrap();
+        assert_eq!(read_sync_cache(tmp.path()), 0);
+    }
+
+    #[test]
+    fn cache_reads_v2_format() {
+        let tmp = TmpPath::new("v2-read");
+        std::fs::write(tmp.path(), "v2:42000000").unwrap();
+        assert_eq!(read_sync_cache(tmp.path()), 42_000_000);
+    }
+
+    #[test]
+    fn cache_writes_v2_format() {
+        // Pin the on-disk format — the shell-side guard in
+        // post-archive-process.sh parses this exact shape.
+        let tmp = TmpPath::new("v2-write");
+        write_sync_cache(tmp.path(), 42_000_000).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path()).unwrap(),
+            "v2:42000000"
+        );
     }
 
     #[test]
