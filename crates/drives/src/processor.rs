@@ -132,9 +132,15 @@ impl Processor {
         // query failure instead of silently treating everything as
         // unprocessed and re-ingesting the whole tree.
         let processed = self.store.processed_set()?;
+        // Membership must compare CANONICAL keys: the scan yields physical
+        // paths (`RecentClips/YYYY-MM-DD/x.mp4` under the snapshot symlink
+        // layout) while the store keys rows by `normalize_path` — which
+        // strips that prefix. Comparing the raw scan path would miss every
+        // stored row and re-extract the whole RecentClips tree each run.
+        // The physical path is kept for the extraction read below.
         let unprocessed: Vec<String> = files
             .into_iter()
-            .filter(|f| !processed.contains(f.as_str()))
+            .filter(|f| !processed.contains(crate::db::normalize_path(f).as_str()))
             .collect();
 
         let total = unprocessed.len();

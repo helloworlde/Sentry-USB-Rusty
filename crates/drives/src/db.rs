@@ -95,6 +95,15 @@ const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "5";
 /// numeric output. "geodesic-1" = the WGS-84 distance migration.
 const AGGREGATE_FORMULA_VERSION: &str = "geodesic-1";
 
+/// Version tag for the route `file` KEY format. Gates a one-shot rewrite of
+/// `routes.file` / `processed_files.file` to the canonical form (see
+/// [`normalize_path`]): the Pi's native processor ingests clips under the
+/// snapshot symlink layout (`RecentClips/YYYY-MM-DD/x.mp4`) while
+/// Sentry-Drive exports key the same clip `YYYY-MM-DD/x.mp4` — before
+/// canon-1 the same physical clip could sit in `routes` under both
+/// spellings and every drive over it double-counted distance.
+const ROUTE_KEY_FORMAT_VERSION: &str = "canon-1";
+
 /// Ordered list of paths the one-shot importer checks on first boot.
 /// The first that exists wins. `/mutable/drive-data.json` is kept as a
 /// fallback so upgraders whose DB is still empty (mid-migration) still
@@ -253,6 +262,72 @@ impl DriveStore {
             run_one_shot_import(&mut guard, import_candidates)
                 .context("load: one-shot import")?;
             let mut mg = guard;
+
+            // Route-key format gate. `normalize_path` canonicalizes the
+            // snapshot symlink layout (`RecentClips/YYYY-MM-DD/x.mp4`) down
+            // to the date-dir form Sentry-Drive exports use
+            // (`YYYY-MM-DD/x.mp4`), but rows written before canon-1 still
+            // carry the prefixed keys — so the same physical clip can sit
+            // in `routes` twice (native + imported) and every drive over it
+            // roughly triples its distance: each copy contributes its full
+            // clip distance and the boundary-gap bridge then "drives" from
+            // copy A's end point back to copy A's start. One-shot rewrite:
+            // drop stray event-folder rows, collapse native+import twins
+            // (the native row wins — it carries the device's own extraction
+            // and BLE telemetry columns), and rename the rest in place.
+            let stored_key_fmt =
+                meta_get(&mg, "route_key_format_version")?.unwrap_or_default();
+            if stored_key_fmt != ROUTE_KEY_FORMAT_VERSION {
+                // Stray SavedClips/SentryClips routes pre-date the
+                // processor's event-folder skip; the grouper already hides
+                // them from drives, so deleting only trims dead rows.
+                let events = mg.execute(
+                    "DELETE FROM routes \
+                     WHERE file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%'",
+                    [],
+                )?;
+                // Where both spellings of a clip exist, delete the import
+                // twin so the native row can take the canonical key.
+                let twins = mg.execute(
+                    "DELETE FROM routes \
+                     WHERE file NOT LIKE 'RecentClips/%' \
+                       AND 'RecentClips/' || file IN \
+                           (SELECT file FROM routes WHERE file LIKE 'RecentClips/%')",
+                    [],
+                )?;
+                // substr is 1-based: position 13 drops the 12-char
+                // 'RecentClips/' prefix.
+                let renamed = mg.execute(
+                    "UPDATE routes SET file = substr(file, 13) \
+                     WHERE file LIKE 'RecentClips/%'",
+                    [],
+                )?;
+                // Mirror in processed_files so the processor's
+                // already-processed check keeps matching these clips.
+                // Event-folder entries are left alone — the processor
+                // skips those directories at scan time anyway.
+                mg.execute(
+                    "INSERT OR IGNORE INTO processed_files(file, added_at) \
+                     SELECT substr(file, 13), added_at FROM processed_files \
+                     WHERE file LIKE 'RecentClips/%'",
+                    [],
+                )?;
+                mg.execute(
+                    "DELETE FROM processed_files WHERE file LIKE 'RecentClips/%'",
+                    [],
+                )?;
+                if events > 0 || twins > 0 || renamed > 0 {
+                    info!(
+                        "[drives] Route keys canonicalized ({} -> {}): {} event row(s) dropped, {} duplicate twin(s) collapsed, {} row(s) renamed",
+                        if stored_key_fmt.is_empty() { "<none>" } else { &stored_key_fmt },
+                        ROUTE_KEY_FORMAT_VERSION,
+                        events,
+                        twins,
+                        renamed
+                    );
+                }
+                meta_set(&mg, "route_key_format_version", ROUTE_KEY_FORMAT_VERSION)?;
+            }
 
             // Aggregate-formula version gate. The per-clip aggregates
             // (distance_m, speeds, FSD distances…) are computed once at
@@ -2481,8 +2556,18 @@ fn sync_to_path(src: &str, dst: &str, cache_path: &str) -> Result<()> {
 /// Convert backslashes to forward slashes so Windows-shaped paths
 /// collide with their POSIX equivalents in `processed_files` and
 /// `routes`.
+/// Canonical DB key for a clip path: forward slashes, and the snapshot
+/// symlink layout's `RecentClips/` prefix stripped so the Pi's native
+/// ingest (`RecentClips/YYYY-MM-DD/x.mp4`) and Sentry-Drive imports
+/// (`YYYY-MM-DD/x.mp4`) key the same physical clip identically.
+/// `SavedClips/`/`SentryClips/` prefixes are kept — the grouper filters
+/// event-folder rows by exactly those prefixes.
 pub fn normalize_path(p: &str) -> String {
-    p.replace('\\', "/")
+    let n = p.replace('\\', "/");
+    match n.strip_prefix("RecentClips/") {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => n,
+    }
 }
 
 fn now_unix() -> i64 {
@@ -2630,6 +2715,166 @@ mod tests {
         let conn = store.conn.lock().unwrap();
         let ver = meta_get(&conn, "aggregate_formula_version").unwrap();
         assert_eq!(ver.as_deref(), Some(AGGREGATE_FORMULA_VERSION));
+    }
+
+    #[test]
+    fn normalize_path_canonicalizes_recentclips_prefix() {
+        // The Pi's native processor sees clips under the snapshot symlink
+        // layout (`RecentClips/YYYY-MM-DD/x.mp4`) while Sentry-Drive
+        // exports key the same clip as `YYYY-MM-DD/x.mp4`. Both must
+        // normalize to the same DB key or every clip ingests twice.
+        assert_eq!(
+            normalize_path("RecentClips/2026-06-07/x-front.mp4"),
+            "2026-06-07/x-front.mp4"
+        );
+        assert_eq!(
+            normalize_path("RecentClips\\2026-06-07\\x-front.mp4"),
+            "2026-06-07/x-front.mp4"
+        );
+        // Already-canonical input is unchanged (idempotent).
+        assert_eq!(
+            normalize_path("2026-06-07/x-front.mp4"),
+            "2026-06-07/x-front.mp4"
+        );
+        // Event-folder prefixes are NOT stripped — the grouper filters
+        // those rows by this exact prefix.
+        assert_eq!(
+            normalize_path("SavedClips/2026-06-07_10-00-00/x-front.mp4"),
+            "SavedClips/2026-06-07_10-00-00/x-front.mp4"
+        );
+        // Only a whole leading component counts.
+        assert_eq!(normalize_path("MyRecentClips/x.mp4"), "MyRecentClips/x.mp4");
+        assert_eq!(normalize_path("RecentClips/x-front.mp4"), "x-front.mp4");
+        // Tessie import paths are untouched.
+        assert_eq!(
+            normalize_path("tessie/2026-04-18/x-front-tessie-1.mp4"),
+            "tessie/2026-04-18/x-front-tessie-1.mp4"
+        );
+    }
+
+    #[test]
+    fn native_and_imported_route_share_one_canonical_row() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        // Pi-native ingest under the snapshot symlink layout.
+        store
+            .add_route(
+                "RecentClips/2026-06-07/c-front.mp4", "2026-06-07", &pts,
+                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+            )
+            .unwrap();
+        // Sentry-Drive-style import of the same clip (Windows separators).
+        store
+            .add_route(
+                "2026-06-07\\c-front.mp4", "2026-06-07", &pts,
+                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+            )
+            .unwrap();
+
+        let (n, file) = {
+            let conn = store.conn.lock().unwrap();
+            let n: i64 = conn
+                .query_row("SELECT count(*) FROM routes", [], |r| r.get(0))
+                .unwrap();
+            let file: String = conn
+                .query_row("SELECT file FROM routes LIMIT 1", [], |r| r.get(0))
+                .unwrap();
+            (n, file)
+        };
+        assert_eq!(n, 1, "same clip under two path spellings must collapse to one route row");
+        assert_eq!(file, "2026-06-07/c-front.mp4");
+
+        // Both spellings count as processed, so the processor never
+        // re-extracts a clip the import already covered (and vice versa).
+        assert!(store.is_processed("RecentClips/2026-06-07/c-front.mp4").unwrap());
+        assert!(store.is_processed("2026-06-07/c-front.mp4").unwrap());
+        // The processed set the processor's bulk filter uses holds the
+        // canonical key.
+        let set = store.processed_set().unwrap();
+        assert!(set.contains("2026-06-07/c-front.mp4"));
+        assert!(!set.iter().any(|f| f.starts_with("RecentClips/")));
+    }
+
+    #[test]
+    fn route_key_canon_migration_dedupes_and_renames() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts2: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        let pts3: Vec<GpsPoint> =
+            vec![[37.7749, -122.4194], [37.7755, -122.4187], [37.7760, -122.4180]];
+
+        // Import twin (canonical key, 2 points).
+        store
+            .add_route(
+                "2026-06-07/dup-front.mp4", "2026-06-07", &pts2,
+                &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+            )
+            .unwrap();
+        // Native copy of the same clip (3 points), a lone native row, and a
+        // stray SavedClips event row. add_route now canonicalizes, so build
+        // the legacy keys via raw UPDATE, the same way the aggregate gate
+        // test simulates stale rows.
+        for (tmp, legacy, pts) in [
+            ("tmp-dup.mp4", "RecentClips/2026-06-07/dup-front.mp4", &pts3),
+            ("tmp-lone.mp4", "RecentClips/2026-06-08/lone-front.mp4", &pts2),
+            ("tmp-event.mp4", "SavedClips/2026-06-07_10-00-00/ev-front.mp4", &pts2),
+        ] {
+            store
+                .add_route(
+                    tmp, "2026-06-07", pts,
+                    &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[],
+                )
+                .unwrap();
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE routes SET file = ?1 WHERE file = ?2",
+                params![legacy, tmp],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE processed_files SET file = ?1 WHERE file = ?2",
+                params![legacy, tmp],
+            )
+            .unwrap();
+        }
+
+        {
+            let conn = store.conn.lock().unwrap();
+            // Force the gate so the next load() runs the migration.
+            meta_set(&conn, "route_key_format_version", "stale-test").unwrap();
+        }
+        store.load().unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT file, point_count FROM routes ORDER BY file")
+            .unwrap();
+        let rows: Vec<(String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(),
+            vec!["2026-06-07/dup-front.mp4", "2026-06-08/lone-front.mp4"],
+            "dup collapses to canonical, lone renames, event row deleted: {:?}",
+            rows
+        );
+        // The native (RecentClips) copy wins the dedupe — it carries the
+        // device's own extraction + BLE telemetry columns.
+        assert_eq!(rows[0].1, 3, "native 3-point row should replace the import twin");
+
+        // processed_files canonicalized the RecentClips rows; the event row
+        // entry is left alone (the processor skips those dirs at scan).
+        let pf: Vec<String> = {
+            let mut s = conn.prepare("SELECT file FROM processed_files ORDER BY file").unwrap();
+            s.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert!(pf.contains(&"2026-06-07/dup-front.mp4".to_string()));
+        assert!(pf.contains(&"2026-06-08/lone-front.mp4".to_string()));
+        assert!(!pf.iter().any(|f| f.starts_with("RecentClips/")), "{:?}", pf);
+
+        let ver = meta_get(&conn, "route_key_format_version").unwrap();
+        assert_eq!(ver.as_deref(), Some(ROUTE_KEY_FORMAT_VERSION));
     }
 
     #[test]
