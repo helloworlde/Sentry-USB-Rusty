@@ -4,8 +4,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use ring::rand::{SecureRandom, SystemRandom};
 
 use sentryusb_cloud_crypto::{aad, aead, ids};
+use sentryusb_drives::calc;
 use sentryusb_drives::charging::{ChargePoint, ChargeSessionSummary};
-use sentryusb_drives::types::Route;
+use sentryusb_drives::types::{GEAR_PARK, Route};
 
 #[derive(Debug, Clone)]
 pub struct EncryptedRoute {
@@ -70,17 +71,38 @@ const AUTOPILOT_FSD: u8 = 1;
 const AUTOPILOT_AUTOSTEER: u8 = 2;
 const AUTOPILOT_TACC: u8 = 3;
 
-fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let r = 6_371_000.0_f64;
-    let d_lat = (lat2 - lat1).to_radians();
-    let d_lon = (lon2 - lon1).to_radians();
-    let a = (d_lat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (d_lon / 2.0).sin().powi(2);
-    r * 2.0 * a.sqrt().atan2((1.0 - a).sqrt())
-}
 
 fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
+}
+
+/// Summary v4 `pv` point selection — must stay identical to the web
+/// implementation (step over original indices, skip invalid, append the
+/// last point, 5-decimal rounding).
+fn path_preview_points(points: &[[f64; 2]]) -> Option<Vec<[f64; 2]>> {
+    let total = points.len();
+    if total < 2 {
+        return None;
+    }
+    let mut out: Vec<[f64; 2]> = Vec::new();
+    let mut push = |i: usize| {
+        let (lat, lng) = (points[i][0], points[i][1]);
+        if !lat.is_finite() || !lng.is_finite() {
+            return;
+        }
+        if lat == 0.0 && lng == 0.0 {
+            return;
+        }
+        out.push([(lat * 1e5).round() / 1e5, (lng * 1e5).round() / 1e5]);
+    };
+    let step = std::cmp::max(1, total / 16);
+    let mut i = 0;
+    while i < total {
+        push(i);
+        i += step;
+    }
+    push(total - 1);
+    if out.len() >= 2 { Some(out) } else { None }
 }
 
 /// Compact per-clip summary, format v3: aggregates + `gr` gear runs +
@@ -95,6 +117,19 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
 
     let mut kept: u64 = 0;
     let mut dist_m = 0.0_f64;
+    let mut fsd_dist_m = 0.0_f64;
+    let mut as_dist_m = 0.0_f64;
+    let mut tacc_dist_m = 0.0_f64;
+    // Autopilot state of ORIGINAL point index i (frame arrays usually
+    // align 1:1 with points; the scale handles reduced data). Must match
+    // the web's summary v4 implementation exactly.
+    let ap_len = ap.len();
+    let ap_at = |i: usize| -> u8 {
+        if ap_len == 0 || len == 0 {
+            return 0;
+        }
+        ap[std::cmp::min(ap_len - 1, (i * ap_len) / len)]
+    };
     let mut prev: Option<(f64, f64)> = None;
     let mut first: Option<(f64, f64)> = None;
     let mut last: Option<(f64, f64)> = None;
@@ -113,9 +148,17 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
         let sp = route.speeds.get(i).copied().map(|s| s as f64).unwrap_or(0.0);
         let sp_val = if sp.is_finite() && sp > 0.0 { sp } else { 0.0 };
         if let Some((plat, plng)) = prev {
-            let seg = haversine_m(plat, plng, lat, lng);
+            // v4: WGS-84 geodesic (same in-clip filters as v3). Per-mode
+            // distance goes to the DESTINATION point's mode.
+            let seg = calc::geodesic_m(plat, plng, lat, lng);
             if seg > 0.0 && seg < 5000.0 {
                 dist_m += seg;
+                match ap_at(i) {
+                    x if x == AUTOPILOT_FSD => fsd_dist_m += seg,
+                    x if x == AUTOPILOT_AUTOSTEER => as_dist_m += seg,
+                    x if x == AUTOPILOT_TACC => tacc_dist_m += seg,
+                    _ => {}
+                }
             }
         }
         if first.is_none() {
@@ -133,15 +176,47 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
         kept += 1;
     }
 
+    // Park intervals (clip-ms domain) from gear runs, for the v4
+    // grace-aware disengagement rule and the pk1 boundary field.
+    let mut park_iv: Vec<(f64, f64)> = Vec::new();
+    let mut pk1: Option<i64> = None;
+    {
+        let gear_total: i64 = route.gear_runs.iter().map(|r| r.frames as i64).sum();
+        if gear_total > 0 {
+            let per_gear_ms = 60_000.0 / gear_total as f64;
+            let mut acc: i64 = 0;
+            for run in &route.gear_runs {
+                let frames = run.frames as i64;
+                if run.gear == GEAR_PARK && frames > 0 {
+                    let a = acc as f64 * per_gear_ms;
+                    park_iv.push((a, (acc + frames) as f64 * per_gear_ms));
+                    if pk1.is_none() && a < 2000.0 {
+                        pk1 = Some(a.round() as i64);
+                    }
+                }
+                acc += frames;
+            }
+        }
+    }
+    let is_park_at = |ms: f64| park_iv.iter().any(|iv| ms >= iv.0 && ms < iv.1);
+
     let mut fsd_ms = 0.0_f64;
     let mut as_ms = 0.0_f64;
     let mut tacc_ms = 0.0_f64;
     let dur_ms = 60_000.0_f64;
     let mut dis: u64 = 0;
+    let mut d_pnd: Option<i64> = None;
+    let mut fsd1: Option<i64> = None;
     if !ap.is_empty() {
         let per_frame = 60_000.0 / ap.len() as f64;
-        let mut in_fsd = false;
-        for &v in ap {
+        // v4 `dis` applies the Park grace WITHIN the clip: a transition
+        // is pending 2000 ms; Park inside the window cancels it (arrival,
+        // not takeover); re-engaging FSD or expiry confirms it. A pending
+        // still open at clip end exports as `dPnd` for the aggregator.
+        let mut prev_fsd = false;
+        let mut pend_ms = -1.0_f64;
+        for (i, &v) in ap.iter().enumerate() {
+            let t = i as f64 * per_frame;
             if v == AUTOPILOT_FSD {
                 fsd_ms += per_frame;
             } else if v == AUTOPILOT_AUTOSTEER {
@@ -150,10 +225,30 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
                 tacc_ms += per_frame;
             }
             let is_fsd = v == AUTOPILOT_FSD;
-            if in_fsd && !is_fsd {
-                dis += 1;
+            if is_fsd && fsd1.is_none() && t < 2000.0 {
+                fsd1 = Some(t.round() as i64);
             }
-            in_fsd = is_fsd;
+            if pend_ms >= 0.0 {
+                let since = t - pend_ms;
+                if is_park_at(t) && since <= 2000.0 {
+                    pend_ms = -1.0;
+                } else if since > 2000.0 || is_fsd {
+                    dis += 1;
+                    pend_ms = -1.0;
+                }
+            }
+            if prev_fsd && !is_fsd && pend_ms < 0.0 {
+                pend_ms = t;
+            }
+            prev_fsd = is_fsd;
+        }
+        if pend_ms >= 0.0 {
+            let elapsed = 60_000.0 - pend_ms;
+            if elapsed > 2000.0 {
+                dis += 1;
+            } else {
+                d_pnd = Some(elapsed.round() as i64);
+            }
         }
     }
 
@@ -164,7 +259,7 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
     }
 
     let mut out = serde_json::json!({
-        "v": 3,
+        "v": 4,
         "file": route.file,
         "ptC": kept,
         "dM": dist_m.round() as i64,
@@ -181,8 +276,30 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
         "lLa": last.map(|p| p.0),
         "lLn": last.map(|p| p.1),
         "gr": gr,
+        "fdM": fsd_dist_m.round() as i64,
+        "adM": as_dist_m.round() as i64,
+        "tdM": tacc_dist_m.round() as i64,
+        "apd": if ap_len > 0 { 1 } else { 0 },
     });
     let obj = out.as_object_mut().unwrap();
+    // Path preview: every floor(total/16)-th valid point plus the last,
+    // (0,0)/non-finite skipped, 5-decimal rounding — identical selection
+    // to the web implementation.
+    if let Some(pv) = path_preview_points(&route.points) {
+        obj.insert("pv".into(), serde_json::json!(pv));
+    }
+    if let Some(src) = route.source.as_deref().filter(|s| !s.is_empty()) {
+        obj.insert("src".into(), serde_json::json!(src));
+    }
+    if let Some(v) = d_pnd {
+        obj.insert("dPnd".into(), serde_json::json!(v));
+    }
+    if let Some(v) = pk1 {
+        obj.insert("pk1".into(), serde_json::json!(v));
+    }
+    if let Some(v) = fsd1 {
+        obj.insert("fsd1".into(), serde_json::json!(v));
+    }
     // Accel pushes — present only when computable (frame-aligned accel
     // data), so a summary recomputed from reduced data can't overwrite
     // a real count with zero.
@@ -628,10 +745,10 @@ mod tests {
         assert!(swapped.is_err());
     }
 
-    /// Route summaries must match the v3 shape the Sentry Cloud web
-    /// client writes — pin the keys + rounding contract.
+    /// Route summaries must match the v4 shape the web client writes —
+    /// pin the keys + rounding contract.
     #[test]
-    fn route_summary_matches_web_v3_shape() {
+    fn route_summary_matches_web_v4_shape() {
         let mut route = sample_route();
         route.points = vec![[53.5, -113.5], [53.501, -113.5]];
         route.speeds = vec![10.0, 12.5];
@@ -641,7 +758,7 @@ mod tests {
         route.location_name_start = Some("Home".to_string());
 
         let v = route_summary_json(&route);
-        assert_eq!(v["v"], serde_json::json!(3));
+        assert_eq!(v["v"], serde_json::json!(4));
         assert_eq!(v["file"], serde_json::json!(route.file));
         assert_eq!(v["ptC"], serde_json::json!(2));
         // ~111m between the two points at this latitude.
@@ -661,6 +778,76 @@ mod tests {
         assert_eq!(v["ls"], serde_json::json!("Home"));
         assert!(v.get("be").is_none());
         assert!(v.get("le").is_none());
+        // v4: the single segment's destination point maps to frame 2
+        // (OFF), so per-mode distances stay zero; apd reflects AP data.
+        assert_eq!(v["fdM"], serde_json::json!(0));
+        assert_eq!(v["adM"], serde_json::json!(0));
+        assert_eq!(v["tdM"], serde_json::json!(0));
+        assert_eq!(v["apd"], serde_json::json!(1));
+        // 2 points -> pv carries both plus the duplicated last index.
+        assert_eq!(v["pv"].as_array().unwrap().len(), 3);
+        assert!(v.get("src").is_none());
+    }
+
+    /// Cross-implementation vectors — the web's summarizeRoute produced
+    /// these exact values for identical inputs; both sides must agree.
+    fn v4_vector_route(ap: Vec<u8>, gear_runs: Vec<sentryusb_drives::types::GearRun>) -> Route {
+        let mut route = sample_route();
+        route.points = (0..60)
+            .map(|i| [53.5 + i as f64 * 0.00005, -113.5])
+            .collect();
+        route.speeds = vec![5.55; 60];
+        route.autopilot_states = ap;
+        route.gear_runs = gear_runs;
+        route
+    }
+
+    fn gr(gear: u8, frames: u32) -> sentryusb_drives::types::GearRun {
+        sentryusb_drives::types::GearRun { gear, frames }
+    }
+
+    #[test]
+    fn route_summary_v4_cross_impl_vectors() {
+        // A: FSD 30 frames then manual, no Park -> grace expires, dis 1.
+        let mut ap = vec![1u8; 30];
+        ap.extend(vec![0u8; 30]);
+        let a = route_summary_json(&v4_vector_route(ap, vec![gr(4, 60)]));
+        assert_eq!(a["dis"], serde_json::json!(1));
+        assert!(a.get("dPnd").is_none());
+        assert_eq!(a["dM"], serde_json::json!(328));
+        assert_eq!(a["fdM"], serde_json::json!(161));
+        assert_eq!(a["apd"], serde_json::json!(1));
+        assert_eq!(a["pv"].as_array().unwrap().len(), 21);
+        assert_eq!(a["pv"][0], serde_json::json!([53.5, -113.5]));
+
+        // B: Park lands within the 2s grace -> cancelled, dis 0.
+        let mut ap = vec![1u8; 30];
+        ap.extend(vec![0u8; 30]);
+        let b = route_summary_json(&v4_vector_route(ap, vec![gr(4, 31), gr(0, 29)]));
+        assert_eq!(b["dis"], serde_json::json!(0));
+        assert!(b.get("dPnd").is_none());
+
+        // C: re-engaging FSD confirms the disengagement -> dis 1.
+        let mut ap = vec![1u8; 30];
+        ap.push(0);
+        ap.extend(vec![1u8; 29]);
+        let c = route_summary_json(&v4_vector_route(ap, vec![gr(4, 60)]));
+        assert_eq!(c["dis"], serde_json::json!(1));
+        assert!(c.get("dPnd").is_none());
+
+        // D: transition in the final second -> pending exports as dPnd.
+        let mut ap = vec![1u8; 59];
+        ap.push(0);
+        let d = route_summary_json(&v4_vector_route(ap, vec![gr(4, 60)]));
+        assert_eq!(d["dis"], serde_json::json!(0));
+        assert_eq!(d["dPnd"], serde_json::json!(1000));
+
+        // E: boundary fields — Park at clip start, FSD from frame 1.
+        let mut ap = vec![0u8];
+        ap.extend(vec![1u8; 59]);
+        let e = route_summary_json(&v4_vector_route(ap, vec![gr(0, 1), gr(4, 59)]));
+        assert_eq!(e["pk1"], serde_json::json!(0));
+        assert_eq!(e["fsd1"], serde_json::json!(1000));
     }
 
     /// Pins the acp rule (and its omission) against the web's
