@@ -14,18 +14,17 @@ export default defineConfig({
     rollupOptions: {
       output: {
         // Named vendor chunks so an OTA update that only changes app
-        // code doesn't bust the cache for libraries that haven't
-        // moved. Each library lives in its own content-hashed file.
-        // Vite 8 / Rolldown removed object-form manualChunks; this is
-        // the codeSplitting equivalent (matched by node_modules path).
-        codeSplitting: {
-          groups: [
-            { name: 'vendor-react', test: /[\\/]node_modules[\\/](react|react-dom|react-router|react-router-dom)[\\/]/ },
-            { name: 'vendor-charts', test: /[\\/]node_modules[\\/]recharts[\\/]/ },
-            { name: 'vendor-maps', test: /[\\/]node_modules[\\/]leaflet[\\/]/ },
-            { name: 'vendor-term', test: /[\\/]node_modules[\\/]@xterm[\\/]/ },
-            { name: 'vendor-icons', test: /[\\/]node_modules[\\/]lucide-react[\\/]/ },
-          ],
+        // code doesn't bust the cache for libraries that haven't moved.
+        // Each library lives in its own content-hashed file. Standard
+        // Rollup `manualChunks` function form — the prior `codeSplitting`
+        // key is a rolldown-vite-only API, but this build runs plain
+        // vite@8, so it failed to build. Same vendor groups, working syntax.
+        manualChunks(id: string) {
+          if (/[\\/]node_modules[\\/](react|react-dom|react-router|react-router-dom)[\\/]/.test(id)) return 'vendor-react'
+          if (/[\\/]node_modules[\\/]recharts[\\/]/.test(id)) return 'vendor-charts'
+          if (/[\\/]node_modules[\\/]leaflet[\\/]/.test(id)) return 'vendor-maps'
+          if (/[\\/]node_modules[\\/]@xterm[\\/]/.test(id)) return 'vendor-term'
+          if (/[\\/]node_modules[\\/]lucide-react[\\/]/.test(id)) return 'vendor-icons'
         },
       },
     },
