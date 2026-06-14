@@ -112,6 +112,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/check-update", post(crate::update::check_for_update))
         .route("/api/system/update-status", get(crate::update::get_update_status))
         .route("/api/system/block-devices", get(crate::devices::list_block_devices))
+        // Storage repair — guided XFS backingfiles recovery (see storage_repair.rs)
+        .route("/api/storage/health", get(crate::storage_repair::storage_health))
+        .route("/api/storage/repair", post(crate::storage_repair::storage_repair))
         // Preferences
         .route("/api/config/preference", get(crate::preferences::get_preference).put(crate::preferences::set_preference))
         // Notifications

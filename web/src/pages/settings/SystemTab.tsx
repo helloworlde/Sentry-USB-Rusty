@@ -11,6 +11,7 @@ import {
 } from "lucide-react"
 import { PrefCard, PrefGrid } from "@/components/settings/PrefCard"
 import { ConfigBackupSection } from "@/components/settings/sections/ConfigBackupSection"
+import { StorageRepairCard } from "@/components/settings/sections/StorageRepairCard"
 import { cn } from "@/lib/utils"
 
 interface Props {
@@ -108,6 +109,9 @@ export function SystemTab({ onOpenRawConfig, onOpenWizard, version, hostname }: 
     <PrefGrid min={300}>
       {/* --- Backups / config maintenance --- */}
       <ConfigBackupSection />
+
+      {/* --- Storage repair (external-SSD XFS recovery) --- */}
+      <StorageRepairCard />
 
       <PrefCard
         icon={<Download className="h-3.5 w-3.5" />}
