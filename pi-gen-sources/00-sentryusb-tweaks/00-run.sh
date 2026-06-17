@@ -191,24 +191,11 @@ else
     echo "WARNING: D-Bus policy file not found — BLE may fail on Pi 5"
 fi
 
-# ── Install tesla-control and tesla-keygen (required for Keep Awake BLE mode) ──
-# These are used by awake_start to send BLE commands to the vehicle.
-# Tesla does not publish pre-built binaries; build-image.sh cross-compiles
-# from their vehicle-command repo and drops the binaries under files/.
-# Without these the image has zero Tesla BLE capability — Keep Awake
-# can't wake the car and pairing can't hand out keys.
-#
-# Note: pairing still requires the user to run tesla-keygen and add-key-request
-# manually while physically near their vehicle (keycard tap required).
-# The "Unknown key" label on the Tesla's key list is expected — named keys
-# require Tesla Fleet API developer access.
-for _tc_bin in tesla-control tesla-keygen; do
-    if [ -f "files/$_tc_bin" ]; then
-        install -m 755 "files/$_tc_bin" "${ROOTFS_DIR}/root/bin/$_tc_bin"
-    else
-        echo "WARNING: $_tc_bin not found in files/ — Keep Awake BLE mode will not work without it"
-    fi
-done
+# ── (tesla-control / tesla-keygen are no longer installed) ──
+# Keep Awake BLE, pairing, keygen and every Tesla command are native now
+# (sentryusb-ble-action + sentryusb-tesla-telemetry, installed via the
+# variant binaries above). The external Go binaries are gone, so there is
+# nothing to drop under /root/bin here.
 
 # ── Install remountfs_rw helper (needed by BLE daemon to save PIN on read-only rootfs) ──
 if [ -f "../../run/remountfs_rw" ]; then
@@ -303,8 +290,9 @@ on_chroot << EOF
 # Enable the web server service
 systemctl enable sentryusb.service
 systemctl enable sentryusb-ble.service 2>/dev/null || true
-# Telemetry sampler — service has ConditionPathExists on tesla-control,
-# so it'll stay inactive until the user pairs BLE. Enable is safe.
+# Telemetry sampler — service has ConditionPathExists on the BLE
+# keypair, so it'll stay inactive until the user generates keys / pairs
+# BLE. Enable is safe.
 systemctl enable sentryusb-telemetry.service 2>/dev/null || true
 
 # Install prerequisites needed by setup scripts

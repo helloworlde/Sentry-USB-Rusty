@@ -159,39 +159,10 @@ for p in "${VARIANT_PATHS[@]}"; do
     [ -f "$p" ] || error "Missing sentryusb variant at $p"
 done
 
-# ── Step 1b: Build tesla-control + tesla-keygen ────────────────────────
-# These binaries drive Tesla vehicles over BLE — they power the `awake_start`
-# Keep-Awake BLE mode. Tesla does not publish pre-built binaries, so we
-# cross-compile from their vehicle-command repo. Go 1.23+ required.
-#
-# Without these in the image, the iOS app's Keep-Awake toggle has no way
-# to reach the car and the Tesla pairing flow can't hand out keys.
-TESLA_CONTROL_PATH=""
-TESLA_KEYGEN_PATH=""
-if command -v go &>/dev/null; then
-    info "Building tesla-control and tesla-keygen from source..."
-    TESLA_VC_DIR="/tmp/sentryusb-vehicle-command"
-    rm -rf "$TESLA_VC_DIR"
-    if git clone --depth 1 https://github.com/teslamotors/vehicle-command.git "$TESLA_VC_DIR" 2>/dev/null; then
-        (
-            cd "$TESLA_VC_DIR"
-            if [ -n "$GO_ARM" ]; then
-                GOOS=linux GOARCH=$GO_ARCH GOARM=$GO_ARM go build -o tesla-control ./cmd/tesla-control
-                GOOS=linux GOARCH=$GO_ARCH GOARM=$GO_ARM go build -o tesla-keygen ./cmd/tesla-keygen
-            else
-                GOOS=linux GOARCH=$GO_ARCH go build -o tesla-control ./cmd/tesla-control
-                GOOS=linux GOARCH=$GO_ARCH go build -o tesla-keygen ./cmd/tesla-keygen
-            fi
-        )
-        TESLA_CONTROL_PATH="$TESLA_VC_DIR/tesla-control"
-        TESLA_KEYGEN_PATH="$TESLA_VC_DIR/tesla-keygen"
-        ok "tesla-control and tesla-keygen built"
-    else
-        info "Could not clone vehicle-command — tesla binaries will NOT be bundled. Keep-Awake BLE mode will be unavailable on the resulting image."
-    fi
-else
-    info "Go not available locally — tesla binaries will NOT be bundled. Keep-Awake BLE mode will be unavailable on the resulting image."
-fi
+# ── (tesla-control / tesla-keygen are no longer built or bundled) ──────
+# Keep-Awake BLE, pairing, keygen and every Tesla command are now native
+# (the tesla_ble crate + sentryusb-ble-action + sentryusb-tesla-telemetry,
+# all built in Step 1 above). The external Go binaries are gone.
 
 # ── Step 2: Clone pi-gen ──
 info "Setting up pi-gen..."
@@ -247,14 +218,6 @@ fi
 cp "$SCRIPT_DIR/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary" \
     "$STAGE_FILES/sentryusb-pick-binary"
 chmod +x "$STAGE_FILES/sentryusb-pick-binary"
-
-if [ -n "$TESLA_CONTROL_PATH" ] && [ -f "$TESLA_CONTROL_PATH" ]; then
-    info "Injecting tesla-control and tesla-keygen..."
-    cp "$TESLA_CONTROL_PATH" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/tesla-control"
-    cp "$TESLA_KEYGEN_PATH"  "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/tesla-keygen"
-    chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/tesla-control"
-    chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/tesla-keygen"
-fi
 
 info "Injecting BLE daemon files..."
 cp "$SCRIPT_DIR/server/ble/sentryusb-ble.py" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/sentryusb-ble.py" 2>/dev/null \

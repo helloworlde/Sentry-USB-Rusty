@@ -158,6 +158,15 @@ enum Command {
     CheckPairing {
         reply: oneshot::Sender<PairingStatus>,
     },
+    /// Unauthenticated add-key-to-whitelist (pairing) request for our own
+    /// public key, sent over the held connection so it reuses the slot
+    /// the daemon already owns instead of opening a competing one — which
+    /// is what tripped the car's "maximum number of BLE devices" limit in
+    /// the old tesla-control flow. Fire-and-forget: the car prompts for an
+    /// NFC-card tap; enrolment is confirmed later via CheckPairing.
+    AddKey {
+        reply: oneshot::Sender<Result<()>>,
+    },
     Shutdown,
 }
 
@@ -393,6 +402,23 @@ impl PersistentSession {
         ))
     }
 
+    /// Send an unauthenticated add-key-to-whitelist (pairing) request for
+    /// our own public key over the held connection. Fire-and-forget: on
+    /// `Ok(())` the car received the request and is prompting for an
+    /// NFC-card tap on the center console — call [`check_pairing`] after
+    /// the user taps to confirm enrolment. `Err` is a connect/write
+    /// failure (e.g. the car's BLE slots are full, or it's out of range).
+    ///
+    /// [`check_pairing`]: Self::check_pairing
+    pub async fn add_key_request(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::AddKey { reply: tx })
+            .await
+            .context("PersistentSession background task has stopped")?;
+        rx.await.context("session task dropped the reply channel")?
+    }
+
     // Typed wrappers: each does a raw Infotainment `query()` and
     // decodes the response into the relevant car_server sub-message.
 
@@ -570,6 +596,17 @@ async fn run_session_task(
                     Err(e) => PairingStatus::Unreachable(format!("{e:#}")),
                 };
                 let _ = reply.send(status);
+            }
+            Command::AddKey { reply } => {
+                // Errors here are connect/transport failures — route them
+                // through the transport handler so a dead link is dropped
+                // and reconnected on the next op, same as the queries.
+                let result = handle_add_key(&mut state).await;
+                handle_transport_error_if_any(&mut state, &result).await;
+                if result.is_ok() {
+                    note_successful_query(&mut state, started.elapsed().as_millis());
+                }
+                let _ = reply.send(result);
             }
             Command::Shutdown => break,
         }
@@ -1202,6 +1239,22 @@ async fn handle_body_controller(
         .context("ensure_connected returned without a connection")?;
     // Success-bookkeeping is done by the caller (run_session_task).
     crate::body_controller::query(conn).await
+}
+
+/// [`Command::AddKey`] handler: send the unauthenticated
+/// add-key-to-whitelist request for our own public key over the held
+/// connection. Fire-and-forget — the car prompts for an NFC-card tap and
+/// enrolment is confirmed later by a `session-info` probe, so we only
+/// surface connect/write failures here.
+async fn handle_add_key(state: &mut SessionState) -> Result<()> {
+    ensure_connected(state).await?;
+    let payload = crate::pairing::build_add_key_request(&state.keypair.pub_uncompressed);
+    let conn = state
+        .conn
+        .as_mut()
+        .context("ensure_connected returned without a connection")?;
+    info!("add-key-request: TX {} bytes (enrolling our key)", payload.len());
+    conn.write_frame(&payload).await
 }
 
 /// session-info handshake over the held connection for the

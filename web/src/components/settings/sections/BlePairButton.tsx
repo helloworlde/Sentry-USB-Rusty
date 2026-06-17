@@ -89,6 +89,16 @@ interface BleLatestSample {
    *  sleeping). Fresh body-controller + stale state = car is asleep
    *  by design, not a failure mode. */
   body_controller_seconds_ago?: number | null
+  /** Per-field age (seconds) of the shown value. A field can be far
+   *  older than `seconds_ago` when its poll is failing while other polls
+   *  keep the envelope fresh — that's what made a stale temp read as
+   *  "updated 8 seconds ago". Used to flag the value inline. */
+  field_secs_ago?: {
+    battery_pct?: number | null
+    interior_temp_c?: number | null
+    exterior_temp_c?: number | null
+    tires?: number | null
+  } | null
 }
 
 /**
@@ -1059,7 +1069,11 @@ function TelemetryOutputPanel({
 
       {hasSample && sample && (
         <div className="space-y-1.5">
-          <Row label="Battery" value={fmtPct(sample.battery_pct)} />
+          <Row
+            label="Battery"
+            value={fmtPct(sample.battery_pct)}
+            age={sample.field_secs_ago?.battery_pct}
+          />
           {sample.odometer_mi != null && (
             <Row label="Odometer" value={fmtOdo(sample.odometer_mi, metric)} />
           )}
@@ -1093,8 +1107,16 @@ function TelemetryOutputPanel({
               may sleep when idle, but stays awake while an archive is running.
             </p>
           )}
-          <Row label="Interior temp" value={fmtTemp(sample.interior_temp_c, metric)} />
-          <Row label="Exterior temp" value={fmtTemp(sample.exterior_temp_c, metric)} />
+          <Row
+            label="Interior temp"
+            value={fmtTemp(sample.interior_temp_c, metric)}
+            age={sample.field_secs_ago?.interior_temp_c}
+          />
+          <Row
+            label="Exterior temp"
+            value={fmtTemp(sample.exterior_temp_c, metric)}
+            age={sample.field_secs_ago?.exterior_temp_c}
+          />
           <Row label="HVAC" value={fmtBool(sample.hvac_on)} />
           {/* Battery cell temperature intentionally omitted: Tesla
               doesn't expose it via state-query APIs (BLE or REST).
@@ -1110,10 +1132,10 @@ function TelemetryOutputPanel({
               <div className="mt-1 border-t border-white/5 pt-1.5 text-[10px] uppercase tracking-wider text-slate-600">
                 Tire pressure (psi)
               </div>
-              <Row label="Front left" value={fmtPsi(sample.tire_fl_psi)} />
-              <Row label="Front right" value={fmtPsi(sample.tire_fr_psi)} />
-              <Row label="Rear left" value={fmtPsi(sample.tire_rl_psi)} />
-              <Row label="Rear right" value={fmtPsi(sample.tire_rr_psi)} />
+              <Row label="Front left" value={fmtPsi(sample.tire_fl_psi)} age={sample.field_secs_ago?.tires} />
+              <Row label="Front right" value={fmtPsi(sample.tire_fr_psi)} age={sample.field_secs_ago?.tires} />
+              <Row label="Rear left" value={fmtPsi(sample.tire_rl_psi)} age={sample.field_secs_ago?.tires} />
+              <Row label="Rear right" value={fmtPsi(sample.tire_rr_psi)} age={sample.field_secs_ago?.tires} />
             </>
           )}
           {/* Three mutually-exclusive context messages for the stale
@@ -1163,11 +1185,37 @@ function TelemetryOutputPanel({
   )
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+// A shown value older than this (seconds) gets an inline age badge, so a
+// last-known reading can't pass for live. 10 min is well past the
+// ~15-30s active poll cadence, so fresh values are never flagged.
+const FIELD_STALE_AFTER_SECS = 600
+
+function Row({
+  label,
+  value,
+  age,
+}: {
+  label: string
+  value: string
+  // Per-field age (seconds) of `value`, when known.
+  age?: number | null
+}) {
+  const stale =
+    age != null && age >= FIELD_STALE_AFTER_SECS ? formatAgo(age) : null
   return (
     <div className="flex items-baseline justify-between">
       <span className="text-slate-500">{label}</span>
-      <span className="font-mono text-slate-300">{value}</span>
+      <span className={"font-mono " + (stale ? "text-slate-500" : "text-slate-300")}>
+        {value}
+        {stale && (
+          <span
+            className="ml-1.5 text-[10px] text-amber-400/80"
+            title="Last-known value — not a live reading"
+          >
+            · {stale} ago
+          </span>
+        )}
+      </span>
     </div>
   )
 }

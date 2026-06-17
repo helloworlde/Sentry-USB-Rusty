@@ -1407,11 +1407,13 @@ async fn handle_action_request(
     enum Dispatch {
         SessionInfo,
         DriveState,
+        Pair,
         Action(sentryusb_tesla_ble::actions::ActionPayload),
     }
     let dispatch = match verb.as_str() {
         "session-info" => Dispatch::SessionInfo,
         "drive-state" => Dispatch::DriveState,
+        "pair" => Dispatch::Pair,
         _ => match action_socket::parse_verb(&verb) {
             Ok(a) => Dispatch::Action(a),
             Err(e) => {
@@ -1520,6 +1522,28 @@ async fn handle_action_request(
                     Err(anyhow::anyhow!("UNREACHABLE: {e:#}"))
                 }
             }
+        }
+        // Add-key-to-whitelist (pairing) request over the held
+        // connection. Fire-and-forget: "OK" means the car received the
+        // request and is prompting for the NFC-card tap. Routing it
+        // through this warm session reuses the BLE slot the daemon
+        // already holds — sidestepping the car's "maximum number of BLE
+        // devices" limit that the old stop-daemon-then-tesla-control flow
+        // tripped. Enrolment is confirmed afterwards via session-info.
+        Dispatch::Pair => {
+            let result = session.add_key_request().await;
+            let elapsed_ms = started.elapsed().as_millis();
+            match &result {
+                Ok(()) => info!(
+                    "action_socket: verb=pair add-key delivered ({}ms) — awaiting NFC tap",
+                    elapsed_ms
+                ),
+                Err(e) => warn!(
+                    "action_socket: verb=pair failed after {}ms: {:#}",
+                    elapsed_ms, e
+                ),
+            }
+            result.map(|()| String::new())
         }
         Dispatch::Action(action) => {
             let result = session.send_action(action).await;

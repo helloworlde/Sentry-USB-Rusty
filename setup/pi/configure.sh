@@ -291,31 +291,47 @@ function check_and_configure_tesla_ble () {
         log_progress "Skipping required package for Tesla BLE API: pi-bluetooth does not exist for this device."
     fi
 
-    log_progress "Downloading Tesla BLE control binaries..."
-    install_tesla_ble_packages "$install_path"
+    # Tesla BLE is fully native now — keygen, pairing and every command go
+    # through sentryusb-ble-action (the tesla_ble crate). No tesla-control /
+    # tesla-keygen download.
+    local ble_action="/root/bin/sentryusb-ble-action"
+    [ -x "$ble_action" ] || ble_action="$install_path/sentryusb-ble-action"
 
     local pairing_needed=true
     mkdir -p /root/.ble
     if [ ! -f /root/.ble/key_public.pem ] || [ ! -f /root/.ble/key_private.pem ]
     then
-      "$install_path/tesla-keygen" -key-file /root/.ble/key_private.pem -output /root/.ble/key_public.pem create
-      chmod 600 /root/.ble/key_private.pem
-      chmod 644 /root/.ble/key_public.pem
-      # Mark these as freshly generated so the web UI knows pairing hasn't been
-      # confirmed yet and won't falsely show "BLE Paired" on a new install.
-      touch /root/.ble/key_pending_pairing
-      log_progress "Generated keys for Tesla BLE interface."
-    elif timeout 30 "$install_path/tesla-control" -ble -vin "${TESLA_BLE_VIN^^}" body-controller-state; then
-      if timeout 30 "$install_path/tesla-control" -ble -vin "${TESLA_BLE_VIN^^}" session-info /root/.ble/key_private.pem infotainment; then
-        log_progress "Tesla BLE keys exist and are paired."
-        pairing_needed=false
+      if [ -x "$ble_action" ]; then
+        # Generates the keypair + the key_pending_pairing marker with the
+        # right perms (0600 / 0644).
+        "$ble_action" keygen
+        log_progress "Generated keys for Tesla BLE interface."
       else
-        log_progress "WARNING: Tesla BLE keys already exist, but are not paired."
+        log_progress "WARNING: $ble_action not found — keys will be generated later via the web UI."
+        pairing_needed=false
       fi
+    elif [ -x "$ble_action" ]; then
+      # Keys already exist — probe pairing state natively. session-info
+      # prints exactly one token: PAIRED / NOT_PAIRED / UNREACHABLE.
+      local ble_token
+      ble_token="$(timeout 40 "$ble_action" session-info 2>/dev/null | tr -d '[:space:]')"
+      case "$ble_token" in
+        PAIRED)
+          log_progress "Tesla BLE keys exist and are paired."
+          pairing_needed=false
+          ;;
+        NOT_PAIRED)
+          log_progress "WARNING: Tesla BLE keys already exist, but are not paired."
+          ;;
+        *)
+          log_progress "WARNING: Tesla BLE keys exist, but the car is not reachable right now."
+          log_progress "If you are performing setup away from your car, this is expected."
+          log_progress "Pairing can be completed later via the web UI when SentryUSB is near the car."
+          pairing_needed=false
+          ;;
+      esac
     else
-      log_progress "WARNING: Tesla BLE keys exist, but the car is not reachable (timed out after 30s)."
-      log_progress "If you are performing setup away from your car, this is expected."
-      log_progress "Pairing can be completed later via the web UI when SentryUSB is near the car."
+      log_progress "WARNING: $ble_action not found — pairing must be completed via the web UI."
       pairing_needed=false
     fi
 
@@ -412,29 +428,6 @@ function install_matrix_packages () {
   install_python3_pip
   setup_progress "Installing matrix python packages..."
   pip3_install matrix-nio
-}
-
-function install_tesla_ble_packages () {
-  local install_path="$1"
-  local binary_dir=/tmp/binarydir
-
-  umount "$binary_dir" &> /dev/null || true
-  rm -rf "$binary_dir"
-  mkdir -p "$binary_dir"
-  mount -t tmpfs none "$binary_dir"
-  (
-    cd "$binary_dir"
-    curlwrapper -L "https://github.com/MikeBishop/tesla-vehicle-command-arm-binaries/releases/latest/download/vehicle-command-binaries-linux-armv6.tar.gz" | tar zxf - --strip-components=1
-  )
-
-  for binary in tesla-control tesla-keygen; do
-    cp "${binary_dir}/$binary" "$install_path/$binary"
-    chmod +x "$install_path/$binary"
-    setup_progress "Downloaded $install_path/$binary ..."
-  done
-
-  umount "$binary_dir" &> /dev/null || true
-  rm -rf "$binary_dir"
 }
 
 function check_signal_configuration () {

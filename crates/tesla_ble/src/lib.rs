@@ -8,6 +8,7 @@ pub mod gatt;
 pub mod keys;
 pub mod local_name;
 pub mod manager;
+pub mod pairing;
 pub mod responses;
 pub mod scan;
 pub mod session;

@@ -171,157 +171,67 @@ pub async fn ble_pair(State(s): State<AppState>, _body: String) -> (StatusCode, 
     }
 
     let hub = s.hub.clone();
-    let adapter = current_ble_adapter_for_pair();
     tokio::spawn(async move {
         hub.broadcast("ble_status", &serde_json::json!({"status": "pairing"}));
-        let vin_upper = vin.to_uppercase();
 
-        // ── Step 1: quiesce everything that touches the radio. ──
-        // sentryusb-telemetry holds a persistent BLE session and
-        // would compete with tesla-control for the slot. The iOS
-        // GATT daemon (sentryusb-ble) registers as a peripheral
-        // server. bluetoothd itself gets stopped briefly so we can
-        // power-cycle the controller before tesla-control needs it.
-        let _ = sentryusb_shell::run("systemctl", &["stop", "sentryusb-telemetry"]).await;
-        let _ = sentryusb_shell::run("systemctl", &["stop", "sentryusb-ble"]).await;
-        let _ = sentryusb_shell::run("systemctl", &["stop", "bluetooth"]).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // ── Step 2: restart bluetoothd. ──
-        // An earlier revision of this handler left bluetoothd
-        // stopped through the tesla-control call, assuming
-        // tesla-control wanted exclusive raw-HCI access. In
-        // practice tesla-control talks to bluez via D-Bus, so it
-        // needs bluetoothd UP. Leaving bluetoothd down "worked" on
-        // most chips (the underlying mgmt-socket calls succeeded
-        // anyway) but silently broke pair on the Rock 4C+'s
-        // BCM4345C0 build 0342 firmware where every subsequent
-        // BLE write was a no-op until something reset the
-        // controller.
-        let _ = sentryusb_shell::run("systemctl", &["start", "bluetooth"]).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // ── Step 3: full controller power-cycle. ──
-        // The BCM4345C0 (Rock Pi 4C+, possibly other Broadcom
-        // boards on recent kernels) enters a corrupt state after
-        // enough connection cycles where every BLE write returns
-        // OK at the bluez API level but never reaches the wire.
-        // dmesg shows `unexpected event for opcode 0x2016`
-        // warnings when this happens. The only thing that clears
-        // it is `hci_dev_close()` which `bluetoothctl power off`
-        // triggers via the management interface. ~3s extra during
-        // a one-time pair operation is a small price for working
-        // on broken chips; no functional cost on healthy ones.
-        let _ = sentryusb_shell::run("bluetoothctl", &["power", "off"]).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let _ = sentryusb_shell::run("bluetoothctl", &["power", "on"]).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // ── Step 4: the actual add-key-request. ──
-        // All flags passed explicitly so default-resolution
-        // differences across tesla-control versions can't bite us:
-        //   -bt-adapter — uses the user's configured choice (USB
-        //                 dongle vs onboard); pre-fix, tesla-control
-        //                 defaulted to hci0 even when the user had
-        //                 selected hci1.
-        //   -connect-timeout / -command-timeout — generous (30s
-        //                 each) because the post-power-cycle window
-        //                 is when the chip is at its most reliable;
-        //                 we'd rather wait longer than fail fast.
-        let add_result = sentryusb_shell::run_with_timeout(
+        // Send the add-key-to-whitelist request natively via
+        // sentryusb-ble-action — no tesla-control, no adapter switcheroo
+        // (no stopping bluetooth/telemetry/ble, no bluetoothctl
+        // power-cycle).
+        //
+        // ble-action routes the request through the telemetry daemon's
+        // IPC socket first, so it goes out over the connection the daemon
+        // already holds — *reusing* the car's BLE slot instead of opening
+        // a new one. The old flow stopped the daemon and power-cycled the
+        // controller, then tesla-control opened a *fresh* connection —
+        // which is exactly what tripped the car's "maximum number of BLE
+        // devices" limit, so the request never landed and the console
+        // never showed the card prompt. Keeping the daemon connected
+        // means no slot churn, no service downtime, and telemetry never
+        // pauses. (If the daemon is down — BLE telemetry disabled —
+        // ble-action falls back to its own one-shot direct-BLE session.)
+        //
+        // On success ble-action prints "OK" and exits 0: the request
+        // reached the car and it is now prompting for the NFC-card tap.
+        // The frontend's subsequent ble-status polls confirm enrolment
+        // once the user taps. The per-chunk WithResponse ATT ACK on the
+        // write is a real wire-level delivery confirmation, so there's no
+        // "chip lied about success" case to separately verify. 120s
+        // budget covers the cold scan + connect of the direct fallback.
+        let result = sentryusb_shell::run_with_timeout(
             Duration::from_secs(120),
-            "/root/bin/tesla-control",
-            &[
-                "-ble",
-                "-vin", &vin_upper,
-                "-bt-adapter", &adapter,
-                "-connect-timeout", "30s",
-                "-command-timeout", "30s",
-                "add-key-request",
-                "/root/.ble/key_public.pem",
-                "owner", "cloud_key",
-            ],
+            "/root/bin/sentryusb-ble-action",
+            &["pair"],
         ).await;
 
-        // ── Step 5: post-pair BLE verification. ──
-        // tesla-control returning exit 0 from add-key-request only
-        // proves that the bluez WriteValue D-Bus call returned —
-        // not that the bytes actually reached the car. On the
-        // BCM4345C0 + kernel 6.18 combo, writes succeed at the
-        // bluez layer while being silently dropped at the controller.
-        // tesla-control then exits success, the UI shows "tap your
-        // card", and the user wonders why the car never prompted.
-        //
-        // Fix: immediately probe `session-info`. This needs a fresh
-        // BLE round-trip and will succeed (or fail with a known
-        // protocol error like "key not whitelisted") if the link
-        // works. It will time out / "connect failed" / "Failed to
-        // initiate write" if the chip is in the bad state. We use
-        // that distinction to surface a meaningful error instead
-        // of the misleading "tap your card" message.
-        let verify_ok = match &add_result {
-            Ok(_) => {
-                // Verify via sentryusb-ble-action (same binary the
-                // ble-status probe below uses), which prints one token:
-                // PAIRED / NOT_PAIRED / UNREACHABLE. Both PAIRED and
-                // NOT_PAIRED mean the round-trip reached the car —
-                // NOT_PAIRED is just "key not whitelisted yet" because
-                // the user hasn't tapped their card, which still proves
-                // the radio link works. Only UNREACHABLE (or a missing/
-                // garbled reply) is the chip-broken transport state we
-                // flag. The pair flow has stopped the telemetry daemon,
-                // so this takes the binary's direct-BLE fallback — the
-                // fresh, independent round-trip we want here. 20s matches
-                // the ble-status probe's cold direct-scan budget.
-                let probe = sentryusb_shell::run_with_timeout(
-                    Duration::from_secs(20),
-                    "/root/bin/sentryusb-ble-action",
-                    &["session-info"],
-                ).await;
-                let token = probe.as_deref().map(str::trim).unwrap_or("");
-                matches!(token, "PAIRED" | "NOT_PAIRED")
-            }
-            Err(_) => false,
-        };
-
-        // ── Step 6: bring services back up. ──
-        let _ = sentryusb_shell::run("systemctl", &["start", "sentryusb-ble"]).await;
-        let _ = sentryusb_shell::run("systemctl", &["start", "sentryusb-telemetry"]).await;
-
-        match add_result {
-            Ok(output) if verify_ok => {
+        match result {
+            Ok(output) => {
                 hub.broadcast(
                     "ble_status",
-                    &serde_json::json!({"status": "waiting", "output": output}),
-                );
-            }
-            Ok(_) => {
-                // The "lies about success" case. add-key-request
-                // returned 0 but the post-pair probe couldn't reach
-                // the car. Surface what we know so the user doesn't
-                // sit waiting for a card prompt that will never
-                // come. Includes `verify_failed: true` so the
-                // frontend can render this case more prominently if
-                // it wants to (separate code path from the generic
-                // "tesla-control errored out" case).
-                hub.broadcast(
-                    "ble_status",
-                    &serde_json::json!({
-                        "status": "error",
-                        "verify_failed": true,
-                        "error": "Pair request returned success but the BLE adapter isn't reliably reaching the car \
-                                  (verification probe failed). This usually means the onboard Bluetooth chip is in a \
-                                  bad state (a known firmware/kernel quirk on some Broadcom chips like the Rock 4C+'s \
-                                  BCM4345C0). Plug in a USB Bluetooth dongle and select it under BLE adapter settings, \
-                                  then retry pairing.",
-                    }),
+                    &serde_json::json!({"status": "waiting", "output": output.trim()}),
                 );
             }
             Err(e) => {
-                let mut msg = e.to_string();
-                if let Some(idx) = msg.find("stderr: ") {
-                    msg = msg[idx + 8..].to_string();
-                }
+                // ble-action exits non-zero on a BLE/slot failure (car's
+                // connection table full, or asleep/out of range) or a
+                // config/key error. Detect the slot-exhaustion case — the
+                // single most common pairing failure — and give
+                // actionable guidance instead of a raw transport error.
+                let detail = e.to_string();
+                let lower = detail.to_lowercase();
+                let msg = if lower.contains("maximum number of ble")
+                    || lower.contains("slot likely held")
+                    || lower.contains("connect timed out")
+                    || lower.contains("could not reach vehicle")
+                {
+                    "Couldn't reach the car to send the pairing request — its Bluetooth \
+                     connection slots are likely full. Turn off Bluetooth on any phones near \
+                     the car (and move other paired phones away), make sure the car is awake \
+                     and within a few metres, then retry pairing."
+                        .to_string()
+                } else {
+                    detail
+                };
                 hub.broadcast(
                     "ble_status",
                     &serde_json::json!({"status": "error", "error": msg}),
@@ -331,24 +241,6 @@ pub async fn ble_pair(State(s): State<AppState>, _body: String) -> (StatusCode, 
     });
 
     (StatusCode::OK, Json(serde_json::json!({"status": "pairing_started"})))
-}
-
-/// Read the user's configured BLE adapter for the pair flow.
-/// Duplicates the resolver in `ble.rs::current_ble_adapter` to avoid
-/// cross-module visibility changes for a 10-line helper. If they
-/// drift, both should be brought back together — neither is
-/// performance-sensitive (called once per pair attempt).
-fn current_ble_adapter_for_pair() -> String {
-    let config_path = sentryusb_config::find_config_path();
-    if let Ok((active, _)) = sentryusb_config::parse_file(config_path) {
-        if let Some(v) = active.get("BLE_ADAPTER") {
-            let trimmed = v.trim();
-            if trimmed.starts_with("hci") {
-                return trimmed.to_string();
-            }
-        }
-    }
-    "hci0".to_string()
 }
 
 /// Remount the root filesystem read-write. These images keep `/`
@@ -409,8 +301,14 @@ pub async fn ble_status(
         Ok((active, _)) => active.get("TESLA_BLE_VIN").cloned().unwrap_or_default(),
         Err(_) => String::new(),
     };
-    let binaries_installed = std::path::Path::new("/root/bin/tesla-control").exists()
-        && std::path::Path::new("/root/bin/tesla-keygen").exists();
+    // "Installed" now means the native BLE action binary plus the
+    // keypair are present. tesla-control / tesla-keygen are gone —
+    // pairing, keygen and every command are native (sentryusb-ble-action
+    // + the tesla_ble crate). ble-action ships in the image, so this
+    // tracks "the keypair has been generated" (the install/enable step),
+    // keeping the frontend's install → pair flow intact.
+    let binaries_installed = std::path::Path::new("/root/bin/sentryusb-ble-action").exists()
+        && priv_exists;
 
     if !pub_exists || !priv_exists {
         return (StatusCode::OK, Json(serde_json::json!({

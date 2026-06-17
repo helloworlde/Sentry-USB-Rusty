@@ -599,6 +599,25 @@ pub async fn ble_latest_sample(
                 )
                 .ok()
             };
+            // Like `latest_col_f64`, but also returns the `ts` of the row
+            // the value came from. The endpoint surfaces this per-field
+            // age so the UI can flag a value that's much older than the
+            // envelope timestamp — fixes "interior 19°C, updated 10s ago"
+            // when the 19°C reading is actually hours stale (a failed
+            // climate poll leaves the old value as latest-non-null while a
+            // charge/body poll advances the envelope). Pairs (value, ts).
+            let latest_col_f64_aged = |col: &str| -> Option<(f64, i64)> {
+                conn.query_row(
+                    &format!(
+                        "SELECT {col}, ts FROM telemetry_samples \
+                         WHERE {col} IS NOT NULL AND ts >= ?1 \
+                         ORDER BY ts DESC LIMIT 1"
+                    ),
+                    (floor,),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok()
+            };
             let latest_col_i64 = |col: &str| -> Option<i64> {
                 conn.query_row(
                     &format!(
@@ -643,11 +662,15 @@ pub async fn ble_latest_sample(
                 (
                     ts,
                     source,
-                    latest_col_f64("battery_pct"),
-                    latest_col_f64("interior_temp_c"),
-                    latest_col_f64("exterior_temp_c"),
+                    // Volatile, freshness-sensitive fields carry their own
+                    // row ts so the UI can show per-field age.
+                    latest_col_f64_aged("battery_pct"),
+                    latest_col_f64_aged("interior_temp_c"),
+                    latest_col_f64_aged("exterior_temp_c"),
                     latest_col_i64("hvac_on"),
-                    latest_col_f64("tire_fl_psi"),
+                    // Tires are polled together; tire_fl's ts represents
+                    // the whole TPMS set's age.
+                    latest_col_f64_aged("tire_fl_psi"),
                     latest_col_f64("tire_fr_psi"),
                     latest_col_f64("tire_rl_psi"),
                     latest_col_f64("tire_rr_psi"),
@@ -685,21 +708,35 @@ pub async fn ble_latest_sample(
             odometer_mi,
             location_name,
             body_controller_ts,
-        )) => (
+        )) => {
+            // Age of each aged (value, ts) pair, in seconds — how old the
+            // shown value actually is, independent of the envelope's
+            // "seconds_ago". The UI flags a field whose age greatly
+            // exceeds the envelope so a stale temp can't read as current.
+            let age = |pair: &Option<(f64, i64)>| pair.map(|(_, t)| (now - t).max(0));
+            (
             StatusCode::OK,
             Json(serde_json::json!({
                 "ts": ts,
                 "seconds_ago": (now - ts).max(0),
-                "battery_pct": battery_pct,
-                "interior_temp_c": interior_temp_c,
-                "exterior_temp_c": exterior_temp_c,
+                "battery_pct": battery_pct.map(|(v, _)| v),
+                "interior_temp_c": interior_temp_c.map(|(v, _)| v),
+                "exterior_temp_c": exterior_temp_c.map(|(v, _)| v),
                 "hvac_on": hvac_on.map(|v| v != 0),
-                "tire_fl_psi": tire_fl_psi,
+                "tire_fl_psi": tire_fl_psi.map(|(v, _)| v),
                 "tire_fr_psi": tire_fr_psi,
                 "tire_rl_psi": tire_rl_psi,
                 "tire_rr_psi": tire_rr_psi,
                 "odometer_mi": odometer_mi,
                 "location_name": location_name,
+                // Per-field age (seconds) for the volatile values the
+                // dashboard shows. Null when the field has no value.
+                "field_secs_ago": {
+                    "battery_pct": age(&battery_pct),
+                    "interior_temp_c": age(&interior_temp_c),
+                    "exterior_temp_c": age(&exterior_temp_c),
+                    "tires": age(&tire_fl_psi),
+                },
                 // Live gate inputs from the daemon's gate file, not the DB.
                 "sentry_mode": sentry_mode,
                 "charging_state": charging_state,
@@ -712,7 +749,8 @@ pub async fn ble_latest_sample(
                 "body_controller_seconds_ago": body_controller_ts
                     .map(|t| (now - t).max(0)),
             })),
-        ),
+        )
+        }
         None => (
             StatusCode::OK,
             Json(serde_json::json!({ "ts": null })),
@@ -946,9 +984,12 @@ pub async fn ble_adapter_set(
 pub async fn ble_install(
     State(s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let already_installed = std::path::Path::new("/root/bin/tesla-control").exists()
-        && std::path::Path::new("/root/bin/tesla-keygen").exists()
-        && std::path::Path::new("/root/.ble/key_private.pem").exists();
+    // "Installed" = the BLE keypair exists. tesla-control / tesla-keygen
+    // are no longer downloaded — install now just ensures bluez and
+    // generates the native keypair (the only durable artifact the step
+    // produces). The native sentryusb-ble-action binary ships in the
+    // image alongside the API server, so it's always present here.
+    let already_installed = std::path::Path::new("/root/.ble/key_private.pem").exists();
 
     let hub = s.hub.clone();
     tokio::spawn(async move {

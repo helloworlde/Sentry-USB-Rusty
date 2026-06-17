@@ -195,11 +195,15 @@ fn validate_sentry_case(env: &SetupEnv) -> Result<()> {
     Ok(())
 }
 
-/// Install `tesla-control` / `tesla-keygen` and generate the BLE
-/// keypair. Caller-agnostic: invoked by `configure_tesla_ble` during
-/// setup and by the settings-page lazy-install endpoint on a live
-/// system. Idempotent — returns Ok(()) immediately if both the
-/// binaries and the keypair already exist.
+/// Ensure bluez is installed and generate the BLE keypair. Caller-
+/// agnostic: invoked by `configure_tesla_ble` during setup and by the
+/// settings-page lazy-install endpoint on a live system. Idempotent —
+/// returns Ok(()) immediately if the keypair already exists.
+///
+/// No longer downloads tesla-control / tesla-keygen: keygen, pairing and
+/// every BLE command are native now (the `tesla_ble` crate +
+/// `sentryusb-ble-action`, which ships in the image). The function name
+/// is kept so the existing `ble-install` endpoint call site is stable.
 ///
 /// Progress messages route through `progress` so callers can dispatch
 /// them to whatever surface they have (setup `SetupEmitter`,
@@ -208,19 +212,7 @@ pub async fn install_tesla_ble_binaries<F>(progress: F) -> Result<()>
 where
     F: Fn(&str),
 {
-    // Match the Go-era install layout: the canonical path is /root/bin/
-    // (which the vendored awake_start script hardcodes at line 153 and
-    // 363), and we additionally symlink into /usr/local/bin/ so PATH
-    // lookups also succeed. Without /root/bin/tesla-control, every
-    // keep-awake call in archiveloop fails with
-    //   /root/bin/awake_start: line 153: /root/bin/tesla-control:
-    //   No such file or directory
-    // even though the binary exists at /usr/local/bin/.
-    let binaries_present = std::path::Path::new("/root/bin/tesla-control").exists()
-        && std::path::Path::new("/root/bin/tesla-keygen").exists();
-    let keys_present = std::path::Path::new("/root/.ble/key_private.pem").exists();
-
-    if binaries_present && keys_present {
+    if std::path::Path::new("/root/.ble/key_private.pem").exists() {
         return Ok(());
     }
 
@@ -252,51 +244,6 @@ where
         }
     }
 
-    if !binaries_present {
-        progress("Downloading Tesla BLE control binaries...");
-        let arch = sentryusb_shell::run("uname", &["-m"]).await?.trim().to_string();
-        let tarball = if arch == "aarch64" || arch.starts_with("arm") {
-            "vehicle-command-binaries-linux-armv6.tar.gz"
-        } else {
-            return Err(anyhow::anyhow!(
-                "unsupported architecture for Tesla BLE binaries: {}",
-                arch
-            ));
-        };
-
-        let url = format!(
-            "https://github.com/MikeBishop/tesla-vehicle-command-arm-binaries/releases/latest/download/{}",
-            tarball
-        );
-        let _ = std::fs::create_dir_all("/tmp/blebin");
-        sentryusb_shell::run_with_timeout(
-            Duration::from_secs(60),
-            "bash", &["-c", &format!(
-                "curl -sL '{}' | tar xzf - -C /tmp/blebin --strip-components=1", url
-            )],
-        ).await.context("failed to download Tesla BLE binaries")?;
-
-        let _ = std::fs::create_dir_all("/root/bin");
-        for binary in &["tesla-control", "tesla-keygen"] {
-            let src = format!("/tmp/blebin/{}", binary);
-            let dst = format!("/root/bin/{}", binary);
-            let path_link = format!("/usr/local/bin/{}", binary);
-            if std::path::Path::new(&src).exists() {
-                std::fs::copy(&src, &dst)?;
-                sentryusb_shell::run("chmod", &["+x", &dst]).await?;
-                // Mirror to /usr/local/bin/ via symlink so PATH-based
-                // callers (the wizard's pairing test, manual ssh sessions)
-                // still work. Remove a stale file or stale symlink first
-                // so re-runs leave us with a clean link.
-                let _ = std::fs::remove_file(&path_link);
-                #[cfg(unix)]
-                let _ = std::os::unix::fs::symlink(&dst, &path_link);
-                progress(&format!("Installed {} (symlinked to {})", dst, path_link));
-            }
-        }
-        let _ = std::fs::remove_dir_all("/tmp/blebin");
-    }
-
     // Generate BLE keys if they don't exist. Uses our Rust-side
     // P-256 generator (sentryusb_tesla_ble::keys::generate_keypair)
     // — no longer shells out to tesla-keygen. Writes PKCS#8 PEM for
@@ -319,19 +266,21 @@ where
 /// Idempotent: if the binaries are already installed and keys exist, we do
 /// nothing and return false so the caller can skip announcing a phase.
 pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
-    let vin = match env.config.get("TESLA_BLE_VIN") {
-        Some(v) if !v.is_empty() => v.clone(),
-        _ => {
-            info!("Tesla BLE not enabled");
-            return Ok(false);
-        }
-    };
+    // BLE is opt-in: skip entirely if no VIN is configured.
+    if env
+        .config
+        .get("TESLA_BLE_VIN")
+        .map(|v| v.is_empty())
+        .unwrap_or(true)
+    {
+        info!("Tesla BLE not enabled");
+        return Ok(false);
+    }
 
-    let binaries_present = std::path::Path::new("/root/bin/tesla-control").exists()
-        && std::path::Path::new("/root/bin/tesla-keygen").exists();
-    let keys_present_initially = std::path::Path::new("/root/.ble/key_private.pem").exists();
-
-    if binaries_present && keys_present_initially {
+    // The only durable artifact is the keypair — keygen, pairing and
+    // every command are native now (no tesla-control/tesla-keygen to
+    // install). If it already exists there's nothing to do.
+    if std::path::Path::new("/root/.ble/key_private.pem").exists() {
         return Ok(false);
     }
 
@@ -339,23 +288,6 @@ pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Resu
     emitter.progress("Configuring Tesla BLE...");
 
     install_tesla_ble_binaries(|msg| emitter.progress(msg)).await?;
-
-    // When binaries were missing but a keypair was already present,
-    // it means the user is "re-installing" alongside an existing
-    // pairing — probe the car so the setup log reflects whether the
-    // existing pairing still works.
-    if keys_present_initially {
-        let vin_upper = vin.to_uppercase();
-        let paired = sentryusb_shell::run_with_timeout(
-            Duration::from_secs(35),
-            "tesla-control", &["-ble", "-vin", &vin_upper, "body-controller-state"],
-        ).await;
-
-        match paired {
-            Ok(_) => emitter.progress("Tesla BLE keys exist and car is reachable."),
-            Err(_) => emitter.progress("Tesla BLE keys exist, but car not reachable. Pairing can be done later."),
-        }
-    }
 
     Ok(true)
 }

@@ -423,6 +423,47 @@ impl Connection {
         result
     }
 
+    /// Write a framed payload to the car WITHOUT waiting for a response.
+    ///
+    /// Used for the unauthenticated add-key/whitelist pairing request.
+    /// Matching tesla-control's `SendAddKeyRequestWithRole`, this is
+    /// fire-and-forget: the per-chunk `WithResponse` ATT ACK confirms the
+    /// car received the bytes, and the car then prompts for the NFC-card
+    /// tap on the center console. Whether the key actually landed on the
+    /// whitelist is confirmed separately by a `session-info` probe — so we
+    /// never block here waiting for a response the car may not send.
+    pub async fn write_frame(&mut self, payload: &[u8]) -> Result<()> {
+        // We don't read a reply, so clear any stray frames first and mark
+        // the line dirty — the next round_trip must re-run its full
+        // pre-TX drain since a late response to this write could arrive.
+        self.drain_until_quiet(Duration::from_millis(100)).await;
+        self.last_round_trip_clean = false;
+
+        let framed = frame(payload);
+        let chunks = chunks_for_mtu(&framed, self.att_mtu);
+        debug!(
+            "TX (no-reply) framed ({} bytes in {} chunk(s)): {}",
+            framed.len(),
+            chunks.len(),
+            hex::encode(&framed)
+        );
+        // The link must be live before we claim delivery — a dead slot
+        // here means the connection dropped (pair-auth race, RF drop).
+        if let Ok(false) = self.peripheral.is_connected().await {
+            bail!(
+                "BLE write_frame: peripheral.is_connected()=false before TX — \
+                 link not established (slot race or RF drop)"
+            );
+        }
+        for chunk in chunks {
+            self.peripheral
+                .write(&self.tx_char, chunk, WriteType::WithResponse)
+                .await
+                .context("BLE write (pairing request)")?;
+        }
+        Ok(())
+    }
+
     /// Best-effort disconnect. Safe to call multiple times.
     pub async fn close(self) {
         let _ = self.peripheral.disconnect().await;

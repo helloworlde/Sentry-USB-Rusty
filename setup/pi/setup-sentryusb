@@ -1398,35 +1398,32 @@ function diagnose {
     else
       echo "BLE private key does NOT exist"
     fi
-    if [ -x /root/bin/tesla-control ]
+    if [ -x /root/bin/sentryusb-ble-action ]
     then
-      echo "tesla-control binary exists"
+      echo "sentryusb-ble-action binary exists (native BLE — tesla-control no longer used)"
     else
-      echo "tesla-control binary does NOT exist"
-    fi
-    if [ -x /root/bin/tesla-keygen ]
-    then
-      echo "tesla-keygen binary exists"
-    else
-      echo "tesla-keygen binary does NOT exist"
+      echo "sentryusb-ble-action binary does NOT exist"
     fi
     if [ -n "${TESLA_BLE_VIN:+x}" ]
     then
       echo "TESLA_BLE_VIN is set: ${TESLA_BLE_VIN}"
-      if [ -x /root/bin/tesla-control ] && [ -f /root/.ble/key_private.pem ]
+      if [ -x /root/bin/sentryusb-ble-action ] && [ -f /root/.ble/key_private.pem ]
       then
-        if /root/bin/tesla-control -ble -vin "${TESLA_BLE_VIN^^}" body-controller-state 2>/dev/null
-        then
-          echo "Car is reachable via BLE"
-          if /root/bin/tesla-control -ble -vin "${TESLA_BLE_VIN^^}" session-info /root/.ble/key_private.pem infotainment 2>/dev/null
-          then
+        # Native pairing probe: prints exactly one token.
+        ble_diag_token="$(timeout 40 /root/bin/sentryusb-ble-action session-info 2>/dev/null | tr -d '[:space:]')"
+        case "$ble_diag_token" in
+          PAIRED)
+            echo "Car is reachable via BLE"
             echo "BLE key is PAIRED with the car"
-          else
-            echo "BLE key is NOT paired with the car (or session-info failed)"
-          fi
-        else
-          echo "Car is NOT reachable via BLE (out of range or BLE issue)"
-        fi
+            ;;
+          NOT_PAIRED)
+            echo "Car is reachable via BLE"
+            echo "BLE key is NOT paired with the car"
+            ;;
+          *)
+            echo "Car is NOT reachable via BLE (out of range, asleep, or BLE issue)"
+            ;;
+        esac
       fi
     else
       echo "TESLA_BLE_VIN is not set (BLE not configured)"

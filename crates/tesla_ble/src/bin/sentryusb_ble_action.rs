@@ -36,6 +36,8 @@
 //!   keep-accessory-off - turn Keep Accessory Power off
 //!   session-info       - pairing probe (see below)
 //!   drive-state        - current gear query (see below)
+//!   pair               - add-key-to-whitelist request (prompts for NFC tap)
+//!   keygen             - generate the BLE P-256 keypair (replaces tesla-keygen)
 //!
 //! `session-info` is not an action: it prints exactly one stdout token
 //! — `PAIRED`, `NOT_PAIRED`, or `UNREACHABLE` — and exits 0 for all
@@ -92,7 +94,7 @@ async fn main() -> ExitCode {
         Some(v) => v,
         None => {
             eprintln!(
-                "usage: sentryusb-ble-action <wake|sentry-on|sentry-off|charge-port-open|charge-port-close|keep-accessory-on|keep-accessory-off>"
+                "usage: sentryusb-ble-action <wake|sentry-on|sentry-off|charge-port-open|charge-port-close|keep-accessory-on|keep-accessory-off|session-info|drive-state|pair|keygen>"
             );
             return ExitCode::from(1);
         }
@@ -107,6 +109,18 @@ async fn main() -> ExitCode {
     // distinct exit codes, so handle it before the action dispatch.
     if verb == "drive-state" {
         return run_drive_state().await;
+    }
+    // `pair` is a fire-and-forget add-key-to-whitelist request — it has
+    // its own IPC-first / direct-fallback path and exit-code semantics
+    // (0 = request delivered, tap your card; 3 = BLE/slot failure), so
+    // handle it before the action dispatch too.
+    if verb == "pair" {
+        return run_pair().await;
+    }
+    // `keygen` generates the P-256 keypair natively (replaces
+    // `tesla-keygen create`). No BLE — pure local key generation.
+    if verb == "keygen" {
+        return run_keygen();
     }
 
     // Try the IPC fast-path first. If the telemetry daemon is up,
@@ -259,6 +273,41 @@ async fn try_via_ipc(verb: &str) -> Result<(), IpcError> {
     }
 }
 
+/// `keygen` verb. Generates the P-256 BLE keypair under /root/.ble
+/// (PKCS#8 private + SPKI public PEM) via the native generator — the
+/// drop-in replacement for `tesla-keygen … create`. Idempotent and
+/// safe: if a private key already exists it is left untouched (never
+/// clobber a key that may already be paired with the car) and we exit 0.
+/// Marks the keys freshly generated so the UI knows pairing is pending.
+///
+/// Exit codes: 0 keys present/created, 2 filesystem/keygen error.
+fn run_keygen() -> ExitCode {
+    let dir = Path::new("/root/.ble");
+    if dir.join("key_private.pem").exists() {
+        info!("keygen: keypair already present at {} — leaving it untouched", dir.display());
+        println!("OK");
+        return ExitCode::SUCCESS;
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        error!("keygen: creating {}: {e:#}", dir.display());
+        return ExitCode::from(2);
+    }
+    match sentryusb_tesla_ble::keys::generate_keypair(dir) {
+        Ok(_) => {
+            // Mark not-yet-paired so the web UI doesn't falsely show
+            // "BLE Paired" on a fresh keypair (matches the wizard).
+            let _ = std::fs::write(dir.join("key_pending_pairing"), "");
+            info!("keygen: generated BLE keypair under {}", dir.display());
+            println!("OK");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!("keygen: {e:#}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// `session-info` verb. Prints one pairing token to stdout and exits 0
 /// (config errors exit 2 with no token). IPC-first so the probe reuses
 /// the telemetry daemon's warm connection; direct fallback covers a
@@ -314,6 +363,79 @@ async fn run_session_info() -> ExitCode {
     };
     println!("{token}");
     ExitCode::SUCCESS
+}
+
+/// `pair` verb. Sends an unauthenticated add-key-to-whitelist request for
+/// our own public key, so the car prompts for an NFC-card tap on the
+/// center console. Fire-and-forget: success (exit 0, prints `OK`) means
+/// the request was delivered — the caller then waits for the tap and
+/// confirms enrolment with `session-info`. Replaces the old
+/// `tesla-control add-key-request` shell-out.
+///
+/// IPC-first: routes through the telemetry daemon's already-open
+/// connection, reusing the BLE slot the daemon holds. This is the key
+/// fix for the "maximum number of BLE devices" failure — the old flow
+/// stopped the daemon and opened a *new* connection before the car freed
+/// the slot. Direct fallback (own one-shot session) covers a
+/// disabled/crashed daemon.
+///
+/// Exit codes: 0 request delivered, 2 config/key error, 3 BLE/slot error.
+async fn run_pair() -> ExitCode {
+    match try_via_ipc("pair").await {
+        Ok(()) => {
+            println!("OK");
+            info!("add-key-request delivered via daemon IPC — tap your card on the console");
+            return ExitCode::SUCCESS;
+        }
+        Err(IpcError::Unavailable(reason)) => {
+            info!(
+                "telemetry IPC unavailable ({}), sending add-key-request via direct BLE",
+                reason
+            );
+        }
+        Err(IpcError::DaemonRejected(msg)) => {
+            // Daemon is up but the add-key write failed (slot full, car
+            // out of range/asleep). A direct attempt would open a *new*
+            // connection — exactly what hits the car's slot limit — so
+            // surface the daemon's error rather than thrashing the radio.
+            eprintln!("{msg}");
+            return ExitCode::from(3);
+        }
+    }
+
+    // Direct fallback: open our own one-shot session and send the request.
+    let (vin, adapter) = match load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("{e:#}");
+            return ExitCode::from(2);
+        }
+    };
+    let keypair = match KeyPair::load(Path::new(KEY_FILE)) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("loading BLE key file {KEY_FILE}: {e:#}");
+            return ExitCode::from(2);
+        }
+    };
+    let session = PersistentSession::start(keypair, vin, adapter);
+    let result = tokio::time::timeout(Duration::from_secs(60), session.add_key_request()).await;
+    session.shutdown().await;
+    match result {
+        Ok(Ok(())) => {
+            println!("OK");
+            info!("add-key-request delivered via direct BLE — tap your card on the console");
+            ExitCode::SUCCESS
+        }
+        Ok(Err(e)) => {
+            error!("{e:#}");
+            ExitCode::from(3)
+        }
+        Err(_) => {
+            error!("pair (add-key) timed out after 60s");
+            ExitCode::from(3)
+        }
+    }
 }
 
 /// Send `session-info` over the daemon IPC socket and map the reply to

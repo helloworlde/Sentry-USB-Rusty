@@ -24,6 +24,8 @@ const TirePressureCard = lazy(() =>
 
 export interface CarStatusSample {
   ts: number | null
+  // Age of the envelope (most recent state poll), in seconds.
+  seconds_ago?: number | null
   battery_pct?: number | null
   interior_temp_c?: number | null
   exterior_temp_c?: number | null
@@ -31,6 +33,16 @@ export interface CarStatusSample {
   tire_fr_psi?: number | null
   tire_rl_psi?: number | null
   tire_rr_psi?: number | null
+  // Per-field age (seconds) of the shown value. A field can be far older
+  // than `seconds_ago` when its poll has been failing while other polls
+  // keep the envelope fresh — that's what made a stale temp read as
+  // "updated 10s ago". Surfaced so the chip can flag it.
+  field_secs_ago?: {
+    battery_pct?: number | null
+    interior_temp_c?: number | null
+    exterior_temp_c?: number | null
+    tires?: number | null
+  } | null
 }
 
 interface CarStatusCardProps {
@@ -100,6 +112,28 @@ function formatTemp(c: number | null | undefined, useFahrenheit: boolean): strin
   const value = useFahrenheit ? (c * 9) / 5 + 32 : c
   const unit = useFahrenheit ? "°F" : "°C"
   return `${Math.round(value)}${unit}`
+}
+
+// A shown value older than this is flagged as stale next to the chip, so
+// a last-known reading (car asleep, or a field's poll failing while the
+// envelope stays fresh) can't masquerade as current. 10 min is well past
+// the ~15-30s active poll cadence, so live values are never flagged.
+const STALE_AFTER_SECS = 600
+
+// Compact relative age ("4m", "2h", "3d") for a stale-value hint.
+function formatAge(secs: number): string {
+  if (secs < 90) return `${Math.max(1, Math.round(secs))}s`
+  const m = Math.round(secs / 60)
+  if (m < 90) return `${m}m`
+  const h = Math.round(m / 60)
+  if (h < 36) return `${h}h`
+  return `${Math.round(h / 24)}d`
+}
+
+// Returns "· 2h ago" when the field is older than the threshold, else null.
+function staleHint(secs: number | null | undefined): string | null {
+  if (secs == null || secs < STALE_AFTER_SECS) return null
+  return `${formatAge(secs)} ago`
 }
 
 /**
@@ -209,6 +243,13 @@ export function CarStatusCard({
           accent={charging}
           valueClass={charging ? "text-emerald-300" : undefined}
           onClick={haveChargeDetail ? () => setBatteryOpen((o) => !o) : undefined}
+          // Live charge SoC (currentCharge) is always fresh; only the
+          // last-BLE-sample battery_pct can be stale.
+          stale={
+            currentCharge?.soc != null
+              ? null
+              : staleHint(sample?.field_secs_ago?.battery_pct)
+          }
           trailing={
             haveChargeDetail ? (
               batteryOpen ? (
@@ -223,17 +264,24 @@ export function CarStatusCard({
           icon={<Thermometer className="h-3.5 w-3.5" />}
           label="Interior"
           value={formatTemp(sample?.interior_temp_c, useFahrenheit)}
+          stale={staleHint(sample?.field_secs_ago?.interior_temp_c)}
         />
         <StatusChip
           icon={<Thermometer className="h-3.5 w-3.5" />}
           label="Exterior"
           value={formatTemp(sample?.exterior_temp_c, useFahrenheit)}
+          stale={staleHint(sample?.field_secs_ago?.exterior_temp_c)}
         />
         <StatusChip
           icon={<Disc className="h-3.5 w-3.5" />}
           label="Tires"
           value={tireStatus.label}
           valueClass={tireStatus.color}
+          stale={
+            tireStatus.kind === "none"
+              ? null
+              : staleHint(sample?.field_secs_ago?.tires)
+          }
           onClick={haveTireData ? () => setTiresOpen((o) => !o) : undefined}
           trailing={
             haveTireData ? (
@@ -307,6 +355,10 @@ interface StatusChipProps {
   accent?: boolean
   onClick?: () => void
   trailing?: React.ReactNode
+  // When set (e.g. "2h ago"), the value is older than it looks: render a
+  // muted age suffix and dim the value so a stale reading isn't mistaken
+  // for a live one.
+  stale?: string | null
 }
 
 function StatusChip({
@@ -317,6 +369,7 @@ function StatusChip({
   accent,
   onClick,
   trailing,
+  stale,
 }: StatusChipProps) {
   const isButton = !!onClick
   const Wrapper = (isButton ? "button" : "div") as "button" | "div"
@@ -353,10 +406,18 @@ function StatusChip({
         <div
           className={
             "mt-0.5 text-sm font-semibold tabular-nums leading-tight " +
-            (valueClass ?? "text-slate-100")
+            (stale ? "text-slate-400" : (valueClass ?? "text-slate-100"))
           }
         >
           {value}
+          {stale && (
+            <span
+              className="ml-1.5 text-[10px] font-medium tabular-nums text-amber-400/80"
+              title="Last-known value — not a live reading"
+            >
+              · {stale}
+            </span>
+          )}
         </div>
       </div>
       {trailing}

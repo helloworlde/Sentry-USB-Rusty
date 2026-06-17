@@ -493,13 +493,14 @@ pub async fn get_config(
     // in later. Now it returns "yes" whenever BLE *could* be used:
     //   * user has explicitly enabled BLE in settings, OR
     //   * a VIN is already set (legacy install), OR
-    //   * the binaries are installed (already opted in at some point), OR
+    //   * a BLE keypair has been generated (opted in at some point), OR
     //   * pairing artifacts exist (paired marker present).
     // Fresh installs that never touched BLE still return "no", so the
     // card stays hidden until the user enables BLE — preserving the
-    // clean default for non-Tesla / non-BLE users.
+    // clean default for non-Tesla / non-BLE users. (tesla-control is
+    // gone; the keypair is the native "opted in" signal.)
     let uses_ble = if crate::ble::is_ble_enabled()
-        || std::path::Path::new("/root/bin/tesla-control").exists()
+        || std::path::Path::new("/root/.ble/key_private.pem").exists()
         || std::path::Path::new("/root/.ble/paired").exists()
     {
         "yes".to_string()

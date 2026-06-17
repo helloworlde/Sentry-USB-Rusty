@@ -414,6 +414,16 @@ if old in content:
     open('/root/bin/archiveloop','w').write(content.replace(old, new, 1))
 PYEOF
 fi
+
+# ── Remove obsolete tesla-control / tesla-keygen ──
+# Pairing, keygen and every Tesla BLE command are native now
+# (sentryusb-ble-action + the tesla_ble crate); nothing references the
+# external Go binaries anymore. They're ~28 MB of dead weight on the
+# space-tight root partition. The telemetry unit copied + reloaded above
+# no longer gates on tesla-control, so removing them can't break startup.
+# Idempotent.
+rm -f /root/bin/tesla-control /root/bin/tesla-keygen \
+      /usr/local/bin/tesla-control /usr/local/bin/tesla-keygen 2>/dev/null || true
 "#,
         tarball_url = tarball_url,
         repo = MIGRATE_REPO,
