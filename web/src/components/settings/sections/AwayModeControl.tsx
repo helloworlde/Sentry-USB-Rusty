@@ -1,10 +1,13 @@
 import { useState } from "react"
-import { AlertTriangle, Clock, Wifi } from "lucide-react"
+import { AlertTriangle, Clock, Wifi, MapPin, Loader2 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAwayMode } from "@/hooks/useAwayMode"
+import type { AwayModeKind } from "@/hooks/useAwayMode"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 import { Row } from "@/components/ui/StatusTile"
+import { SegPicker } from "@/components/ui/SegPicker"
+import { HomeGeofencePicker } from "@/components/settings/HomeGeofencePicker"
 
 const AWAY_PRESETS = [
   { value: 60, label: "1h" },
@@ -13,24 +16,33 @@ const AWAY_PRESETS = [
   { value: 480, label: "8h" },
 ]
 
+const MODE_OPTIONS: { value: AwayModeKind; label: string }[] = [
+  { value: "manual", label: "Manual" },
+  { value: "auto", label: "Automatic" },
+]
+
 interface Props {
   /** Re-launches the Setup Wizard so the user can configure the AP. */
   onOpenWizard?: () => void
 }
 
 export function AwayModeControl({ onOpenWizard }: Props = {}) {
-  const { status, enable, disable } = useAwayMode()
+  const { status, enable, disable, setMode, config, updateConfig, useCurrentLocation } = useAwayMode()
   // Undefined means the first status poll hasn't resolved (or an older
-  // backend) — assume configured so the card doesn't flash disabled.
+  // backend) — assume configured/manual so the card doesn't flash.
   const apConfigured = status.ap_configured !== false
+  const mode: AwayModeKind = status.mode ?? "manual"
   const [selectedDuration, setSelectedDuration] = useState(240)
   const [customHours, setCustomHours] = useState("")
   const [customMinutes, setCustomMinutes] = useState("")
   const [useCustom, setUseCustom] = useState(false)
   const [enabling, setEnabling] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
+  const [enablingBle, setEnablingBle] = useState(false)
 
   const isActive = status.state === "active"
+  // The AP is up when a manual timer is running, or auto mode says "away".
+  const apUp = mode === "auto" ? status.ap_on === true : isActive
 
   function getCustomMinutes() {
     const h = parseInt(customHours) || 0
@@ -71,13 +83,56 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
     return Math.max(0, Math.min(100, ((total - status.remaining_sec) / total) * 100))
   }
 
+  async function enableBle() {
+    setEnablingBle(true)
+    try {
+      await fetch("/api/system/ble-enabled", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      })
+    } catch {
+      /* leave the warning up; user can retry */
+    } finally {
+      setEnablingBle(false)
+    }
+  }
+
+  function autoStatusLine() {
+    if (status.geofence_configured === false) {
+      return <p className="text-xs text-amber-400/80">Set your home location below to start.</p>
+    }
+    if (status.gps_stale) {
+      return (
+        <p className="text-xs text-slate-500">
+          Waiting for a fresh location (the car may be asleep)…
+        </p>
+      )
+    }
+    if (status.is_home == null) {
+      return <p className="text-xs text-slate-500">Waiting for the car’s location…</p>
+    }
+    return (
+      <div className="flex items-center gap-2 text-xs">
+        <MapPin className="h-3 w-3 text-blue-400" />
+        <span className="text-slate-300">
+          Currently <span className="font-medium">{status.is_home ? "home" : "away"}</span> —
+          access point{" "}
+          <span className={status.ap_on ? "font-medium text-blue-400" : "text-slate-400"}>
+            {status.ap_on ? "on" : "off"}
+          </span>
+        </span>
+      </div>
+    )
+  }
+
   return (
     <PrefCard
       icon={<Wifi className="h-3.5 w-3.5" />}
       halo="blue"
       title="Away Mode"
       badge={
-        isActive ? (
+        apUp ? (
           <Pill kind="sky">
             <LiveDot /> Active
           </Pill>
@@ -95,156 +150,213 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
           : undefined
       }
     >
-      {status.has_rtc === false && (
-        <div className="flex gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-2 text-[10px] text-amber-400/80">
-          <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
-          <p>No RTC detected — timer saved every 30s, may lose accuracy on reboot.</p>
-        </div>
-      )}
+      <SegPicker<AwayModeKind>
+        options={MODE_OPTIONS}
+        value={mode}
+        onChange={(m) => setMode(m)}
+      />
 
-      {isActive ? (
+      {mode === "auto" ? (
         <>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 text-xs text-blue-400">
-              <Clock className="h-3 w-3" />
-              <span className="font-medium">{formatRemaining(status.remaining_sec ?? 0)}</span>
-            </div>
-            <button
-              onClick={disable}
-              className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/20"
-            >
-              Disable
-            </button>
-          </div>
-          <div className="h-1 overflow-hidden rounded-full bg-white/5">
-            <div
-              className="h-full rounded-full bg-blue-500/60 transition-all duration-1000"
-              style={{ width: `${getProgress()}%` }}
-            />
-          </div>
-        </>
-      ) : (
-        <>
-          <div className="flex items-center gap-1.5">
-            {AWAY_PRESETS.map((p) => (
-              <button
-                key={p.value}
-                onClick={() => {
-                  setSelectedDuration(p.value)
-                  setUseCustom(false)
-                }}
-                className={cn(
-                  "rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-all",
-                  !useCustom && selectedDuration === p.value
-                    ? "border-blue-500/40 bg-blue-500/10 text-blue-400"
-                    : "border-white/5 bg-white/[0.02] text-slate-400 hover:bg-white/[0.05]"
-                )}
-              >
-                {p.label}
-              </button>
-            ))}
-            <button
-              onClick={() => setUseCustom(true)}
-              className={cn(
-                "rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-all",
-                useCustom
-                  ? "border-blue-500/40 bg-blue-500/10 text-blue-400"
-                  : "border-white/5 bg-white/[0.02] text-slate-400 hover:bg-white/[0.05]"
-              )}
-            >
-              Custom
-            </button>
-            <button
-              onClick={handleEnableClick}
-              disabled={enabling || (useCustom && getCustomMinutes() <= 0)}
-              className="ml-auto rounded-lg bg-blue-500/15 px-3 py-1.5 text-xs font-medium text-blue-400 transition-colors hover:bg-blue-500/25 disabled:opacity-40"
-            >
-              {enabling ? "Enabling..." : "Enable"}
-            </button>
-          </div>
+          <p className="t-xs">
+            The hotspot turns on by itself when the car leaves your home area, and off when it
+            returns (so the Pi rejoins your home WiFi). Uses the car’s location over BLE.
+          </p>
 
-          {useCustom && (
-            <div className="flex items-center gap-1.5">
-              <input
-                type="number"
-                min="0"
-                max="24"
-                step="1"
-                placeholder="0"
-                value={customHours}
-                onChange={(e) => setCustomHours(e.target.value)}
-                className="w-14 rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-xs text-slate-200 placeholder:text-slate-600 focus:border-blue-500/40 focus:outline-none"
-              />
-              <span className="text-[10px] text-slate-500">hrs</span>
-              <input
-                type="number"
-                min="0"
-                max="59"
-                step="1"
-                placeholder="0"
-                value={customMinutes}
-                onChange={(e) => setCustomMinutes(e.target.value)}
-                className="w-14 rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-xs text-slate-200 placeholder:text-slate-600 focus:border-blue-500/40 focus:outline-none"
-              />
-              <span className="text-[10px] text-slate-500">min</span>
+          {/* BLE telemetry is the GPS source — Automatic can't see location
+              without it. Mirrors the keep-accessory dependency warning. */}
+          {status.ble_ready === false && (
+            <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+              <div className="space-y-2">
+                <p className="text-xs text-amber-200/90">
+                  <span className="font-medium">Automatic needs BLE telemetry.</span> The car’s
+                  location comes over BLE, which needs the Pi paired as a key to your car. Turn it
+                  on, then pair from the Bluetooth card.
+                </p>
+                <button
+                  type="button"
+                  onClick={enableBle}
+                  disabled={enablingBle}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-100 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
+                >
+                  {enablingBle && <Loader2 className="h-3 w-3 animate-spin" />}
+                  Turn on BLE telemetry
+                </button>
+              </div>
             </div>
           )}
 
-          {confirmOpen && (
-            <div className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
-              <div className="flex items-start gap-2">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
-                <div className="space-y-1 text-xs text-amber-300/90">
-                  <p className="font-semibold">You may lose connection to this page</p>
-                  <p className="text-amber-400/70">
-                    Enabling Away Mode will start the WiFi hotspot and disconnect from your home
-                    network.
-                    {status.ap_ssid && (
-                      <>
-                        {" "}
-                        To continue using the web UI, connect your device to{" "}
-                        <span className="font-medium text-amber-300">"{status.ap_ssid}"</span>
-                      </>
-                    )}
-                    {status.ap_ip && (
-                      <>
-                        {" "}
-                        and navigate to{" "}
-                        <span className="font-medium text-amber-300">
-                          http://{status.ap_ip}
-                        </span>
-                      </>
-                    )}
-                    .
-                  </p>
-                </div>
-              </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={handleConfirmEnable}
-                  className="flex-1 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-400 transition-colors hover:bg-amber-500/20"
-                >
-                  Enable Away Mode
-                </button>
-                <button
-                  onClick={() => setConfirmOpen(false)}
-                  className="flex-1 rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2 text-xs font-medium text-slate-400 transition-colors hover:bg-white/[0.05]"
-                >
-                  Cancel
-                </button>
-              </div>
+          {autoStatusLine()}
+
+          <HomeGeofencePicker
+            values={config}
+            onChange={updateConfig}
+            onUseCurrentLocation={useCurrentLocation}
+            mapHint={
+              <>
+                Tap the map (or drag the pin) to set your home — the blue circle is your radius.
+                Anywhere outside it counts as away → the hotspot turns on automatically. Or tap
+                “Use current location” to use the car’s GPS.
+              </>
+            }
+            radiusHint="Smaller = the hotspot comes on sooner after you pull away from home."
+          />
+        </>
+      ) : (
+        <>
+          {status.has_rtc === false && (
+            <div className="flex gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-2 text-[10px] text-amber-400/80">
+              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+              <p>No RTC detected — timer saved every 30s, may lose accuracy on reboot.</p>
             </div>
+          )}
+
+          {isActive ? (
+            <>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-xs text-blue-400">
+                  <Clock className="h-3 w-3" />
+                  <span className="font-medium">{formatRemaining(status.remaining_sec ?? 0)}</span>
+                </div>
+                <button
+                  onClick={disable}
+                  className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/20"
+                >
+                  Disable
+                </button>
+              </div>
+              <div className="h-1 overflow-hidden rounded-full bg-white/5">
+                <div
+                  className="h-full rounded-full bg-blue-500/60 transition-all duration-1000"
+                  style={{ width: `${getProgress()}%` }}
+                />
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="flex items-center gap-1.5">
+                {AWAY_PRESETS.map((p) => (
+                  <button
+                    key={p.value}
+                    onClick={() => {
+                      setSelectedDuration(p.value)
+                      setUseCustom(false)
+                    }}
+                    className={cn(
+                      "rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-all",
+                      !useCustom && selectedDuration === p.value
+                        ? "border-blue-500/40 bg-blue-500/10 text-blue-400"
+                        : "border-white/5 bg-white/[0.02] text-slate-400 hover:bg-white/[0.05]"
+                    )}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+                <button
+                  onClick={() => setUseCustom(true)}
+                  className={cn(
+                    "rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-all",
+                    useCustom
+                      ? "border-blue-500/40 bg-blue-500/10 text-blue-400"
+                      : "border-white/5 bg-white/[0.02] text-slate-400 hover:bg-white/[0.05]"
+                  )}
+                >
+                  Custom
+                </button>
+                <button
+                  onClick={handleEnableClick}
+                  disabled={enabling || (useCustom && getCustomMinutes() <= 0)}
+                  className="ml-auto rounded-lg bg-blue-500/15 px-3 py-1.5 text-xs font-medium text-blue-400 transition-colors hover:bg-blue-500/25 disabled:opacity-40"
+                >
+                  {enabling ? "Enabling..." : "Enable"}
+                </button>
+              </div>
+
+              {useCustom && (
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="number"
+                    min="0"
+                    max="24"
+                    step="1"
+                    placeholder="0"
+                    value={customHours}
+                    onChange={(e) => setCustomHours(e.target.value)}
+                    className="w-14 rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-xs text-slate-200 placeholder:text-slate-600 focus:border-blue-500/40 focus:outline-none"
+                  />
+                  <span className="text-[10px] text-slate-500">hrs</span>
+                  <input
+                    type="number"
+                    min="0"
+                    max="59"
+                    step="1"
+                    placeholder="0"
+                    value={customMinutes}
+                    onChange={(e) => setCustomMinutes(e.target.value)}
+                    className="w-14 rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-xs text-slate-200 placeholder:text-slate-600 focus:border-blue-500/40 focus:outline-none"
+                  />
+                  <span className="text-[10px] text-slate-500">min</span>
+                </div>
+              )}
+
+              {confirmOpen && (
+                <div className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                    <div className="space-y-1 text-xs text-amber-300/90">
+                      <p className="font-semibold">You may lose connection to this page</p>
+                      <p className="text-amber-400/70">
+                        Enabling Away Mode will start the WiFi hotspot and disconnect from your home
+                        network.
+                        {status.ap_ssid && (
+                          <>
+                            {" "}
+                            To continue using the web UI, connect your device to{" "}
+                            <span className="font-medium text-amber-300">"{status.ap_ssid}"</span>
+                          </>
+                        )}
+                        {status.ap_ip && (
+                          <>
+                            {" "}
+                            and navigate to{" "}
+                            <span className="font-medium text-amber-300">
+                              http://{status.ap_ip}
+                            </span>
+                          </>
+                        )}
+                        .
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={handleConfirmEnable}
+                      className="flex-1 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-400 transition-colors hover:bg-amber-500/20"
+                    >
+                      Enable Away Mode
+                    </button>
+                    <button
+                      onClick={() => setConfirmOpen(false)}
+                      className="flex-1 rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2 text-xs font-medium text-slate-400 transition-colors hover:bg-white/[0.05]"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </>
       )}
 
       {/* AP details — folded into the Away Mode card so users see the
-          control and the access-point address together. While inactive,
-          this is a one-line placeholder; while active, it shows the SSID
+          control and the access-point address together. While the AP is
+          down, this is a one-line placeholder; while up, it shows the SSID
           and IP to join from inside the car. */}
       <div className="space-y-1.5 border-t border-white/5 pt-3">
         <p className="text-xs font-medium text-slate-400">Access point</p>
-        {isActive ? (
+        {apUp ? (
           status.ap_ssid || status.ap_ip ? (
             <>
               {status.ap_ssid && <Row label="SSID" value={status.ap_ssid} />}
@@ -263,8 +375,9 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
           )
         ) : (
           <p className="text-xs text-slate-600">
-            Once Away Mode is on, the Pi broadcasts its own WiFi network. The SSID
-            and IP to join will appear here.
+            {mode === "auto"
+              ? "While you’re away, the Pi broadcasts its own WiFi network. The SSID and IP to join will appear here."
+              : "Once Away Mode is on, the Pi broadcasts its own WiFi network. The SSID and IP to join will appear here."}
           </p>
         )}
       </div>

@@ -41,6 +41,12 @@ pub struct BleConfig {
     pub adapter: String,
     /// Keep-Accessory-Power automation (12V-powered Pis only).
     pub keep_accessory: KeepAccessoryConfig,
+    /// Automatic Away Mode is on (geofence-driven WiFi AP). The daemon
+    /// only cares whether it's enabled — the geofence decision itself
+    /// lives in the API server (`away_mode.rs`). When on, the daemon
+    /// keeps polling GPS (see the location-poll gate in `main.rs`) so
+    /// the API watcher has a fresh fix to evaluate home/away against.
+    pub away_auto_enabled: bool,
     /// Master opt-in for in-progress consolidation features (expanded
     /// sampler decode, etc.). Default OFF — set `SENTRYUSB_EXPERIMENTAL`
     /// to enable. Anything gated by this flag stays dormant on a normal
@@ -56,6 +62,7 @@ impl Default for BleConfig {
             vin: String::new(),
             adapter: DEFAULT_ADAPTER.to_string(),
             keep_accessory: KeepAccessoryConfig::default(),
+            away_auto_enabled: false,
             experimental: false,
         }
     }
@@ -140,6 +147,14 @@ impl BleConfig {
             home_radius_m,
         };
 
+        // Automatic Away Mode. Like keep-accessory it's a write-once
+        // gate the daemon reads each loop — when on, we keep GPS warm
+        // for the API server's geofence watcher.
+        let away_auto_enabled = active
+            .get("AWAY_MODE_AUTO_ENABLED")
+            .map(|v| matches!(v.trim(), "yes" | "true" | "1"))
+            .unwrap_or(false);
+
         // Master experimental opt-in. Default OFF. Gates in-progress
         // consolidation features so a pre-release build is byte-for-byte
         // current behavior until a tester sets SENTRYUSB_EXPERIMENTAL.
@@ -156,6 +171,7 @@ impl BleConfig {
             vin,
             adapter,
             keep_accessory,
+            away_auto_enabled,
             experimental,
         })
     }

@@ -27,6 +27,23 @@ const AP_PROFILE: &str = "SENTRYUSB_AP";
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_DURATION_MIN: u64 = 24 * 60;
 
+// ── Automatic (geofence) mode ──
+/// The car's last GPS fix, written by the telemetry daemon's location
+/// poll (shared with keep-accessory). We read lat/lon/ts from it.
+const GPS_FILE: &str = "/mutable/keep_accessory_gps.json";
+/// Default home geofence radius (meters) when `AWAY_MODE_HOME_RADIUS_M`
+/// is unset. Matches keep-accessory's default.
+const DEFAULT_HOME_RADIUS_M: f64 = 120.0;
+/// A GPS fix older than this is treated as "no fix" → the watcher holds
+/// the AP state rather than flip on stale data. The daemon stops polling
+/// when the car is parked-quiet/asleep, so a stale fix is the normal
+/// signal that we're parked — holding is exactly right (a parked car at
+/// home stays home, parked away stays away).
+const STALE_FIX_SEC: i64 = 900;
+/// A home/away flip must hold this many consecutive ticks (~30s each)
+/// before we act — so a single jittery fix can't toggle the AP.
+const CONFIRM_TICKS: u8 = 2;
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct FlagData {
     #[serde(default)]
@@ -40,10 +57,23 @@ struct FlagData {
 }
 
 struct Inner {
-    state: &'static str, // "idle" | "active"
+    /// Automation mode. `"manual"` = the timer (legacy behavior);
+    /// `"auto"` = geofence-driven (the AP follows the car's location).
+    /// Source of truth is `AWAY_MODE_AUTO_ENABLED` in sentryusb.conf —
+    /// hydrated at startup and on every `/api/away-mode/mode` write.
+    mode: &'static str, // "manual" | "auto"
+    state: &'static str, // "idle" | "active" (manual timer only)
     has_rtc: bool,
     expires_at: Option<SystemTime>,
     enabled_at: Option<SystemTime>,
+    /// Auto mode: last committed home/away decision (`Some(true)` = home,
+    /// `Some(false)` = away, `None` = undecided / no fix yet). The AP is
+    /// on iff this is `Some(false)`.
+    last_is_home: Option<bool>,
+    /// Auto mode: candidate decision awaiting `CONFIRM_TICKS` confirmation.
+    pending_is_home: Option<bool>,
+    /// Auto mode: how many consecutive ticks the candidate has held.
+    pending_count: u8,
     stop: std::sync::Arc<Notify>,
     /// Bumped on every session start/stop. `notify_waiters` only wakes
     /// tasks currently parked on `notified()` — a watcher that's between
@@ -63,10 +93,14 @@ fn mgr() -> &'static Mutex<Inner> {
             info!("[away-mode] No RTC — using countdown-based expiration");
         }
         Mutex::new(Inner {
+            mode: "manual",
             state: "idle",
             has_rtc,
             expires_at: None,
             enabled_at: None,
+            last_is_home: None,
+            pending_is_home: None,
+            pending_count: 0,
             stop: std::sync::Arc::new(Notify::new()),
             epoch: 0,
         })
@@ -125,6 +159,225 @@ fn away_mode_log(msg: &str) {
         let ts = chrono::Local::now().format("%a %e %b %H:%M:%S %Z %Y");
         let _ = writeln!(f, "{}: [away-mode] {}", ts, msg);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Automatic (geofence) mode
+//
+// The decision lives here (the API server owns the AP); the telemetry
+// daemon only keeps GPS warm. Each 30s tick we read the daemon's last
+// fix + the home geofence and toggle the AP: away → ON, home → OFF.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Great-circle distance in meters (haversine). Copied from the telemetry
+/// crate's `keep_accessory` — it's a different crate with no dep edge, and
+/// 8 lines isn't worth a shared crate.
+fn distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_R_M: f64 = 6_371_000.0;
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dphi = (lat2 - lat1).to_radians();
+    let dlambda = (lon2 - lon1).to_radians();
+    let a = (dphi / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlambda / 2.0).sin().powi(2);
+    2.0 * EARTH_R_M * a.sqrt().asin()
+}
+
+/// Resolve a distance-from-home into a hysteresis-banded reading:
+/// `Some(true)` = home, `Some(false)` = away, `None` = inside the
+/// dead-band (ambiguous — hold). The band (±`MARGIN`) stops the AP
+/// flapping when the car idles near the boundary; `MARGIN` scales with
+/// the radius but is clamped so it's neither trivial nor larger than a
+/// small geofence.
+fn band_is_home(dist_m: f64, radius_m: f64) -> Option<bool> {
+    let margin = (0.15 * radius_m).clamp(15.0, 60.0);
+    if dist_m < radius_m - margin {
+        Some(true)
+    } else if dist_m > radius_m + margin {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Pure decision core: fold a fresh banded reading into the confirm
+/// state. Returns `Some(new_is_home)` when a flip is confirmed (commit
+/// it + act), or `None` to hold. Kept pure (mutates only the passed-in
+/// state) so the flap-resistance is unit-tested without touching nmcli.
+///
+/// * `candidate` — banded reading this tick (`None` = no usable fix /
+///   in dead-band → hold).
+/// * `last` — last committed decision.
+fn fold_geofence(
+    candidate: Option<bool>,
+    last: Option<bool>,
+    pending: &mut Option<bool>,
+    pending_count: &mut u8,
+) -> Option<bool> {
+    let Some(cand) = candidate else {
+        // No usable signal → hold, and drop any half-confirmation so a
+        // gap doesn't leave a stale candidate that commits on one later tick.
+        *pending = None;
+        *pending_count = 0;
+        return None;
+    };
+    if Some(cand) == last {
+        // Already in this state; cancel any pending flip-back.
+        *pending = None;
+        *pending_count = 0;
+        return None;
+    }
+    if *pending == Some(cand) {
+        *pending_count = pending_count.saturating_add(1);
+    } else {
+        *pending = Some(cand);
+        *pending_count = 1;
+    }
+    if *pending_count >= CONFIRM_TICKS {
+        *pending = None;
+        *pending_count = 0;
+        Some(cand)
+    } else {
+        None
+    }
+}
+
+/// The daemon's last GPS fix as `(lat, lon, age_sec)`, or `None` if the
+/// file is missing/unparseable or has no coordinates. `age_sec` is how
+/// long ago the fix was taken (clamped ≥ 0).
+fn read_gps_fix() -> Option<(f64, f64, i64)> {
+    let s = std::fs::read_to_string(GPS_FILE).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let lat = v.get("lat").and_then(|x| x.as_f64())?;
+    let lon = v.get("lon").and_then(|x| x.as_f64())?;
+    let ts = v.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some((lat, lon, (now - ts).max(0)))
+}
+
+/// Read the Away Mode geofence: the home center is shared with
+/// keep-accessory (`KEEP_ACCESSORY_HOME_LAT/LON`); the radius is Away
+/// Mode's own (`AWAY_MODE_HOME_RADIUS_M`, default 120m).
+fn read_away_geofence() -> (Option<f64>, Option<f64>, f64) {
+    let config_path = sentryusb_config::find_config_path();
+    match sentryusb_config::parse_file(config_path) {
+        Ok((active, commented)) => {
+            let g = |k: &str| sentryusb_config::get_config_value(&active, &commented, k);
+            let lat = g("KEEP_ACCESSORY_HOME_LAT").and_then(|s| s.trim().parse::<f64>().ok());
+            let lon = g("KEEP_ACCESSORY_HOME_LON").and_then(|s| s.trim().parse::<f64>().ok());
+            let radius = g("AWAY_MODE_HOME_RADIUS_M")
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|r| *r > 0.0)
+                .unwrap_or(DEFAULT_HOME_RADIUS_M);
+            (lat, lon, radius)
+        }
+        Err(_) => (None, None, DEFAULT_HOME_RADIUS_M),
+    }
+}
+
+/// Whether `AWAY_MODE_AUTO_ENABLED` is set in the config. The mode's
+/// source of truth (shared with the telemetry daemon).
+fn read_auto_enabled_config() -> bool {
+    let config_path = sentryusb_config::find_config_path();
+    if let Ok((active, commented)) = sentryusb_config::parse_file(config_path) {
+        if let Some(v) = sentryusb_config::get_config_value(&active, &commented, "AWAY_MODE_AUTO_ENABLED") {
+            return matches!(v.trim(), "yes" | "true" | "1");
+        }
+    }
+    false
+}
+
+/// Auto mode has no timer, so `write_flag_file` (which needs `expires_at`)
+/// doesn't apply. The NetworkManager dispatcher only checks the flag
+/// file's EXISTENCE to decide whether to resurrect ap0 when wlan0 comes
+/// up, so a minimal body is enough — we write it whenever the AP is up
+/// in auto mode and remove it when the AP goes down. Tagged `mode:"auto"`
+/// for anyone reading /mutable. `FlagData` ignores the extra field on read.
+fn write_auto_flag_file() {
+    let body = serde_json::json!({
+        "mode": "auto",
+        "enabled_at": to_rfc3339(SystemTime::now()),
+    });
+    if let Ok(data) = serde_json::to_vec_pretty(&body) {
+        let tmp = format!("{}.tmp", FLAG_FILE);
+        if std::fs::write(&tmp, &data).is_ok() {
+            let _ = std::fs::rename(&tmp, FLAG_FILE);
+        }
+    }
+}
+
+/// One auto-mode tick: read the fix + geofence, fold into the confirm
+/// state, and toggle the AP on a confirmed home/away flip. Holds (no
+/// change) on a stale/missing fix or an unset home geofence.
+async fn auto_eval_tick() {
+    let fix = read_gps_fix();
+    let (home_lat, home_lon, radius_m) = read_away_geofence();
+
+    // Banded reading, or None to hold (no fresh fix / no home set).
+    let candidate = match (fix, home_lat, home_lon) {
+        (Some((la, lo, age)), Some(hla), Some(hlo)) if age <= STALE_FIX_SEC => {
+            band_is_home(distance_m(la, lo, hla, hlo), radius_m)
+        }
+        _ => None,
+    };
+
+    let commit = {
+        let mut inner = mgr().lock().unwrap();
+        if inner.mode != "auto" {
+            return; // mode changed out from under us
+        }
+        let last = inner.last_is_home;
+        let mut pending = inner.pending_is_home;
+        let mut count = inner.pending_count;
+        let decision = fold_geofence(candidate, last, &mut pending, &mut count);
+        inner.pending_is_home = pending;
+        inner.pending_count = count;
+        if let Some(new_home) = decision {
+            inner.last_is_home = Some(new_home);
+        }
+        decision
+    };
+
+    // Act outside the lock (AP toggles spawn their own tasks).
+    if let Some(is_home) = commit {
+        if is_home {
+            // Arrived home → drop the AP so wlan0 rejoins home WiFi.
+            // Remove the flag first so the dispatcher won't resurrect ap0.
+            remove_flag_file();
+            stop_ap_bg();
+            away_mode_log("Automatic: at home — stopping AP (rejoining home WiFi)");
+            info!("[away-mode] auto: home → AP off");
+        } else {
+            // Left home → bring the AP up. Flag file present so the
+            // dispatcher keeps it alive across a wlan0 bounce.
+            write_auto_flag_file();
+            start_ap_bg();
+            away_mode_log("Automatic: away from home — starting AP");
+            info!("[away-mode] auto: away → AP on");
+        }
+    }
+}
+
+/// Auto-mode watcher: re-evaluate the geofence every `POLL_INTERVAL`.
+/// Exits when the mode changes or the epoch is superseded (mirrors
+/// `spawn_watcher`'s epoch/stop contract).
+fn spawn_auto_watcher(stop: std::sync::Arc<Notify>, my_epoch: u64) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop.notified() => return,
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+            {
+                let inner = mgr().lock().unwrap();
+                if inner.mode != "auto" || inner.epoch != my_epoch {
+                    return;
+                }
+            }
+            auto_eval_tick().await;
+        }
+    });
 }
 
 /// Find the WiFi client device (never ap0). Prefers the device backing an
@@ -276,9 +529,35 @@ fn spawn_watcher(stop: std::sync::Arc<Notify>, my_epoch: u64) {
     });
 }
 
-/// Call at server startup. Resumes an active session if the flag file still
-/// has time remaining.
+/// Call at server startup. In Automatic mode, starts the geofence watcher
+/// (the AP state is re-derived from the next GPS fix). In Manual mode,
+/// resumes an active timer session if the flag file still has time
+/// remaining.
 pub fn restore_from_file() {
+    // Mode is config-driven (the source of truth shared with the daemon).
+    if read_auto_enabled_config() {
+        let (notify, epoch) = {
+            let mut inner = mgr().lock().unwrap();
+            inner.mode = "auto";
+            inner.state = "idle"; // auto doesn't use the timer state
+            inner.expires_at = None;
+            inner.enabled_at = None;
+            inner.last_is_home = None;
+            inner.pending_is_home = None;
+            inner.pending_count = 0;
+            inner.stop = std::sync::Arc::new(Notify::new());
+            inner.epoch += 1;
+            (inner.stop.clone(), inner.epoch)
+        };
+        // Don't touch the flag file: it may exist from a prior "away"
+        // state (the dispatcher uses it to bring the AP up on boot). The
+        // first geofence tick re-derives home/away and reconciles the AP.
+        away_mode_log("Automatic Away Mode active on boot — geofence watcher started");
+        info!("[away-mode] Automatic mode — geofence watcher started");
+        spawn_auto_watcher(notify, epoch);
+        return;
+    }
+
     let data = match std::fs::read_to_string(FLAG_FILE) {
         Ok(d) => d,
         Err(_) => return,
@@ -360,6 +639,16 @@ pub async fn enable(
             "duration_min cannot exceed 24 hours (1440)",
         );
     }
+    // The manual timer and the automatic geofence both own the AP — never
+    // let them run at once. (The UI hides the timer in Automatic mode; this
+    // guards any other caller.)
+    let in_auto = { mgr().lock().unwrap().mode == "auto" };
+    if in_auto {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "Away Mode is in Automatic mode — switch to Manual to use the timer.",
+        );
+    }
     // Verify the AP profile exists before we promise anything.
     if !ap_profile_exists().await {
         return crate::json_error(
@@ -419,6 +708,12 @@ pub async fn enable(
 pub async fn disable(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     {
         let mut inner = mgr().lock().unwrap();
+        // In Automatic mode the geofence owns the AP — `disable` (the
+        // manual Stop button) is a no-op so it can't tear down the
+        // watcher. Use `/api/away-mode/mode` to leave Automatic.
+        if inner.mode == "auto" {
+            return crate::json_ok();
+        }
         if inner.state == "idle" {
             return crate::json_ok();
         }
@@ -437,9 +732,9 @@ pub async fn disable(State(_s): State<AppState>) -> (StatusCode, Json<serde_json
 
 /// GET /api/away-mode/status
 pub async fn status(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let mut snap = {
+    let (mut snap, mode) = {
         let inner = mgr().lock().unwrap();
-        status_snapshot_sync(&inner)
+        (status_snapshot_sync(&inner), inner.mode)
     };
     let (ssid, ip) = get_ap_info().await;
     // A wifi AP profile always carries an SSID, so a non-empty SSID doubles
@@ -449,15 +744,291 @@ pub async fn status(State(_s): State<AppState>) -> (StatusCode, Json<serde_json:
         snap["ap_ssid"] = serde_json::Value::String(ssid);
         snap["ap_ip"] = serde_json::Value::String(ip);
     }
+    // Auto-mode extras the card needs: the geofence, the BLE-telemetry
+    // prerequisite (no GPS without it), and freshness of the last fix.
+    if mode == "auto" {
+        let (home_lat, home_lon, radius) = read_away_geofence();
+        snap["geofence_configured"] =
+            serde_json::Value::Bool(home_lat.is_some() && home_lon.is_some());
+        snap["home_lat"] = serde_json::json!(home_lat);
+        snap["home_lon"] = serde_json::json!(home_lon);
+        snap["home_radius_m"] = serde_json::json!(radius);
+        snap["ble_ready"] = serde_json::Value::Bool(crate::ble::is_ble_enabled());
+        match read_gps_fix() {
+            Some((_, _, age)) => {
+                snap["gps_stale"] = serde_json::Value::Bool(age > STALE_FIX_SEC);
+                snap["last_fix_age_sec"] = serde_json::json!(age);
+            }
+            None => {
+                snap["gps_stale"] = serde_json::Value::Bool(true);
+                snap["last_fix_age_sec"] = serde_json::Value::Null;
+            }
+        }
+    }
     (StatusCode::OK, Json(snap))
+}
+
+#[derive(Deserialize)]
+pub struct ModeBody {
+    mode: String,
+}
+
+/// POST /api/away-mode/mode — body `{"mode": "manual"|"auto"}`.
+///
+/// Persists `AWAY_MODE_AUTO_ENABLED` (so the daemon keeps GPS warm and
+/// the setting survives reboot) and performs the in-process transition.
+/// Switching to Manual stops the AP; switching to Automatic spawns the
+/// geofence watcher but does NOT force the AP — the first fix reconciles.
+pub async fn set_mode(
+    State(_s): State<AppState>,
+    Json(body): Json<ModeBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let want_auto = match body.mode.as_str() {
+        "auto" => true,
+        "manual" => false,
+        other => {
+            return crate::json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid mode {other:?} (expected \"manual\" or \"auto\")"),
+            );
+        }
+    };
+
+    // Persist the flag first (RO root → flip rw for the write, same
+    // pattern as keep_accessory_config_set / ble_enabled_set).
+    let persist = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let config_path = sentryusb_config::find_config_path();
+        let (mut active, _) = sentryusb_config::parse_file(config_path)?;
+        active.insert(
+            "AWAY_MODE_AUTO_ENABLED".to_string(),
+            if want_auto { "yes" } else { "no" }.to_string(),
+        );
+        let _ = std::process::Command::new("bash")
+            .args(["-c", "/root/bin/remountfs_rw"])
+            .status();
+        sentryusb_config::write_file(config_path, &active)?;
+        Ok(())
+    })
+    .await;
+    match persist {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("config write failed: {e}"),
+            );
+        }
+        Err(e) => {
+            return crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("config task failed: {e}"),
+            );
+        }
+    }
+
+    if want_auto {
+        let (notify, epoch) = {
+            let mut inner = mgr().lock().unwrap();
+            // Cancel any running manual timer / watcher.
+            inner.stop.notify_waiters();
+            inner.mode = "auto";
+            inner.state = "idle";
+            inner.expires_at = None;
+            inner.enabled_at = None;
+            inner.last_is_home = None;
+            inner.pending_is_home = None;
+            inner.pending_count = 0;
+            inner.stop = std::sync::Arc::new(Notify::new());
+            inner.epoch += 1;
+            (inner.stop.clone(), inner.epoch)
+        };
+        away_mode_log("Switched to Automatic (geofence) mode");
+        info!("[away-mode] mode → auto");
+        spawn_auto_watcher(notify, epoch);
+    } else {
+        {
+            let mut inner = mgr().lock().unwrap();
+            // Kill the auto (or manual) watcher and reset to a clean idle.
+            inner.stop.notify_waiters();
+            inner.mode = "manual";
+            inner.state = "idle";
+            inner.expires_at = None;
+            inner.enabled_at = None;
+            inner.last_is_home = None;
+            inner.pending_is_home = None;
+            inner.pending_count = 0;
+            inner.epoch += 1;
+            remove_flag_file();
+        }
+        away_mode_log("Switched to Manual mode — AP stopped");
+        info!("[away-mode] mode → manual");
+        stop_ap_bg();
+    }
+
+    let snap = {
+        let inner = mgr().lock().unwrap();
+        status_snapshot_sync(&inner)
+    };
+    (StatusCode::OK, Json(snap))
+}
+
+/// GET /api/away-mode/config → the Away Mode geofence: the home center
+/// (shared with keep-accessory) + Away Mode's own radius.
+pub async fn config_get(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let (home_lat, home_lon, home_radius_m) = read_away_geofence();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "home_lat": home_lat,
+            "home_lon": home_lon,
+            "home_radius_m": home_radius_m,
+        })),
+    )
+}
+
+#[derive(Deserialize)]
+pub struct AwayConfigBody {
+    pub home_lat: Option<f64>,
+    pub home_lon: Option<f64>,
+    pub home_radius_m: Option<f64>,
+}
+
+/// PUT /api/away-mode/config → persist the geofence. Writes the SHARED
+/// home center (`KEEP_ACCESSORY_HOME_LAT/LON`, so the Keep Accessory card
+/// stays in sync) and Away Mode's own radius (`AWAY_MODE_HOME_RADIUS_M`).
+pub async fn config_set(
+    State(_s): State<AppState>,
+    Json(body): Json<AwayConfigBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let config_path = sentryusb_config::find_config_path();
+        let (mut active, _) = sentryusb_config::parse_file(config_path)?;
+        if let Some(lat) = body.home_lat {
+            active.insert("KEEP_ACCESSORY_HOME_LAT".to_string(), format!("{lat:.6}"));
+        }
+        if let Some(lon) = body.home_lon {
+            active.insert("KEEP_ACCESSORY_HOME_LON".to_string(), format!("{lon:.6}"));
+        }
+        if let Some(r) = body.home_radius_m {
+            // Clamp to a sane range (20m–2km), same as keep-accessory.
+            let r = r.clamp(20.0, 2000.0).round() as i64;
+            active.insert("AWAY_MODE_HOME_RADIUS_M".to_string(), r.to_string());
+        }
+        let _ = std::process::Command::new("bash")
+            .args(["-c", "/root/bin/remountfs_rw"])
+            .status();
+        sentryusb_config::write_file(config_path, &active)?;
+        Ok(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            info!("[away-mode] geofence config updated");
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
+        Ok(Err(e)) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write failed: {e}"),
+        ),
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config task failed: {e}"),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distance_zero_for_same_point() {
+        assert!(distance_m(37.5, -122.3, 37.5, -122.3) < 0.01);
+    }
+
+    #[test]
+    fn distance_roughly_111km_per_degree_lat() {
+        let d = distance_m(37.0, -122.0, 38.0, -122.0);
+        assert!((d - 111_200.0).abs() < 1_000.0, "got {d}m");
+    }
+
+    #[test]
+    fn band_inside_is_home_outside_is_away_middle_holds() {
+        // radius 120 → margin = clamp(18, 15, 60) = 18.
+        assert_eq!(band_is_home(50.0, 120.0), Some(true)); // well inside
+        assert_eq!(band_is_home(300.0, 120.0), Some(false)); // well outside
+        assert_eq!(band_is_home(120.0, 120.0), None); // on the line → hold
+        assert_eq!(band_is_home(110.0, 120.0), None); // inside the band → hold
+    }
+
+    #[test]
+    fn fold_needs_two_ticks_to_commit() {
+        let mut pending = None;
+        let mut count = 0u8;
+        // First away reading: not yet confirmed.
+        assert_eq!(
+            fold_geofence(Some(false), None, &mut pending, &mut count),
+            None
+        );
+        assert_eq!(count, 1);
+        // Second consistent reading: commit away.
+        assert_eq!(
+            fold_geofence(Some(false), None, &mut pending, &mut count),
+            Some(false)
+        );
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn fold_holds_on_no_fix_and_clears_pending() {
+        let mut pending = Some(false);
+        let mut count = 1u8;
+        // A gap (no fix) must drop the half-confirmation.
+        assert_eq!(fold_geofence(None, Some(true), &mut pending, &mut count), None);
+        assert_eq!(pending, None);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn fold_no_op_when_already_in_state() {
+        let mut pending = None;
+        let mut count = 0u8;
+        // Already home, reading still home → nothing to commit.
+        assert_eq!(
+            fold_geofence(Some(true), Some(true), &mut pending, &mut count),
+            None
+        );
+    }
+
+    #[test]
+    fn fold_jitter_does_not_commit() {
+        // Alternating away/home never reaches 2 consecutive → no flip.
+        let mut pending = None;
+        let mut count = 0u8;
+        let last = Some(true); // currently home
+        assert_eq!(fold_geofence(Some(false), last, &mut pending, &mut count), None);
+        assert_eq!(fold_geofence(Some(true), last, &mut pending, &mut count), None);
+        assert_eq!(fold_geofence(Some(false), last, &mut pending, &mut count), None);
+        assert_eq!(count, 1); // reset each flip-flop, never hits CONFIRM_TICKS
+    }
 }
 
 fn status_snapshot_sync(inner: &Inner) -> serde_json::Value {
     let mut v = serde_json::json!({
+        "mode": inner.mode,
         "state": inner.state,
         "has_rtc": inner.has_rtc,
     });
-    if inner.state == "active" {
+    if inner.mode == "auto" {
+        // Auto: report the committed home/away decision (null until the
+        // first fix is confirmed). The AP is on iff we're away.
+        v["is_home"] = match inner.last_is_home {
+            Some(h) => serde_json::Value::Bool(h),
+            None => serde_json::Value::Null,
+        };
+        v["ap_on"] = serde_json::Value::Bool(matches!(inner.last_is_home, Some(false)));
+    } else if inner.state == "active" {
         if let Some(exp) = inner.expires_at {
             v["expires_at"] = serde_json::Value::String(to_rfc3339(exp));
             v["remaining_sec"] =

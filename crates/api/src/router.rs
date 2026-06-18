@@ -238,6 +238,13 @@ pub fn build_router(state: AppState) -> Router {
         // path here so both shapes work.
         .route("/api/away-mode", delete(crate::away_mode::disable))
         .route("/api/away-mode/status", get(crate::away_mode::status))
+        // Away mode — Automatic (geofence) mode: switch modes + the home
+        // geofence (center shared with keep-accessory, radius its own).
+        .route("/api/away-mode/mode", post(crate::away_mode::set_mode))
+        .route(
+            "/api/away-mode/config",
+            get(crate::away_mode::config_get).put(crate::away_mode::config_set),
+        )
         // Terminal WebSocket
         .route("/api/terminal", get(crate::terminal::handle_terminal))
         // WebSocket

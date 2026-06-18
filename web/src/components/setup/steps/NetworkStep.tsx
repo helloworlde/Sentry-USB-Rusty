@@ -130,33 +130,61 @@ export function NetworkStep({ data, onChange, onBatchChange }: StepProps) {
         </label>
 
         {apEnabled && (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Field
-              label="AP SSID"
-              field="AP_SSID"
-              placeholder="SENTRYUSB WIFI"
-              data={data}
-              onChange={onChange}
-            />
-            <Field
-              label="AP Password"
-              field="AP_PASS"
-              type="password"
-              placeholder="Min 8 characters"
-              data={data}
-              onChange={onChange}
-              hint="Must be at least 8 characters"
-              error={(data.AP_PASS ?? "").length < 8}
-            />
-            <Field
-              label="AP IP Address"
-              field="AP_IP"
-              placeholder="192.168.66.1"
-              data={data}
-              onChange={onChange}
-              hint="Optional, default: 192.168.66.1"
-            />
-          </div>
+          <>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field
+                label="AP SSID"
+                field="AP_SSID"
+                placeholder="SENTRYUSB WIFI"
+                data={data}
+                onChange={onChange}
+              />
+              <Field
+                label="AP Password"
+                field="AP_PASS"
+                type="password"
+                placeholder="Min 8 characters"
+                data={data}
+                onChange={onChange}
+                hint="Must be at least 8 characters"
+                error={(data.AP_PASS ?? "").length < 8}
+              />
+              <Field
+                label="AP IP Address"
+                field="AP_IP"
+                placeholder="192.168.66.1"
+                data={data}
+                onChange={onChange}
+                hint="Optional, default: 192.168.66.1"
+              />
+            </div>
+
+            {/* Away Mode acknowledgement — informational only. The actual
+                geofence setup lives in Settings → Car & Network. */}
+            <div className="mt-3 rounded-lg border border-blue-500/20 bg-blue-500/5 p-3">
+              <div className="flex items-start gap-2.5">
+                <Info className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
+                <div className="text-xs leading-relaxed text-slate-400">
+                  <p className="font-medium text-slate-200">Away Mode has two modes</p>
+                  <p className="mt-1">
+                    Configure it later in{" "}
+                    <span className="font-medium text-slate-300">Settings → Car &amp; Network</span>:
+                  </p>
+                  <ul className="mt-1 list-disc space-y-1 pl-4">
+                    <li>
+                      <span className="font-medium text-slate-300">Manual</span> — turn the hotspot
+                      on for a set time from the dashboard.
+                    </li>
+                    <li>
+                      <span className="font-medium text-slate-300">Automatic</span> — the hotspot
+                      turns on by itself when the car leaves your home area and off when it returns.
+                      This needs the Pi paired as a BLE key (BLE telemetry) for the car’s location.
+                    </li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          </>
         )}
       </div>
     </div>

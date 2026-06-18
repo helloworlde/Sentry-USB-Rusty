@@ -972,17 +972,21 @@ async fn tick(
 
         // ── 1b. LOCATION (raw GPS) ── `state drive` returns the address
         // name but NOT raw coords when parked, so lat/lon need their own
-        // `state location` round-trip. Two consumers: the keep-accessory
-        // home geofence, and the charging-map pin (which needs coords, not
-        // just the address). Run it when keep-accessory is on OR the car is
-        // actively charging — so a charge gets a map pin without polling
-        // GPS on every idle parked car. Coarse cadence; pure input (not a
-        // DB sample) — doesn't set any_call_ran.
+        // `state location` round-trip. Three consumers: the keep-accessory
+        // home geofence, the automatic Away Mode geofence (the API server
+        // reads the GPS file we write below), and the charging-map pin
+        // (which needs coords, not just the address). Run it when either
+        // geofence feature is on OR the car is actively charging — so a
+        // charge gets a map pin without polling GPS on every idle parked
+        // car. Coarse cadence; pure input (not a DB sample) — doesn't set
+        // any_call_ran.
         let charging_now = last_charging_state
             .as_ref()
             .map(|s| s.is_active_charging())
             .unwrap_or(false);
-        if !connect_failed && (cfg.keep_accessory.enabled || charging_now) {
+        if !connect_failed
+            && (cfg.keep_accessory.enabled || cfg.away_auto_enabled || charging_now)
+        {
             let due = last_location_poll
                 .map(|t| tick_now.duration_since(t) >= LOCATION_POLL_INTERVAL)
                 .unwrap_or(true);
