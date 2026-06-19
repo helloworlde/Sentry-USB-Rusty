@@ -157,34 +157,50 @@ async fn ensure_rsync(emitter: &SetupEmitter) -> Result<()> {
 /// A VIN alone means BLE telemetry is set up — that doesn't block
 /// other keep-awake providers or require a Sentry case.
 fn ble_used_for_keep_awake(env: &SetupEnv) -> bool {
-    env.config.contains_key("TESLA_BLE_VIN")
+    env.is_set("TESLA_BLE_VIN")
         && matches!(
-            env.config.get("BLE_KEEP_AWAKE_ENABLED").map(String::as_str),
+            env.config.get("BLE_KEEP_AWAKE_ENABLED").map(|s| s.trim()),
             Some("yes") | Some("true") | Some("1")
         )
 }
 
-/// Check that at most one wake API is configured.
+/// Check that at most one keep-awake provider is configured.
+///
+/// "Configured" means present AND non-empty (see [`SetupEnv::is_set`]).
+/// An empty `export KEY=''` — written when the wizard switches away from
+/// a provider — does NOT count, matching the runtime in `run/awake_start`
+/// (`${VAR:+x}`). Counting empties here is what bricked devices into a
+/// setup boot loop after a keep-awake method change.
 fn validate_wake_apis(env: &SetupEnv) -> Result<()> {
-    let apis = [
-        env.config.contains_key("TESSIE_API_TOKEN"),
-        env.config.contains_key("TESLAFI_API_TOKEN"),
-        ble_used_for_keep_awake(env),
-        env.config.contains_key("KEEP_AWAKE_WEBHOOK_URL"),
-    ];
-    let count = apis.iter().filter(|&&v| v).count();
-    if count > 1 {
-        bail!("Multiple control providers configured — only 1 can be enabled at a time");
+    let mut providers = Vec::new();
+    if env.is_set("TESSIE_API_TOKEN") {
+        providers.push("Tessie");
+    }
+    if env.is_set("TESLAFI_API_TOKEN") {
+        providers.push("TeslaFi");
+    }
+    if ble_used_for_keep_awake(env) {
+        providers.push("BLE");
+    }
+    if env.is_set("KEEP_AWAKE_WEBHOOK_URL") {
+        providers.push("Webhook");
+    }
+    if providers.len() > 1 {
+        bail!(
+            "Multiple keep-awake providers configured ({}) — only 1 can be enabled \
+             at a time. Edit /root/sentryusb.conf and keep just one.",
+            providers.join(", ")
+        );
     }
     Ok(())
 }
 
 /// Validate SENTRY_CASE value if any wake API is enabled.
 fn validate_sentry_case(env: &SetupEnv) -> Result<()> {
-    let has_api = env.config.contains_key("TESSIE_API_TOKEN")
-        || env.config.contains_key("TESLAFI_API_TOKEN")
+    let has_api = env.is_set("TESSIE_API_TOKEN")
+        || env.is_set("TESLAFI_API_TOKEN")
         || ble_used_for_keep_awake(env)
-        || env.config.contains_key("KEEP_AWAKE_WEBHOOK_URL");
+        || env.is_set("KEEP_AWAKE_WEBHOOK_URL");
 
     if has_api {
         let case = env.get("SENTRY_CASE", "");
@@ -650,4 +666,87 @@ fn clear_music_archive_mount(fstype: &str, emitter: &SetupEmitter) -> Result<()>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::{PiModel, SetupEnv};
+    use std::collections::HashMap;
+
+    fn env_with(pairs: &[(&str, &str)]) -> SetupEnv {
+        let config: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        SetupEnv {
+            pi_model: PiModel::Other,
+            boot_path: String::new(),
+            cmdline_path: None,
+            piconfig_path: None,
+            boot_disk: None,
+            root_partition: None,
+            data_drive: None,
+            config,
+        }
+    }
+
+    #[test]
+    fn empty_provider_tokens_do_not_count_as_configured() {
+        // Reproduces the boot-loop bug ("Multiple control providers
+        // configured"). The wizard "clears" a deselected keep-awake
+        // provider by writing `export TESSIE_API_TOKEN=''`. An empty value
+        // must NOT count as a configured provider — matching the runtime's
+        // `${VAR:+x}` check in run/awake_start and the frontend's JS-falsy
+        // check. Only the validator miscounted it, bricking the device.
+        let env = env_with(&[
+            ("TESLA_BLE_VIN", "5YJ3E1EA4JF000001"),
+            ("BLE_KEEP_AWAKE_ENABLED", "yes"),
+            ("TESSIE_API_TOKEN", ""),
+            ("TESLAFI_API_TOKEN", ""),
+            ("KEEP_AWAKE_WEBHOOK_URL", ""),
+        ]);
+        assert!(
+            validate_wake_apis(&env).is_ok(),
+            "BLE keep-awake plus empty (cleared) provider tokens must validate"
+        );
+    }
+
+    #[test]
+    fn two_real_providers_are_rejected() {
+        // The actual "only 1" rule: two genuinely-set providers must fail.
+        let env = env_with(&[
+            ("TESLA_BLE_VIN", "5YJ3E1EA4JF000001"),
+            ("BLE_KEEP_AWAKE_ENABLED", "yes"),
+            ("TESSIE_API_TOKEN", "real-token"),
+        ]);
+        let err = validate_wake_apis(&env).unwrap_err().to_string();
+        assert!(err.contains("BLE") && err.contains("Tessie"), "error names both: {err}");
+    }
+
+    #[test]
+    fn single_real_provider_is_ok() {
+        let env = env_with(&[("TESSIE_API_TOKEN", "real-token")]);
+        assert!(validate_wake_apis(&env).is_ok());
+    }
+
+    #[test]
+    fn bare_vin_is_telemetry_only_not_a_provider() {
+        // A VIN with no BLE_KEEP_AWAKE_ENABLED is telemetry-only, so it can
+        // coexist with another keep-awake provider.
+        let env = env_with(&[
+            ("TESLA_BLE_VIN", "5YJ3E1EA4JF000001"),
+            ("TESSIE_API_TOKEN", "real-token"),
+        ]);
+        assert!(validate_wake_apis(&env).is_ok());
+    }
+
+    #[test]
+    fn whitespace_only_token_does_not_count() {
+        let env = env_with(&[
+            ("TESSIE_API_TOKEN", "   "),
+            ("KEEP_AWAKE_WEBHOOK_URL", "http://ha.local/hook"),
+        ]);
+        assert!(validate_wake_apis(&env).is_ok());
+    }
 }

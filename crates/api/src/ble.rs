@@ -72,6 +72,32 @@ pub fn is_ble_keep_awake_enabled() -> bool {
     false
 }
 
+/// Names a non-BLE keep-awake provider that is configured (present AND
+/// non-empty) in `active`, if any.
+///
+/// Used to refuse enabling BLE keep-awake from the Settings → Network
+/// toggle while another provider already owns keep-awake. Switching
+/// methods belongs in the setup wizard (which clears the old provider
+/// and sets SENTRY_CASE); letting the settings toggle stack a second
+/// provider is what produces the "Multiple keep-awake providers"
+/// boot-loop on the next setup run. Empty values don't count — same
+/// non-empty semantics as the setup validator and the runtime
+/// `${VAR:+x}` check in `run/awake_start`.
+fn conflicting_keep_awake_provider(
+    active: &sentryusb_config::SetupConfig,
+) -> Option<&'static str> {
+    let is_set = |k: &str| active.get(k).is_some_and(|v| !v.trim().is_empty());
+    if is_set("TESSIE_API_TOKEN") {
+        Some("Tessie")
+    } else if is_set("TESLAFI_API_TOKEN") {
+        Some("TeslaFi")
+    } else if is_set("KEEP_AWAKE_WEBHOOK_URL") {
+        Some("Webhook")
+    } else {
+        None
+    }
+}
+
 /// One-shot migration: existing prebuilt-image users may have only
 /// `TESLA_BLE_VIN` set (their pairing was done before the explicit
 /// `BLE_ENABLED` / `BLE_KEEP_AWAKE_ENABLED` toggles existed). For
@@ -281,12 +307,26 @@ fn first_external_adapter() -> Option<String> {
 }
 
 /// GET /api/system/ble-keep-awake-enabled
+///
+/// Returns `{ enabled, blocked_by }`. `blocked_by` names a non-BLE
+/// keep-awake provider that's already configured (Tessie/TeslaFi/Webhook),
+/// or null. The settings UI uses it to disable and explain the BLE
+/// keep-awake toggle, since only one provider can be active at a time.
 pub async fn ble_keep_awake_enabled_get(
     State(_s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let blocked_by = {
+        let config_path = sentryusb_config::find_config_path();
+        sentryusb_config::parse_file(config_path)
+            .ok()
+            .and_then(|(active, _)| conflicting_keep_awake_provider(&active))
+    };
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "enabled": is_ble_keep_awake_enabled() })),
+        Json(serde_json::json!({
+            "enabled": is_ble_keep_awake_enabled(),
+            "blocked_by": blocked_by,
+        })),
     )
 }
 
@@ -310,9 +350,20 @@ pub async fn ble_keep_awake_enabled_set(
             );
         }
     };
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<&'static str>> {
         let config_path = sentryusb_config::find_config_path();
         let (mut active, _) = sentryusb_config::parse_file(config_path)?;
+        // Refuse to enable BLE keep-awake while another provider already
+        // owns it — only one keep-awake provider may be active at a time.
+        // Switching methods is the wizard's job (it clears the old
+        // provider and sets SENTRY_CASE); letting this toggle stack a
+        // second provider is what bails the next setup run into a boot
+        // loop ("Multiple keep-awake providers configured").
+        if enabled {
+            if let Some(name) = conflicting_keep_awake_provider(&active) {
+                return Ok(Some(name));
+            }
+        }
         active.insert(
             "BLE_KEEP_AWAKE_ENABLED".to_string(),
             if enabled { "yes" } else { "no" }.to_string(),
@@ -321,13 +372,20 @@ pub async fn ble_keep_awake_enabled_set(
             .args(["-c", "/root/bin/remountfs_rw"])
             .status();
         sentryusb_config::write_file(config_path, &active)?;
-        Ok(())
+        Ok(None)
     })
     .await;
     match result {
-        Ok(Ok(())) => (
+        Ok(Ok(None)) => (
             StatusCode::OK,
             Json(serde_json::json!({ "enabled": enabled })),
+        ),
+        Ok(Ok(Some(name))) => crate::json_error(
+            StatusCode::CONFLICT,
+            &format!(
+                "{name} is already set as your keep-awake provider. Change the \
+                 keep-awake method in Setup — only one can be active at a time."
+            ),
         ),
         Ok(Err(e)) => crate::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1037,4 +1095,41 @@ pub async fn ble_install(
             "already_installed": already_installed,
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(pairs: &[(&str, &str)]) -> sentryusb_config::SetupConfig {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn detects_real_tessie_token_as_conflict() {
+        let c = cfg(&[("TESSIE_API_TOKEN", "real-token")]);
+        assert_eq!(conflicting_keep_awake_provider(&c), Some("Tessie"));
+    }
+
+    #[test]
+    fn detects_real_webhook_as_conflict() {
+        let c = cfg(&[("KEEP_AWAKE_WEBHOOK_URL", "http://ha.local/hook")]);
+        assert_eq!(conflicting_keep_awake_provider(&c), Some("Webhook"));
+    }
+
+    #[test]
+    fn empty_or_whitespace_token_is_not_a_conflict() {
+        // The exact state the wizard leaves behind when switching to BLE.
+        let c = cfg(&[("TESSIE_API_TOKEN", ""), ("TESLAFI_API_TOKEN", "   ")]);
+        assert_eq!(conflicting_keep_awake_provider(&c), None);
+    }
+
+    #[test]
+    fn bare_vin_alone_is_not_a_conflict() {
+        let c = cfg(&[("TESLA_BLE_VIN", "5YJ3E1EA4JF000001")]);
+        assert_eq!(conflicting_keep_awake_provider(&c), None);
+    }
 }

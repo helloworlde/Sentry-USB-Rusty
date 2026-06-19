@@ -16,6 +16,11 @@ import { Pill } from "@/components/ui/Pill"
 export function BleEnableToggle() {
   const [telemetry, setTelemetry] = useState<boolean | null>(null)
   const [keepAwake, setKeepAwake] = useState<boolean | null>(null)
+  // Name of another keep-awake provider (Tessie/TeslaFi/Webhook) that's
+  // already configured, or null. When set, BLE keep-awake can't be turned
+  // on here — only one provider may be active, and switching belongs in
+  // the wizard. Telemetry is unaffected (it can coexist with any provider).
+  const [blockedBy, setBlockedBy] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
 
@@ -29,6 +34,7 @@ export function BleEnableToggle() {
         if (cancelled) return
         setTelemetry(Boolean(t?.enabled))
         setKeepAwake(Boolean(k?.enabled))
+        setBlockedBy(k?.blocked_by ?? null)
       })
       .catch(() => {
         if (cancelled) return
@@ -67,6 +73,9 @@ export function BleEnableToggle() {
 
   const anyOn = telemetry === true || keepAwake === true
   const loaded = telemetry !== null && keepAwake !== null
+  // Block turning BLE keep-awake ON when another provider owns it. If it's
+  // somehow already on, leave the toggle enabled so it can be turned off.
+  const keepAwakeBlocked = blockedBy !== null && keepAwake !== true
   const icon = anyOn ? (
     <ShieldCheck className="h-3.5 w-3.5" />
   ) : (
@@ -98,12 +107,16 @@ export function BleEnableToggle() {
         />
         <Toggle
           checked={keepAwake === true}
-          disabled={busy || !loaded}
+          disabled={busy || !loaded || keepAwakeBlocked}
           onChange={(v) =>
             update("/api/system/ble-keep-awake-enabled", v, setKeepAwake)
           }
           label="Use BLE for keep-awake"
-          sub="Nudges the car over BLE during archive cycles so USB power stays on."
+          sub={
+            keepAwakeBlocked
+              ? `${blockedBy} is your keep-awake provider — change the method in Setup to use BLE instead (only one can be active at a time).`
+              : "Nudges the car over BLE during archive cycles so USB power stays on."
+          }
         />
         {err && <p className="text-xs text-red-400">{err}</p>}
       </div>

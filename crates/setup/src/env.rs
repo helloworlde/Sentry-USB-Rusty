@@ -163,6 +163,18 @@ impl SetupEnv {
         self.config.get(key).cloned().unwrap_or_else(|| default.to_string())
     }
 
+    /// True when `key` is present AND non-empty (after trimming).
+    ///
+    /// Mirrors the runtime's bash `${VAR:+x}` test (run/awake_start) and
+    /// the wizard frontend's JS-falsy check. The wizard clears a
+    /// deselected keep-awake provider by writing `export KEY=''`; that
+    /// empty value must read as "not configured", not as a second
+    /// provider. Use this — not `config.contains_key` — anywhere a config
+    /// value's presence gates behavior.
+    pub fn is_set(&self, key: &str) -> bool {
+        self.config.get(key).is_some_and(|v| !v.trim().is_empty())
+    }
+
     /// Get a config value as bool (matches bash `true`/`false`).
     pub fn get_bool(&self, key: &str, default: bool) -> bool {
         match self.config.get(key).map(|s| s.as_str()) {
