@@ -65,12 +65,12 @@ function make_links_for_snapshot {
     #log "linking $f"
     linksnapshotfiletorecents "$f" "$curmnt" "$finalmnt"
   done
-  # also link in any files that were moved to SavedClips
+  # link files that were moved to SavedClips into their event folder ONLY.
+  # Deliberately NOT cross-linked into RecentClips — events belong in the
+  # Saved tab. Mixing them into Recent made the Recent tab look like it held
+  # continuous footage going back weeks when it was really just events.
   for f in "$curmnt/TeslaCam/SavedClips"/*/*
   do
-    #log "linking $f"
-    linksnapshotfiletorecents "$f" "$curmnt" "$finalmnt"
-    # also link it into a SavedClips folder
     local eventfolder=${f%/*}
     local eventtime=${eventfolder##/*/}
     if [ ! -d "$saved/$eventtime" ]
@@ -79,11 +79,9 @@ function make_links_for_snapshot {
     fi
     ln -sf "${f/$curmnt/$finalmnt}" "$saved/$eventtime"
   done
-  # and the same for SentryClips
+  # and the same for SentryClips — event folder ONLY, never RecentClips.
   for f in "$curmnt/TeslaCam/SentryClips/"*/*
   do
-    #log "linking $f"
-    linksnapshotfiletorecents "$f" "$curmnt" "$finalmnt"
     local eventfolder=${f%/*}
     local eventtime=${eventfolder##/*/}
     if [ ! -d "$sentry/$eventtime" ]
@@ -167,6 +165,29 @@ function rebuild_all_snapshot_links {
   then
     log "rebuilt symlinks for $rebuilt snapshot(s)"
   fi
+}
+
+# One-time cleanup: remove Saved/Sentry event cross-links that earlier
+# versions dropped into /mutable/TeslaCam/RecentClips/<date>/. Genuine
+# continuous-footage links point at .../RecentClips/...; the stray event
+# links point at .../SavedClips/... or .../SentryClips/.... Discriminate on
+# the symlink's stored target with a SINGLE-level readlink (not readlink -f)
+# so we never trigger an autofs snapshot mount. Date folders left empty
+# afterwards (days that held only events) are pruned. Idempotent: a second
+# run finds nothing to remove.
+function purge_event_links_from_recentclips {
+  local recents=/mutable/TeslaCam/RecentClips
+  [ -d "$recents" ] || return 0
+  log "purging Saved/Sentry cross-links from RecentClips"
+  local link
+  while IFS= read -r -d '' link
+  do
+    case "$(readlink "$link")" in
+      */SavedClips/*|*/SentryClips/*) rm -f "$link" ;;
+    esac
+  done < <(find "$recents" -type l -print0)
+  # drop date folders left empty (those days were only events)
+  find "$recents" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 }
 
 function snapshot {
@@ -283,4 +304,15 @@ if [ -e /mutable/.rebuild_snapshot_symlinks ]
 then
   rebuild_all_snapshot_links
   rm -f /mutable/.rebuild_snapshot_symlinks
+fi
+
+# One-time sweep of legacy Saved/Sentry cross-links out of RecentClips.
+# Self-guarded by a persistent marker so it runs once per device after the
+# update that stopped creating them, then never again. Runs under the same
+# /backingfiles/snapshots flock as the rest of this script, so it can't
+# race the linker above.
+if [ ! -e /mutable/.recentclips_events_purged ]
+then
+  purge_event_links_from_recentclips
+  touch /mutable/.recentclips_events_purged
 fi

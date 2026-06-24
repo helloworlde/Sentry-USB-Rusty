@@ -32,6 +32,12 @@ const SNAPSHOTS_DIR: &str = "/backingfiles/snapshots";
 const CAM_DISK: &str = "/backingfiles/cam_disk.bin";
 const REBUILD_FLAG: &str = "/mutable/.rebuild_snapshot_symlinks";
 
+/// Persistent marker gating the one-time purge of legacy Saved/Sentry
+/// cross-links out of `RecentClips/`. Present ⇒ the sweep already ran on
+/// this device; we never re-run it (the linker no longer creates such
+/// links, so there is nothing new to clean).
+const PURGE_MARKER: &str = "/mutable/.recentclips_events_purged";
+
 const TESLACAM: &str = "/mutable/TeslaCam";
 
 /// Create a snapshot of the cam disk plus all the symlink/TOC work the
@@ -155,6 +161,16 @@ pub async fn make_snapshot(skip_fsck: bool) -> Result<Option<String>> {
             warn!("rebuild_all_snapshot_links: {}", e);
         }
         let _ = std::fs::remove_file(REBUILD_FLAG);
+    }
+
+    // ── one-time purge of legacy Saved/Sentry cross-links from RecentClips ─
+    // Self-guarded by a persistent marker so it runs once per device after
+    // the update that stopped creating them, then never again.
+    if !Path::new(PURGE_MARKER).exists() {
+        if let Err(e) = purge_event_links_in(&Path::new(TESLACAM).join("RecentClips")) {
+            warn!("purge_event_links_in: {}", e);
+        }
+        let _ = std::fs::write(PURGE_MARKER, b"done\n");
     }
 
     Ok(Some(snap_name))
@@ -400,7 +416,10 @@ fn make_links_for_snapshot(cur_mnt: &str, final_mnt: &str) -> Result<()> {
 
             if let Ok(clips) = std::fs::read_dir(&evt_path) {
                 for clip in clips.flatten() {
-                    link_clip_into_recents(&clip.path(), cur_mnt, final_mnt);
+                    // Event clips are linked into their SavedClips event
+                    // folder ONLY — deliberately NOT cross-linked into
+                    // RecentClips, so the Recent tab stays limited to genuine
+                    // continuous footage instead of double-listing events.
                     let link = format!(
                         "{}/{}",
                         evt_dest,
@@ -431,7 +450,8 @@ fn make_links_for_snapshot(cur_mnt: &str, final_mnt: &str) -> Result<()> {
 
             if let Ok(clips) = std::fs::read_dir(&evt_path) {
                 for clip in clips.flatten() {
-                    link_clip_into_recents(&clip.path(), cur_mnt, final_mnt);
+                    // SentryClips event folder ONLY, never RecentClips (see
+                    // the SavedClips loop above for the rationale).
                     let link = format!(
                         "{}/{}",
                         evt_dest,
@@ -493,6 +513,65 @@ fn link_clip_into_recents(file: &Path, cur_mnt: &str, final_mnt: &str) {
         let target = retarget_path(file, cur_mnt, final_mnt);
         let _ = std::os::unix::fs::symlink(&target, &link);
     }
+}
+
+/// One-time cleanup mirroring the bash `purge_event_links_from_recentclips`.
+///
+/// Earlier versions cross-linked every Saved/Sentry event clip into
+/// `RecentClips/<date>/` in addition to its own event folder, so the Recent
+/// tab double-listed events and looked like it held weeks of continuous
+/// footage. This removes those stray links: genuine continuous-footage links
+/// point at `.../RecentClips/...`, event cross-links point at
+/// `.../SavedClips/...` or `.../SentryClips/...`, so we discriminate on the
+/// symlink's stored target via a single-level `read_link` (never resolving
+/// through the autofs snapshot mount). Date folders left empty afterwards
+/// (days that held only events) are pruned. Idempotent: a second run finds
+/// nothing to remove.
+fn purge_event_links_in(recents_root: &Path) -> Result<()> {
+    if !recents_root.is_dir() {
+        return Ok(());
+    }
+    info!(
+        "purging Saved/Sentry cross-links from {}",
+        recents_root.display()
+    );
+    let date_dirs = match std::fs::read_dir(recents_root) {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+    for date_entry in date_dirs.flatten() {
+        let date_dir = date_entry.path();
+        if !date_dir.is_dir() {
+            continue;
+        }
+        if let Ok(clips) = std::fs::read_dir(&date_dir) {
+            for clip in clips.flatten() {
+                let path = clip.path();
+                // Only symlinks are candidates. Read the stored target
+                // without resolving it (symlink_metadata avoids following).
+                let is_symlink = std::fs::symlink_metadata(&path)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                if !is_symlink {
+                    continue;
+                }
+                if let Ok(target) = std::fs::read_link(&path) {
+                    let t = target.to_string_lossy().replace('\\', "/");
+                    if t.contains("/SavedClips/") || t.contains("/SentryClips/") {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        // Drop the date folder if it's now empty (held only events).
+        let now_empty = std::fs::read_dir(&date_dir)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+        if now_empty {
+            let _ = std::fs::remove_dir(&date_dir);
+        }
+    }
+    Ok(())
 }
 
 /// Replace `cur_mnt` prefix with `final_mnt` so the symlink target
@@ -703,6 +782,96 @@ mod tests {
         // escape SNAPSHOTS_DIR — the final segment isn't a `snap-` name.
         assert_eq!(normalize_snap_name("snap-1/../../etc/passwd"), None);
         assert_eq!(normalize_snap_name("/etc/../snap-1/.."), None);
+    }
+
+    /// The purge keys off each symlink's stored target: links into
+    /// `.../SavedClips/...` or `.../SentryClips/...` are the stray event
+    /// cross-links to delete; `.../RecentClips/...` links are genuine
+    /// continuous footage to keep. Targets are dangling on purpose — the
+    /// sweep reads the link string, never the file behind it.
+    #[cfg(unix)]
+    #[test]
+    fn purge_event_links_in_removes_only_event_crosslinks() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let root = TempDir::new().unwrap();
+        let recents = root.path();
+
+        // A day that was ONLY events (like the user's May 18): a Sentry
+        // cross-link + a Saved cross-link, both should be removed and the
+        // now-empty date folder pruned.
+        let only_events = recents.join("2026-05-18");
+        std::fs::create_dir_all(&only_events).unwrap();
+        symlink(
+            "/backingfiles/snapshots/snap-000005/mnt/TeslaCam/SentryClips/2026-05-18_17-29-00/2026-05-18_17-29-00-front.mp4",
+            only_events.join("2026-05-18_17-29-00-front.mp4"),
+        )
+        .unwrap();
+        symlink(
+            "/backingfiles/snapshots/snap-000005/mnt/TeslaCam/SavedClips/2026-05-18_08-12-00/2026-05-18_08-12-00-front.mp4",
+            only_events.join("2026-05-18_08-12-00-front.mp4"),
+        )
+        .unwrap();
+
+        // A driving day: a genuine continuous RecentClips link (must survive)
+        // plus a stray Sentry cross-link (must be removed).
+        let mixed = recents.join("2026-06-22");
+        std::fs::create_dir_all(&mixed).unwrap();
+        let continuous = mixed.join("2026-06-22_12-58-00-front.mp4");
+        symlink(
+            "/backingfiles/snapshots/snap-000068/mnt/TeslaCam/RecentClips/2026-06-22_12-58-00-front.mp4",
+            &continuous,
+        )
+        .unwrap();
+        symlink(
+            "/backingfiles/snapshots/snap-000068/mnt/TeslaCam/SentryClips/2026-06-22_13-00-00/2026-06-22_13-00-00-front.mp4",
+            mixed.join("2026-06-22_13-00-00-front.mp4"),
+        )
+        .unwrap();
+
+        purge_event_links_in(recents).unwrap();
+
+        // Event-only day pruned entirely.
+        assert!(!only_events.exists(), "event-only date folder should be removed");
+
+        // Driving day kept, with ONLY the continuous link remaining.
+        assert!(mixed.is_dir(), "driving day should remain");
+        let survivors: Vec<String> = std::fs::read_dir(&mixed)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(survivors, vec!["2026-06-22_12-58-00-front.mp4"]);
+        assert!(
+            std::fs::symlink_metadata(&continuous)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the continuous RecentClips link must be untouched",
+        );
+    }
+
+    /// Missing root is a no-op; regular (non-symlink) files are never
+    /// touched, and a clean tree is left alone (idempotent).
+    #[cfg(unix)]
+    #[test]
+    fn purge_event_links_in_is_safe_on_missing_and_clean_trees() {
+        use tempfile::TempDir;
+
+        let root = TempDir::new().unwrap();
+        let recents = root.path().join("RecentClips");
+
+        // Missing root: returns Ok with nothing to do.
+        purge_event_links_in(&recents).unwrap();
+
+        // A real (non-symlink) clip file is left alone, and its folder
+        // survives because it isn't empty.
+        let day = recents.join("2026-06-22");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("real.mp4"), b"x").unwrap();
+        purge_event_links_in(&recents).unwrap();
+        assert!(day.join("real.mp4").exists());
     }
 }
 
