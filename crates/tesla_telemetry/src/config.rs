@@ -53,7 +53,24 @@ pub struct BleConfig {
     /// install, so a pre-release build never changes behavior unless a
     /// tester explicitly turns it on. See the consolidation RFC.
     pub experimental: bool,
+    /// How often the sampler fires the keep-awake `charge-port-close`
+    /// nudge while a keep-awake is active (env: `BLE_KEEP_AWAKE_INTERVAL_SEC`,
+    /// default 60). Tesla's post-2026.14.3 "falling asleep" window is
+    /// around 18 min on parked cars, so the default of 60 s sits well
+    /// inside that with room for a missed nudge. Bench-friendly knob:
+    /// AIC8800 / UART-BT boards can dial it to 120–180 s to reduce
+    /// session-drop pressure while the bluer rewrite (#338) lands.
+    /// Bash legacy path (`run/awake_start`) reads the same key so both
+    /// architectures honor it consistently.
+    pub keep_awake_interval_secs: u64,
 }
+
+/// Default `BLE_KEEP_AWAKE_INTERVAL_SEC` when unset. 60 s matches the
+/// on-vehicle Phase 1+2 test (2026-06-23) that held a parked 2026.20.3
+/// Tesla `online` for 1 h+ continuous; relaxing to a bigger value is
+/// safe up to ~300 s on Tesla firmware that pre-dates the 14.3
+/// scheduler tightening but borderline beyond that.
+pub const DEFAULT_KEEP_AWAKE_INTERVAL_SECS: u64 = 60;
 
 impl Default for BleConfig {
     fn default() -> Self {
@@ -64,6 +81,7 @@ impl Default for BleConfig {
             keep_accessory: KeepAccessoryConfig::default(),
             away_auto_enabled: false,
             experimental: false,
+            keep_awake_interval_secs: DEFAULT_KEEP_AWAKE_INTERVAL_SECS,
         }
     }
 }
@@ -175,6 +193,19 @@ impl BleConfig {
         // the legacy env var has no effect; it's ignored silently to
         // avoid breaking existing configs at upgrade time.
 
+        // Cadence knob for the inline keep-awake nudge. Same env key
+        // the legacy bash path in `run/awake_start` honors, so both
+        // architectures agree. Clamp out absurd values (< 15 s spams
+        // the radio, > 900 s exceeds Tesla's post-14.3 sleep window).
+        let keep_awake_interval_secs = sentryusb_config::get_config_value(
+            &active,
+            &commented,
+            "BLE_KEEP_AWAKE_INTERVAL_SEC",
+        )
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| (15..=900).contains(s))
+        .unwrap_or(DEFAULT_KEEP_AWAKE_INTERVAL_SECS);
+
         Ok(Self {
             enabled,
             vin,
@@ -182,6 +213,7 @@ impl BleConfig {
             keep_accessory,
             away_auto_enabled,
             experimental,
+            keep_awake_interval_secs,
         })
     }
 }

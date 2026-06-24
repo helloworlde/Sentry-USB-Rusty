@@ -1285,13 +1285,17 @@ async fn tick(
             let now = Instant::now();
             let due = next_nudge_due_at.map(|t| now >= t).unwrap_or(true);
             if due {
+                let interval = Duration::from_secs(cfg.keep_awake_interval_secs);
                 let result = session
                     .send_action(sentryusb_tesla_ble::actions::charge_port_close())
                     .await;
                 match result {
                     Ok(_) => {
-                        info!("keep-awake: charge-port-close nudge sent (next in 60s)");
-                        *next_nudge_due_at = Some(now + Duration::from_secs(60));
+                        info!(
+                            "keep-awake: charge-port-close nudge sent (next in {}s)",
+                            cfg.keep_awake_interval_secs
+                        );
+                        *next_nudge_due_at = Some(now + interval);
                         *nudge_retry_count = 0;
                     }
                     Err(e) => {
@@ -1313,7 +1317,7 @@ async fn tick(
                             // cadence — don't spam the link with 30 s
                             // retries once the budget is exhausted.
                             *nudge_retry_count = 0;
-                            *next_nudge_due_at = Some(now + Duration::from_secs(60));
+                            *next_nudge_due_at = Some(now + interval);
                         } else {
                             *next_nudge_due_at = Some(now + Duration::from_secs(30));
                         }
