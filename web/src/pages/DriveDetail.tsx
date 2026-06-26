@@ -13,6 +13,7 @@ import {
   Wind,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { monotonicTrack } from "@/lib/drive-track"
 import { useDriveDetail } from "@/hooks/useDriveDetail"
 import { ScrubberProvider, useScrubberActions } from "@/hooks/useScrubberSync"
 import {
@@ -130,56 +131,18 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
     }
   }, [drive.id])
 
-  // RecentClips can stitch overlapping/duplicate same-minute clips into one
-  // drive, which makes a point's synthesized time jump backward at the seam
-  // (and teleport position). Filter to a strictly non-decreasing time sequence
-  // so the colliding clip's backward points are dropped and EVERY consumer
-  // (map, scrubber, speed chart) shares one clean, monotonic, index-aligned
-  // sequence. fsdStates is parallel to points, so it's filtered in lockstep or
-  // the route's FSD/manual coloring would break. A normal contiguous drive is
-  // already monotonic → no-op.
+  // Tesla can stitch overlapping/duplicate same-minute clips into one drive,
+  // which makes a sample's synthesized time jump backward at the seam even
+  // though the car kept moving. monotonicTrack repairs the clock in place
+  // (keeping every real position) so EVERY consumer (map, scrubber, speed
+  // chart) shares one clean, geographically continuous, strictly time-
+  // increasing, index-aligned sequence. See web/src/lib/drive-track.ts for the
+  // why — the old "drop backward samples" approach silently deleted over a mile
+  // of real road at the seam, leaving a false gap on the map. A normal
+  // contiguous drive passes through unchanged.
   const { monoPoints, monoFsdStates } = useMemo(() => {
-    // Drop points that break a single continuous trajectory: (1) backward-in-time
-    // samples from overlapping RecentClips clips, and (2) teleports — a position
-    // jump too far for the elapsed time to be real travel (the surviving tail of
-    // a colliding clip lands 3.7km away in a few ms = ~50,000 m/s). What remains
-    // is one clean, monotonic, index-aligned sequence shared by the map, scrubber
-    // and speed chart; fsdStates is filtered in lockstep so route coloring stays
-    // aligned. No-op on a normal contiguous drive.
-    const hav = (la1: number, lo1: number, la2: number, lo2: number) => {
-      const R = 6371000
-      const r = Math.PI / 180
-      const dLa = (la2 - la1) * r
-      const dLo = (lo2 - lo1) * r
-      const a =
-        Math.sin(dLa / 2) ** 2 +
-        Math.cos(la1 * r) * Math.cos(la2 * r) * Math.sin(dLo / 2) ** 2
-      return 2 * R * Math.asin(Math.sqrt(a))
-    }
-    const MAX_MPS = 60 // ~134 mph; faster than any real drive → a data teleport
-    const pts: typeof drive.points = []
-    const fsd: number[] = []
-    const hasFsd =
-      Array.isArray(drive.fsdStates) &&
-      drive.fsdStates.length === drive.points.length
-    let maxT = -Infinity
-    let last: (typeof drive.points)[number] | null = null
-    drive.points.forEach((p, i) => {
-      if (p[2] < maxT) return // backward in time → drop
-      if (last) {
-        const dt = (p[2] - last[2]) / 1000
-        const dist = hav(last[0], last[1], p[0], p[1])
-        if (dist > 50 && (dt <= 0 || dist / dt > MAX_MPS)) return // teleport → drop
-      }
-      pts.push(p)
-      if (hasFsd) fsd.push(drive.fsdStates![i])
-      maxT = p[2]
-      last = p
-    })
-    return {
-      monoPoints: pts,
-      monoFsdStates: hasFsd ? fsd : drive.fsdStates,
-    }
+    const { points, fsdStates } = monotonicTrack(drive.points, drive.fsdStates)
+    return { monoPoints: points, monoFsdStates: fsdStates }
   }, [drive.points, drive.fsdStates])
 
   useEffect(() => {
