@@ -3,7 +3,7 @@ import { ScrollText, Download, RefreshCw, ArrowDown, Loader2 } from "lucide-reac
 import { cn } from "@/lib/utils"
 
 const logTabs = [
-  { id: "archiveloop", label: "Archive Loop", url: "/api/logs/archiveloop" },
+  { id: "archiveloop", label: "Archiveloop", url: "/api/logs/archiveloop" },
   { id: "setup", label: "Setup Log", url: "/api/logs/setup" },
   { id: "diagnostics", label: "Diagnostics", url: "/api/logs/diagnostics" },
   // Live BLE state dump — service status, adapter pick, what the

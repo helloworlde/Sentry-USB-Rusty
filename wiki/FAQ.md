@@ -28,7 +28,7 @@ All local archive methods (CIFS, NFS, rsync to a LAN server) work offline.
 
 Sentry USB archives **whenever the Pi connects to a known WiFi network**. For most users, that means every time you park in your driveway or garage.
 
-To trigger manually, open the web UI and click **Drives** → **Archive Now**.
+To trigger manually, open the web UI and click the **Archive Sync** action at the top of the **Settings** page.
 
 ## Can I run it on hardware other than a Raspberry Pi?
 
