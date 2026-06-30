@@ -12,6 +12,11 @@ import {
   XAxis,
   YAxis,
 } from "recharts"
+import { useUnits } from "@/lib/units"
+
+// Telemetry pressures arrive in PSI; bar is a display conversion driven by
+// the Display & Units "Tire pressure" toggle (PRESSURE_UNIT). 1 psi = this.
+const PSI_TO_BAR = 0.0689476
 
 // Tire-pressure zones — labels and styling per the user's spec. Each
 // band is a solid-feeling translucent block with the label centered
@@ -30,58 +35,31 @@ import {
 // gets pushed off the top edge and looks like it's hugging the
 // border instead of centred in the visible red strip. The other three
 // bands already sit entirely inside the domain so they're unaffected.
-const ZONES = [
-  {
-    y1: 50,
-    y2: 55,
-    fill: "rgba(127, 29, 29, 0.55)",
-    label: ">50 PSI • UNSAFE",
-    labelColor: "#fca5a5",
-  },
-  {
-    y1: 45,
-    y2: 50,
-    fill: "rgba(63, 98, 18, 0.55)",
-    label: ">45 PSI • HARSHER RIDE & WEAR",
-    labelColor: "#bef264",
-  },
-  {
-    y1: 36,
-    y2: 45,
-    fill: "rgba(22, 78, 51, 0.55)",
-    label: "OPTIMAL",
-    labelColor: "rgba(167, 243, 208, 0.85)",
-  },
-  {
-    y1: 28,
-    y2: 36,
-    fill: "rgba(124, 45, 18, 0.55)",
-    label: "<36 PSI • REDUCED HANDLING & EFFICIENCY",
-    labelColor: "#fcd34d",
-  },
-  {
-    y1: 20,
-    y2: 28,
-    fill: "rgba(127, 29, 29, 0.55)",
-    label: "<28 PSI • UNSAFE",
-    labelColor: "#fca5a5",
-  },
+// Zone bands keyed in PSI (the native telemetry unit). `gt`/`lt` carry the
+// threshold so the label can be rebuilt in whichever unit is active; `text`
+// is the unit-agnostic descriptor. Converted to bar at render time.
+const ZONES_PSI = [
+  { y1: 50, y2: 55, fill: "rgba(127, 29, 29, 0.55)", labelColor: "#fca5a5", gt: 50, text: "UNSAFE" },
+  { y1: 45, y2: 50, fill: "rgba(63, 98, 18, 0.55)", labelColor: "#bef264", gt: 45, text: "HARSHER RIDE & WEAR" },
+  { y1: 36, y2: 45, fill: "rgba(22, 78, 51, 0.55)", labelColor: "rgba(167, 243, 208, 0.85)", text: "OPTIMAL" },
+  { y1: 28, y2: 36, fill: "rgba(124, 45, 18, 0.55)", labelColor: "#fcd34d", lt: 36, text: "REDUCED HANDLING & EFFICIENCY" },
+  { y1: 20, y2: 28, fill: "rgba(127, 29, 29, 0.55)", labelColor: "#fca5a5", lt: 28, text: "UNSAFE" },
 ] as const
 
-// Interior boundaries (dashed lines drawn between adjacent zones).
+// Interior boundaries (dashed lines drawn between adjacent zones), in PSI.
 // Colour-coded to the warning band immediately above/below so the
 // divider reads as a transition cue, not chrome.
-const ZONE_BOUNDARIES = [
+const ZONE_BOUNDARIES_PSI = [
   { y: 50, color: "rgba(252, 165, 165, 0.7)" }, // red boundary above harsh
   { y: 45, color: "rgba(190, 242, 100, 0.7)" }, // amber/lime above optimal
   { y: 36, color: "rgba(252, 211, 77, 0.7)" }, // amber above reduced
   { y: 28, color: "rgba(252, 165, 165, 0.7)" }, // red above bottom-unsafe
 ] as const
 
-// Y range chosen so the visible bottom "UNSAFE" band has real
+// Y range (PSI) chosen so the visible bottom "UNSAFE" band has real
 // presence (~25-30% of the chart height). Going below 20 just wastes
 // space — tires never read that low in practice.
-const Y_DOMAIN: [number, number] = [20, 55]
+const Y_DOMAIN_PSI: [number, number] = [20, 55]
 
 // Per-tire line colours — green family so the lines read against the
 // coloured zone bands while staying distinguishable from each other on
@@ -125,11 +103,27 @@ export const TirePressureCard = memo(function TirePressureCard({
   days = 30,
   chartOnly = false,
 }: TirePressureCardProps) {
+  const { pressureBar } = useUnits()
+
+  // Pressures are stored in PSI; convert the whole series up front so the
+  // lines, latest chips and tooltip all read in the active unit (bar).
+  const points = useMemo(
+    () =>
+      pressureBar
+        ? data.points.map((p) => ({
+            ts: p.ts,
+            fl: p.fl !== undefined ? p.fl * PSI_TO_BAR : undefined,
+            fr: p.fr !== undefined ? p.fr * PSI_TO_BAR : undefined,
+            rl: p.rl !== undefined ? p.rl * PSI_TO_BAR : undefined,
+            rr: p.rr !== undefined ? p.rr * PSI_TO_BAR : undefined,
+          }))
+        : data.points,
+    [data.points, pressureBar],
+  )
+
   // Latest reading per tire for the header strip — rendered inline
-  // beside the title so the card stays compact for the dashboard
-  // grid.
+  // beside the title so the card stays compact for the dashboard grid.
   const latest = useMemo(() => {
-    const points = data.points
     const out: Partial<Record<"fl" | "fr" | "rl" | "rr", number>> = {}
     for (let i = points.length - 1; i >= 0; i--) {
       const p = points[i]
@@ -146,13 +140,37 @@ export const TirePressureCard = memo(function TirePressureCard({
         break
     }
     return out
-  }, [data])
+  }, [points])
+
+  // Unit-aware display helpers (active unit chosen by PRESSURE_UNIT).
+  const conv = (psi: number) => (pressureBar ? psi * PSI_TO_BAR : psi)
+  const unitUpper = pressureBar ? "BAR" : "PSI"
+  const fmtThreshold = (psi: number) =>
+    pressureBar ? (psi * PSI_TO_BAR).toFixed(1) : String(psi)
+  const fmtTick = (n: number) => (pressureBar ? n.toFixed(1) : String(Math.round(n)))
+  const fmtValue = (v: number) => (pressureBar ? `${v.toFixed(2)} bar` : `${v.toFixed(1)} psi`)
+
+  const zones = ZONES_PSI.map((z) => ({
+    key: z.y1,
+    y1: conv(z.y1),
+    y2: conv(z.y2),
+    fill: z.fill,
+    labelColor: z.labelColor,
+    label:
+      "gt" in z
+        ? `>${fmtThreshold(z.gt)} ${unitUpper} • ${z.text}`
+        : "lt" in z
+          ? `<${fmtThreshold(z.lt)} ${unitUpper} • ${z.text}`
+          : z.text,
+  }))
+  const boundaries = ZONE_BOUNDARIES_PSI.map((b) => ({ key: b.y, y: conv(b.y), color: b.color }))
+  const domain: [number, number] = [conv(Y_DOMAIN_PSI[0]), conv(Y_DOMAIN_PSI[1])]
 
   const chart = (
     <div className="h-72 w-full" aria-label="Tire pressure chart">
           <ResponsiveContainer minHeight={0} minWidth={0}>
             <LineChart
-              data={data.points}
+              data={points}
               margin={{ top: 8, right: 20, bottom: 24, left: 0 }}
             >
               <CartesianGrid
@@ -160,9 +178,9 @@ export const TirePressureCard = memo(function TirePressureCard({
                 strokeDasharray="3 3"
                 vertical={false}
               />
-              {ZONES.map((z) => (
+              {zones.map((z) => (
                 <ReferenceArea
-                  key={z.label}
+                  key={z.key}
                   y1={z.y1}
                   y2={z.y2}
                   fill={z.fill}
@@ -178,9 +196,9 @@ export const TirePressureCard = memo(function TirePressureCard({
                   ifOverflow="hidden"
                 />
               ))}
-              {ZONE_BOUNDARIES.map((b) => (
+              {boundaries.map((b) => (
                 <ReferenceLine
-                  key={b.y}
+                  key={b.key}
                   y={b.y}
                   stroke={b.color}
                   strokeWidth={1}
@@ -201,14 +219,14 @@ export const TirePressureCard = memo(function TirePressureCard({
                 minTickGap={64}
               />
               <YAxis
-                domain={Y_DOMAIN}
+                domain={domain}
                 stroke="#475569"
                 tick={{ fill: "#64748b", fontSize: 11 }}
-                tickFormatter={(n: number) => `${Math.round(n)}`}
+                tickFormatter={(n: number) => fmtTick(n)}
                 tickLine={false}
                 axisLine={false}
                 tickMargin={4}
-                width={32}
+                width={pressureBar ? 40 : 32}
               />
               <Tooltip
                 content={({ active, payload }) => {
@@ -219,10 +237,10 @@ export const TirePressureCard = memo(function TirePressureCard({
                       <div className="mb-1 text-[10px] text-slate-500 tabular-nums">
                         {formatTooltipTime(p.ts)}
                       </div>
-                      <TooltipRow label="FL" value={p.fl} color={TIRE_COLORS.fl} />
-                      <TooltipRow label="FR" value={p.fr} color={TIRE_COLORS.fr} />
-                      <TooltipRow label="RL" value={p.rl} color={TIRE_COLORS.rl} />
-                      <TooltipRow label="RR" value={p.rr} color={TIRE_COLORS.rr} />
+                      <TooltipRow label="FL" value={p.fl} color={TIRE_COLORS.fl} format={fmtValue} />
+                      <TooltipRow label="FR" value={p.fr} color={TIRE_COLORS.fr} format={fmtValue} />
+                      <TooltipRow label="RL" value={p.rl} color={TIRE_COLORS.rl} format={fmtValue} />
+                      <TooltipRow label="RR" value={p.rr} color={TIRE_COLORS.rr} format={fmtValue} />
                     </div>
                   )
                 }}
@@ -299,10 +317,10 @@ export const TirePressureCard = memo(function TirePressureCard({
           </div>
         </div>
         <div className="ml-auto flex flex-wrap gap-3 text-xs tabular-nums text-slate-300">
-          <LatestChip label="FL" value={latest.fl} color={TIRE_COLORS.fl} />
-          <LatestChip label="FR" value={latest.fr} color={TIRE_COLORS.fr} />
-          <LatestChip label="RL" value={latest.rl} color={TIRE_COLORS.rl} />
-          <LatestChip label="RR" value={latest.rr} color={TIRE_COLORS.rr} />
+          <LatestChip label="FL" value={latest.fl} color={TIRE_COLORS.fl} format={fmtValue} />
+          <LatestChip label="FR" value={latest.fr} color={TIRE_COLORS.fr} format={fmtValue} />
+          <LatestChip label="RL" value={latest.rl} color={TIRE_COLORS.rl} format={fmtValue} />
+          <LatestChip label="RR" value={latest.rr} color={TIRE_COLORS.rr} format={fmtValue} />
         </div>
       </div>
       {chart}
@@ -314,10 +332,12 @@ function LatestChip({
   label,
   value,
   color,
+  format,
 }: {
   label: string
   value: number | undefined
   color: string
+  format: (v: number) => string
 }) {
   return (
     <span className="inline-flex items-center gap-1.5">
@@ -328,7 +348,7 @@ function LatestChip({
       />
       <span className="text-slate-500">{label}</span>
       <span className="text-slate-100">
-        {value !== undefined ? `${value.toFixed(1)} psi` : "—"}
+        {value !== undefined ? format(value) : "—"}
       </span>
     </span>
   )
@@ -338,10 +358,12 @@ function TooltipRow({
   label,
   value,
   color,
+  format,
 }: {
   label: string
   value: number | undefined
   color: string
+  format: (v: number) => string
 }) {
   return (
     <div className="flex items-center gap-2 tabular-nums">
@@ -352,7 +374,7 @@ function TooltipRow({
       />
       <span className="text-slate-400">{label}</span>
       <span className="ml-auto font-medium">
-        {value !== undefined ? `${value.toFixed(1)} psi` : "—"}
+        {value !== undefined ? format(value) : "—"}
       </span>
     </div>
   )

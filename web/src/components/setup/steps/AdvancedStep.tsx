@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react"
-import { Cog, Thermometer, MapPin, Search, Battery, AlertTriangle } from "lucide-react"
+import { Cog, Thermometer, MapPin, Search, Battery, AlertTriangle, Ruler } from "lucide-react"
 import type { StepProps } from "../SetupWizard"
 import { SizeInput } from "../SizeInput"
 
@@ -222,6 +222,9 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
   const [tzSearch, setTzSearch] = useState("")
   const [isPi5, setIsPi5] = useState(false)
   const useFahrenheit = data.TEMPERATURE_UNIT === "F"
+  // Master measurement-unit selector reflects the temperature choice (the
+  // per-unit controls below can still diverge into a mixed set).
+  const isMetric = !useFahrenheit
 
   useEffect(() => {
     fetch("/api/status")
@@ -296,25 +299,41 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
         </div>
       </div>
 
-      {/* Temperature monitoring */}
+      {/* Measurement unit — master selector. Sets temperature, distance and
+          tire-pressure units together; the per-unit controls below (and the
+          dashboard's Display & Units) stay in sync via the same config keys. */}
       <div>
-        <div className="mb-3 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Thermometer className="h-4 w-4 text-blue-400" />
-            <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
-              Temperature Monitoring
-            </h3>
-          </div>
-          <div className="flex overflow-hidden rounded-lg border border-white/10">
-            <button type="button" onClick={() => onChange("TEMPERATURE_UNIT", "C")}
-              className={`px-2.5 py-1 text-xs font-medium transition-colors ${!useFahrenheit ? "bg-blue-500 text-white" : "text-slate-500 hover:text-slate-300"}`}>
-              °C
-            </button>
-            <button type="button" onClick={() => onChange("TEMPERATURE_UNIT", "F")}
-              className={`px-2.5 py-1 text-xs font-medium transition-colors ${useFahrenheit ? "bg-blue-500 text-white" : "text-slate-500 hover:text-slate-300"}`}>
-              °F
-            </button>
-          </div>
+        <div className="mb-3 flex items-center gap-2">
+          <Ruler className="h-4 w-4 text-blue-400" />
+          <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
+            Measurement System
+          </h3>
+        </div>
+        <div className="flex w-fit overflow-hidden rounded-lg border border-white/10">
+          <button type="button"
+            onClick={() => { onChange("TEMPERATURE_UNIT", "C"); onChange("DRIVE_MAP_UNIT", "km"); onChange("PRESSURE_UNIT", "bar") }}
+            className={`px-4 py-1.5 text-xs font-medium transition-colors ${isMetric ? "bg-blue-500 text-white" : "text-slate-500 hover:text-slate-300"}`}>
+            Metric
+          </button>
+          <button type="button"
+            onClick={() => { onChange("TEMPERATURE_UNIT", "F"); onChange("DRIVE_MAP_UNIT", "mi"); onChange("PRESSURE_UNIT", "psi") }}
+            className={`px-4 py-1.5 text-xs font-medium transition-colors ${!isMetric ? "bg-blue-500 text-white" : "text-slate-500 hover:text-slate-300"}`}>
+            Imperial
+          </button>
+        </div>
+        <p className="mt-1.5 text-xs text-slate-600">
+          Select your preferred measurement system.
+        </p>
+      </div>
+
+      {/* Temperature monitoring — unit follows the Measurement Unit selector
+          above (TEMPERATURE_UNIT); thresholds render in that unit. */}
+      <div>
+        <div className="mb-3 flex items-center gap-2">
+          <Thermometer className="h-4 w-4 text-blue-400" />
+          <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
+            Temperature Monitoring
+          </h3>
         </div>
         <div className="grid gap-3 sm:grid-cols-2">
           <TempInput label="Warning Threshold" field="TEMPERATURE_WARNING"
@@ -486,19 +505,6 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
             </p>
           </>
         )}
-        <div className="mt-3">
-          <label className="mb-1 block text-sm font-medium text-slate-300">Distance Unit</label>
-          <div className="flex overflow-hidden rounded-lg border border-white/10 w-fit">
-            <button type="button" onClick={() => onChange("DRIVE_MAP_UNIT", "mi")}
-              className={`px-3 py-1.5 text-xs font-medium transition-colors ${(data.DRIVE_MAP_UNIT ?? "mi") === "mi" ? "bg-blue-500 text-white" : "text-slate-500 hover:text-slate-300"}`}>
-              Miles
-            </button>
-            <button type="button" onClick={() => onChange("DRIVE_MAP_UNIT", "km")}
-              className={`px-3 py-1.5 text-xs font-medium transition-colors ${data.DRIVE_MAP_UNIT === "km" ? "bg-blue-500 text-white" : "text-slate-500 hover:text-slate-300"}`}>
-              Kilometers
-            </button>
-          </div>
-        </div>
       </div>
 
       {/* Source */}

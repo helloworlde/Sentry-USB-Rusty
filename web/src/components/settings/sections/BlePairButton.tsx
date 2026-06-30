@@ -4,6 +4,10 @@ import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { Pill, LiveDot } from "@/components/ui/Pill"
+import { useUnits } from "@/lib/units"
+
+// Telemetry reports TPMS in PSI; bar is a display conversion (PRESSURE_UNIT).
+const PSI_TO_BAR = 0.0689476
 
 type BleState =
   | "loading"
@@ -134,10 +138,6 @@ export function BlePairButton() {
   const [adapterError, setAdapterError] = useState<string | null>(null)
   const [clockStatus, setClockStatus] = useState<ClockStatusResp | null>(null)
   const [vinRevealed, setVinRevealed] = useState(false)
-  // Unit pref: mirrors Drives.tsx — DRIVE_MAP_UNIT=="km" → metric
-  // (km + °C), else imperial (mi + °F). Default to imperial since
-  // that's the wizard default and most North-American Pi owners.
-  const [metric, setMetric] = useState<boolean>(false)
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -322,20 +322,6 @@ export function BlePairButton() {
     }
   }, [])
 
-  // Unit preference — mirror Drives.tsx's DRIVE_MAP_UNIT lookup.
-  useEffect(() => {
-    fetch("/api/setup/config")
-      .then((r) => r.json())
-      .then((cfg) => {
-        const entry = cfg?.DRIVE_MAP_UNIT
-        if (!entry) return
-        const val = typeof entry === "object"
-          ? (entry.active ? entry.value : null)
-          : entry
-        if (val !== null) setMetric(val === "km")
-      })
-      .catch(() => { /* default imperial */ })
-  }, [])
 
   useEffect(() => {
     if (!outputOpen) {
@@ -837,7 +823,6 @@ export function BlePairButton() {
         <TelemetryOutputPanel
           sample={latestSample}
           loading={sampleLoading}
-          metric={metric}
           onRefresh={async () => {
             // Also refetch the connection pill so the user sees
             // immediate visible feedback (Last seen Xm ago updates)
@@ -972,18 +957,21 @@ function AdapterPicker({
 function TelemetryOutputPanel({
   sample,
   loading,
-  metric,
   onRefresh,
   radioOwner,
   archiving,
 }: {
   sample: BleLatestSample | null
   loading: boolean
-  metric: boolean
   onRefresh: () => void
   radioOwner: string | null
   archiving: boolean
 }) {
+  // Units from the shared store: temperature follows TEMPERATURE_UNIT,
+  // odometer follows DRIVE_MAP_UNIT, pressure follows PRESSURE_UNIT — all
+  // coherent with Settings → Display & Units (previously temp wrongly keyed
+  // off the distance unit).
+  const { pressureBar, tempF, km } = useUnits()
   const hasSample = sample !== null && sample.ts !== null
   // Sample is considered "stale" once it's older than 60s — visually
   // de-emphasize so the user understands they're looking at past
@@ -1075,7 +1063,7 @@ function TelemetryOutputPanel({
             age={sample.field_secs_ago?.battery_pct}
           />
           {sample.odometer_mi != null && (
-            <Row label="Odometer" value={fmtOdo(sample.odometer_mi, metric)} />
+            <Row label="Odometer" value={fmtOdo(sample.odometer_mi, km)} />
           )}
           {sample.location_name && (
             <Row label="Location" value={sample.location_name} />
@@ -1109,12 +1097,12 @@ function TelemetryOutputPanel({
           )}
           <Row
             label="Interior temp"
-            value={fmtTemp(sample.interior_temp_c, metric)}
+            value={fmtTemp(sample.interior_temp_c, !tempF)}
             age={sample.field_secs_ago?.interior_temp_c}
           />
           <Row
             label="Exterior temp"
-            value={fmtTemp(sample.exterior_temp_c, metric)}
+            value={fmtTemp(sample.exterior_temp_c, !tempF)}
             age={sample.field_secs_ago?.exterior_temp_c}
           />
           <Row label="HVAC" value={fmtBool(sample.hvac_on)} />
@@ -1130,12 +1118,12 @@ function TelemetryOutputPanel({
             sample.tire_rr_psi != null) && (
             <>
               <div className="mt-1 border-t border-white/5 pt-1.5 text-[10px] uppercase tracking-wider text-slate-600">
-                Tire pressure (psi)
+                Tire pressure ({pressureBar ? "bar" : "psi"})
               </div>
-              <Row label="Front left" value={fmtPsi(sample.tire_fl_psi)} age={sample.field_secs_ago?.tires} />
-              <Row label="Front right" value={fmtPsi(sample.tire_fr_psi)} age={sample.field_secs_ago?.tires} />
-              <Row label="Rear left" value={fmtPsi(sample.tire_rl_psi)} age={sample.field_secs_ago?.tires} />
-              <Row label="Rear right" value={fmtPsi(sample.tire_rr_psi)} age={sample.field_secs_ago?.tires} />
+              <Row label="Front left" value={fmtPressure(sample.tire_fl_psi, pressureBar)} age={sample.field_secs_ago?.tires} />
+              <Row label="Front right" value={fmtPressure(sample.tire_fr_psi, pressureBar)} age={sample.field_secs_ago?.tires} />
+              <Row label="Rear left" value={fmtPressure(sample.tire_rl_psi, pressureBar)} age={sample.field_secs_ago?.tires} />
+              <Row label="Rear right" value={fmtPressure(sample.tire_rr_psi, pressureBar)} age={sample.field_secs_ago?.tires} />
             </>
           )}
           {/* Three mutually-exclusive context messages for the stale
@@ -1254,10 +1242,12 @@ function fmtBool(v: boolean | null | undefined): string {
   return v ? "on" : "off"
 }
 
-/** Tesla reports TPMS in PSI. We follow that — most users (US + EU)
- *  read tire pressure in PSI even when other units are metric. */
-function fmtPsi(v: number | null | undefined): string {
-  return v == null ? "—" : `${Math.round(v)} psi`
+/** Tesla reports TPMS in PSI. The display unit follows the Display & Units
+ *  "Tire pressure" toggle (PRESSURE_UNIT): psi shows whole numbers, bar to
+ *  two decimals. */
+function fmtPressure(v: number | null | undefined, bar: boolean): string {
+  if (v == null) return "—"
+  return bar ? `${(v * PSI_TO_BAR).toFixed(2)} bar` : `${Math.round(v)} psi`
 }
 
 /** Odometer in miles (Tesla's native unit). When the user prefers

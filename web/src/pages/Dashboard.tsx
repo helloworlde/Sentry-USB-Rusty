@@ -30,6 +30,7 @@ import type { CurrentCharge } from "@/types/charging"
 import type { PiStatus, DriveStats, StorageBreakdown } from "@/lib/api"
 import { wsClient } from "@/lib/ws"
 import { formatUptime, formatBytes, formatTemp } from "@/lib/utils"
+import { useUnits } from "@/lib/units"
 import { CloudStatusBar } from "@/components/CloudStatusBar"
 import {
   CarStatusCard,
@@ -132,8 +133,10 @@ export default function Dashboard() {
   const [archiveProgress, setArchiveProgress] = useState<ProcessProgress | null>(null)
   const [processing, setProcessing] = useState(false)
   const [processProgress, setProcessProgress] = useState<ProcessProgress | null>(null)
-  const [useFahrenheit, setUseFahrenheit] = useState(false)
-  const [metric, setMetric] = useState(false)
+  // Units come from the shared store — coherent defaults and live-synced with
+  // the Settings → Display & Units controls. systemTempF is the independent
+  // System-tile CPU unit; tempF/km drive the dashboard temps and distances.
+  const { tempF: useFahrenheit, systemTempF: systemUseFahrenheit, km: metric } = useUnits()
   const [rtcWarning, setRtcWarning] = useState<string | null>(null)
   // null = still probing, then either the response or `{points: []}`.
   // The card stays unmounted until points.length > 0, so vendor-charts
@@ -220,26 +223,6 @@ export default function Dashboard() {
     fetchStatus()
     fetchDriveStats()
     fetchStorageBreakdown()
-
-    fetch("/api/setup/config")
-      .then((r) => r.json())
-      .then((cfg) => {
-        const entry = cfg.DRIVE_MAP_UNIT
-        if (entry) {
-          const val =
-            typeof entry === "object" ? (entry.active ? entry.value : null) : entry
-          if (val !== null) setMetric(val === "km")
-        }
-        const tempEntry = cfg.TEMPERATURE_UNIT
-        if (tempEntry) {
-          const val =
-            typeof tempEntry === "object"
-              ? (tempEntry.active ? tempEntry.value : null)
-              : tempEntry
-          if (val !== null) setUseFahrenheit(val === "F")
-        }
-      })
-      .catch(() => {})
 
     fetch("/api/system/rtc-status")
       .then((r) => r.json())
@@ -508,7 +491,7 @@ export default function Dashboard() {
         <SystemTile
           status={status}
           uptime={uptime}
-          useFahrenheit={useFahrenheit}
+          useFahrenheit={systemUseFahrenheit}
           keepAwakeIdle={keepAwakeMode == null}
         />
         <NetworkTile status={status} />

@@ -22,6 +22,14 @@ const SOC_COLOR = "#60a5fa" // blue — battery level
 const LEFT_MARGIN = 4
 const RIGHT_MARGIN = 8
 const YAXIS_WIDTH = 40
+// Bold horizontal unit captions sitting below each axis's values, on the
+// same baseline as the time ticks — which get squeezed between them.
+const AXIS_LABEL_STYLE = {
+  fill: "#94a3b8",
+  fontSize: 11,
+  fontWeight: 700,
+  textAnchor: "middle" as const,
+}
 
 type ChartPoint = ChargePoint & { socProjected?: number | null }
 
@@ -78,6 +86,7 @@ function ChargePowerChart({
             axisLine={false}
             tickMargin={10}
             minTickGap={56}
+            padding={{ left: 6, right: 6 }}
           />
           <YAxis
             yAxisId="power"
@@ -89,6 +98,7 @@ function ChargePowerChart({
             tickMargin={4}
             width={YAXIS_WIDTH}
             domain={[0, "dataMax + 2"]}
+            label={{ value: "kW", position: "bottom", offset: 8, style: AXIS_LABEL_STYLE }}
           />
           <YAxis
             yAxisId="soc"
@@ -101,6 +111,8 @@ function ChargePowerChart({
             tickMargin={4}
             width={YAXIS_WIDTH}
             domain={[0, 100]}
+            ticks={[0, 25, 50, 75, 100]}
+            label={{ value: "SoC", position: "bottom", offset: 8, style: AXIS_LABEL_STYLE }}
           />
           <Tooltip
             content={({ active, payload }) => {
