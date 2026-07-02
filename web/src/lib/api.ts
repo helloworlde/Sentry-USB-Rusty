@@ -172,12 +172,24 @@ export interface ClipTelemetry {
 
 export const api = {
   // Travel Mode (secret menu): keep the USB gadget connected to the car while
-  // still archiving on the road. Single persisted boolean in sentryusb.conf.
-  getTravelMode: () => request<{ enabled: boolean }>("/travel-mode/status"),
-  setTravelMode: (enabled: boolean) =>
-    request<{ ok: boolean; enabled: boolean }>("/travel-mode", {
+  // still archiving on the road. Persisted in sentryusb.conf: the master
+  // toggle plus an optional "half snapshots" cadence flag (snapshot+archive
+  // every SNAPSHOT_INTERVAL/2 instead of the full interval while traveling).
+  getTravelMode: () =>
+    request<{ enabled: boolean; half_snapshots: boolean; snapshot_interval_sec: number }>(
+      "/travel-mode/status",
+    ),
+  setTravelMode: (enabled: boolean, halfSnapshots?: boolean) =>
+    request<{
+      ok: boolean
+      enabled: boolean
+      half_snapshots: boolean
+      snapshot_interval_sec: number
+    }>("/travel-mode", {
       method: "POST",
-      body: JSON.stringify({ enabled }),
+      body: JSON.stringify(
+        halfSnapshots === undefined ? { enabled } : { enabled, half_snapshots: halfSnapshots },
+      ),
     }),
   getStatus: () => request<PiStatus>("/status"),
   getStorageBreakdown: () => request<StorageBreakdown>("/status/storage"),

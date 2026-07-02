@@ -262,6 +262,17 @@ log "Drive processing complete. $PROCESSED directories processed."
 # Check if archive is still reachable before syncing drive data.
 # If the user drove away during processing, skip the sync — it will
 # be retried on the next archive cycle.
+#
+# Travel Mode: relax the probe timeouts (same values as the archive-clips.sh
+# watchdog) so a slow VPN link isn't misread as "drove away", which would
+# needlessly skip the drive-data sync every cycle. envsetup.sh (sourced at
+# the top) provides TRAVEL_MODE_ENABLED fresh for each invocation.
+case "${TRAVEL_MODE_ENABLED:-}" in
+  [yY][eE][sS]|[tT][rR][uU][eE]|1|[oO][nN])
+    export ARCHIVE_PING_TIMEOUT="${ARCHIVE_PING_TIMEOUT:-4}"
+    export ARCHIVE_SSH_TIMEOUT="${ARCHIVE_SSH_TIMEOUT:-8}"
+    ;;
+esac
 ARCHIVE_REACHABLE=true
 if [ -x /root/bin/archive-is-reachable.sh ]; then
   ARCHIVE_SERVER="${ARCHIVE_SERVER:-}"

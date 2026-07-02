@@ -150,7 +150,18 @@ function fix_errors_in_image () {
 function archive_is_reachable () {
   local reachable=true
 
-  /root/bin/archive-is-reachable.sh "$ARCHIVE_SERVER" || reachable=false
+  # Travel Mode: relax the probe timeouts to the same values the transfer
+  # watchdog in archive-clips.sh uses — a high-latency VPN link can take
+  # more than 1s to answer, and the snappy defaults misread "slow" as
+  # "offline" (skipping post-archive work, or never starting an archive at
+  # all on a working link). Normal mode keeps the 1s defaults so
+  # drive-away detection stays fast. An explicit env override still wins.
+  if travel_mode_active; then
+    ARCHIVE_PING_TIMEOUT="${ARCHIVE_PING_TIMEOUT:-4}" ARCHIVE_SSH_TIMEOUT="${ARCHIVE_SSH_TIMEOUT:-8}" \
+      /root/bin/archive-is-reachable.sh "$ARCHIVE_SERVER" || reachable=false
+  else
+    /root/bin/archive-is-reachable.sh "$ARCHIVE_SERVER" || reachable=false
+  fi
 
   if [ "$reachable" = false ]
   then
@@ -318,6 +329,34 @@ function travel_mode_active () {
     return 1
   done
   return 1
+}
+
+function travel_mode_interval () {
+  # Cycle pacing for Travel Mode. Precedence: explicit TRAVEL_MODE_INTERVAL
+  # (power-user env/conf override) > "half snapshots" menu toggle
+  # (TRAVEL_MODE_HALF_SNAPSHOTS, read fresh like travel_mode_active so a
+  # mid-trip toggle applies without restarting archiveloop) > the user's
+  # SNAPSHOT_INTERVAL. Halving shrinks the window in which a full cam disk
+  # can lose footage the car deletes before it was snapshotted + uploaded.
+  if [ -n "${TRAVEL_MODE_INTERVAL:-}" ]; then
+    echo "$TRAVEL_MODE_INTERVAL"
+    return
+  fi
+  local base="${SNAPSHOT_INTERVAL:-3480}"
+  local conf val
+  for conf in /root/sentryusb.conf /boot/firmware/sentryusb.conf /boot/sentryusb.conf
+  do
+    [ -f "$conf" ] || continue
+    val=$( set +eu; . "$conf" >/dev/null 2>&1; printf '%s' "${TRAVEL_MODE_HALF_SNAPSHOTS:-}" )
+    case "${val,,}" in
+      yes|true|1|on)
+        echo $((base / 2))
+        return
+        ;;
+    esac
+    break
+  done
+  echo "$base"
 }
 
 function wifi_cycle () {
@@ -1493,9 +1532,10 @@ then
 
   if travel_mode_active; then
     # Always-on VPN never goes unreachable, so wait_for_archive_to_be_unreachable
-    # would block forever and halt archiving. Pace to the snapshot cadence: the
+    # would block forever and halt archiving. Pace to the snapshot cadence
+    # (halved if the menu toggle says so — see travel_mode_interval): the
     # next iteration takes a fresh snapshot and archives its new clips.
-    interval="${TRAVEL_MODE_INTERVAL:-${SNAPSHOT_INTERVAL:-3480}}"
+    interval=$(travel_mode_interval)
     log "Travel Mode: next snapshot+archive cycle in ${interval}s"
     sleep "$interval"
   elif archive_is_reachable; then
@@ -1556,9 +1596,10 @@ do
 
   if travel_mode_active; then
     # Always-on VPN never goes unreachable, so wait_for_archive_to_be_unreachable
-    # would block forever and halt archiving. Pace to the snapshot cadence: the
+    # would block forever and halt archiving. Pace to the snapshot cadence
+    # (halved if the menu toggle says so — see travel_mode_interval): the
     # next iteration takes a fresh snapshot and archives its new clips.
-    interval="${TRAVEL_MODE_INTERVAL:-${SNAPSHOT_INTERVAL:-3480}}"
+    interval=$(travel_mode_interval)
     log "Travel Mode: next snapshot+archive cycle in ${interval}s"
     sleep "$interval"
   elif archive_is_reachable; then

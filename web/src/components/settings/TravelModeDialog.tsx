@@ -11,13 +11,23 @@ interface Props {
   onChange?: (enabled: boolean) => void
 }
 
+/** "58 min" / "4 min" / "45 sec" — for showing snapshot cadences. */
+function fmtInterval(sec: number): string {
+  if (sec < 90) return `${Math.round(sec)} sec`
+  return `${Math.round(sec / 60)} min`
+}
+
 /**
  * Hidden "secret menu" reached by tapping the Away Mode card icon 5×.
- * Toggles Travel Mode — a single persisted boolean the archive loop reads
- * to keep the USB drive connected to the car while archiving on the road.
+ * Toggles Travel Mode — persisted flags the archive loop reads to keep the
+ * USB drive connected to the car while archiving on the road, plus an
+ * optional half-interval snapshot cadence for long trips.
  */
 export function TravelModeDialog({ onClose, onChange }: Props) {
   const [enabled, setEnabled] = useState(false)
+  const [halfSnapshots, setHalfSnapshots] = useState(false)
+  // Matches archiveloop's ${SNAPSHOT_INTERVAL:-3480} until status loads.
+  const [intervalSec, setIntervalSec] = useState(3480)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [archiving, setArchiving] = useState(false)
@@ -27,7 +37,10 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
     api
       .getTravelMode()
       .then((r) => {
-        if (!cancelled) setEnabled(r.enabled)
+        if (cancelled) return
+        setEnabled(r.enabled)
+        setHalfSnapshots(r.half_snapshots)
+        setIntervalSec(r.snapshot_interval_sec)
       })
       .catch(() => {})
       .finally(() => {
@@ -74,6 +87,21 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
     }
   }
 
+  async function toggleHalf(next: boolean) {
+    if (archiving) return
+    setSaving(true)
+    setHalfSnapshots(next) // optimistic
+    try {
+      const r = await api.setTravelMode(enabled, next)
+      setHalfSnapshots(r.half_snapshots)
+      setIntervalSec(r.snapshot_interval_sec)
+    } catch {
+      setHalfSnapshots(!next) // revert on failure
+    } finally {
+      setSaving(false)
+    }
+  }
+
   // Portal to document.body: the Away Mode card is a `glass-card` with a
   // backdrop-filter, which establishes a containing block for `position:
   // fixed` and would otherwise pin/clip this overlay inside the card.
@@ -112,6 +140,18 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
           }
         />
 
+        <Toggle
+          checked={halfSnapshots}
+          onChange={toggleHalf}
+          disabled={loading || saving || archiving}
+          label="How often to take snapshots"
+          sub={
+            halfSnapshots
+              ? `Half — every ${fmtInterval(intervalSec / 2)} instead of every ${fmtInterval(intervalSec)}. Snapshots and uploads run twice as often, so less footage is at risk if the car's drive fills up on a long trip.`
+              : `Default — every ${fmtInterval(intervalSec)}, same as your setup. Flip on to snapshot and upload twice as often while traveling.`
+          }
+        />
+
         {archiving && (
           <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
             <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber-400" />
@@ -123,8 +163,9 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
         )}
 
         <p className="text-[10px] text-slate-500">
-          While on, disk cleanup is paused (the car manages its own space) and archiving runs about
-          once per snapshot interval. Turn this off when you’re back home to resume normal cleanup.
+          While on, disk cleanup is paused (the car manages its own space) and archiving runs once
+          per snapshot interval — or twice as often with the toggle above. Turn this off when
+          you’re back home to resume normal cleanup.
         </p>
       </div>
     </Modal>,
