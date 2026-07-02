@@ -273,6 +273,10 @@ async fn main() {
     // now always dispatches `charge-port-close` inline at the end of an
     // active tick (see "Sampler keep-awake CPC dispatch" in
     // tesla_telemetry/src/main.rs). Existing conf lines remain inert.
+    // Boot-time storage auto repair (opt-in via the storage_auto_repair
+    // preference). Detects a /backingfiles that failed to mount at boot
+    // and runs the guarded xfs_repair ladder; see api::storage_repair.
+    sentryusb_api::storage_repair::spawn_boot_check(hub.clone());
     phase!("startup_tasks_spawned");
 
     // Build the API router

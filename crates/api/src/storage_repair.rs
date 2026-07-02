@@ -284,6 +284,87 @@ async fn notify_storage_repair(message: &str) {
     }
 }
 
+// ───────────────────────── boot-time auto repair ─────────────────────────
+
+/// Settle delay before the boot check. Long enough for fstab mounts and
+/// device enumeration to finish; short enough that an unattended fix
+/// starts promptly after a corrupting power loss.
+const BOOT_CHECK_DELAY: Duration = Duration::from_secs(20);
+
+/// Spawn the boot-time storage check (see `boot_check`). Called once
+/// from the server binary's startup path.
+pub fn spawn_boot_check(hub: sentryusb_ws::Hub) {
+    tokio::spawn(async move { boot_check(hub, AUTO_REPAIR_MARKER).await });
+}
+
+/// Boot-time auto repair for /backingfiles, gated by the
+/// `storage_auto_repair` preference toggle. Detection signal: the fstab
+/// mount already failed by the time we run (XFS refuses corrupt
+/// filesystems at boot). A one-shot mount retry filters out the
+/// "device enumerated late, nothing actually corrupt" case — if that
+/// mount succeeds we deliberately do NOT reboot; the filesystem is fine
+/// and slow enumeration is out of scope here.
+async fn boot_check(hub: sentryusb_ws::Hub, marker: &str) {
+    tokio::time::sleep(BOOT_CHECK_DELAY).await;
+
+    let prefs = crate::preferences::load_prefs();
+    let auto_enabled = crate::notification_center::bool_pref(&prefs, "storage_auto_repair", false);
+    let force_allowed =
+        crate::notification_center::bool_pref(&prefs, "storage_auto_force_repair", false);
+
+    let device = resolve_backing_device().await;
+    let external = match &device {
+        Some(d) => is_external(d).await,
+        None => false,
+    };
+    let mut mounted = resolve_mount_source(&read_proc_mounts().await, BACKINGFILES).is_some();
+
+    // Mount retry: separates "corrupt" from "wasn't there when fstab ran".
+    if auto_enabled && external && !mounted {
+        if let Some(d) = &device {
+            let r = run_capture(CMD_TIMEOUT, "mount", &[d.as_str(), BACKINGFILES]).await;
+            if r.ok {
+                tracing::info!(
+                    "[storage-boot] /backingfiles mounted on retry — filesystem is fine, no repair"
+                );
+                mounted = true;
+            }
+        }
+    }
+
+    match decide_boot_action(auto_enabled, device.is_some(), external, mounted, marker_exists(marker)) {
+        BootAction::Skip(reason) => {
+            tracing::info!("[storage-boot] auto repair skipped: {reason}");
+        }
+        BootAction::ClearMarker => {
+            clear_marker(marker);
+        }
+        BootAction::NotifyRepeatCorruption => {
+            tracing::warn!(
+                "[storage-boot] corrupt again after a previous auto repair — not retrying (marker {marker})"
+            );
+            notify_storage_repair(MSG_REPEAT_CORRUPTION).await;
+        }
+        BootAction::Repair => {
+            let device = device.expect("BootAction::Repair implies device_found");
+            // Belt-and-suspenders: same root-disk refusal as the HTTP handler.
+            if let Some(rp) = root_disk().await {
+                if parent_disk(&device) == rp {
+                    tracing::error!(
+                        "[storage-boot] refusing auto repair: {device} resolves to the root disk"
+                    );
+                    return;
+                }
+            }
+            write_marker(marker);
+            tracing::warn!(
+                "[storage-boot] /backingfiles corrupt — starting auto repair (force_allowed={force_allowed})"
+            );
+            run_repair(hub, device, RepairMode::AutoBoot { force_allowed }).await;
+        }
+    }
+}
+
 // ───────────────────────── runtime resolution ─────────────────────────
 
 fn canonicalize_dev(src: &str) -> String {
