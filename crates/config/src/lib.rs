@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 
@@ -18,13 +19,42 @@ pub const BOOT_CONFIG_PATH: &str = "/boot/firmware/sentryusb.conf";
 const LEGACY_BOOT_PATH: &str = "/boot/sentryusb.conf";
 
 /// Returns the first existing config file path.
+///
+/// `SENTRYUSB_CONFIG_PATH` overrides the on-Pi search chain entirely so
+/// the daemon can run off-Pi (local development) against a config file
+/// in a writable location. The override is read once; with it unset the
+/// probe loop below runs live on every call, exactly as before.
 pub fn find_config_path() -> &'static str {
+    static ENV_OVERRIDE: OnceLock<Option<&'static str>> = OnceLock::new();
+    let ov = ENV_OVERRIDE.get_or_init(|| {
+        std::env::var("SENTRYUSB_CONFIG_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| &*Box::leak(s.into_boxed_str()))
+    });
+    if let Some(p) = ov {
+        return p;
+    }
     for p in [DEFAULT_CONFIG_PATH, BOOT_CONFIG_PATH, LEGACY_BOOT_PATH] {
         if Path::new(p).exists() {
             return p;
         }
     }
     DEFAULT_CONFIG_PATH
+}
+
+/// Base directory for runtime state that lives under `/mutable` on the
+/// Pi (preferences store, GPS fix cache). `SENTRYUSB_MUTABLE_DIR`
+/// redirects it for off-Pi development; unset means `/mutable`.
+pub fn mutable_dir() -> &'static str {
+    static DIR: OnceLock<&'static str> = OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::var("SENTRYUSB_MUTABLE_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| &*Box::leak(s.trim_end_matches('/').to_owned().into_boxed_str()))
+            .unwrap_or("/mutable")
+    })
 }
 
 /// Reads a sentryusb.conf file and returns both active (exported) and
