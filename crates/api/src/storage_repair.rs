@@ -144,6 +144,103 @@ fn needs_log_replay(out: &str) -> bool {
     l.contains("destroy the log") || l.contains("metadata changes in a log")
 }
 
+/// Marker recording that an auto repair already ran for the current
+/// corruption incident. Lives on /mutable (survives reboot + read-only
+/// root). Written BEFORE the repair starts so a crash mid-repair can't
+/// reboot-loop; cleared only by a boot where /backingfiles is mounted.
+const AUTO_REPAIR_MARKER: &str = "/mutable/.storage_auto_repair_attempted";
+
+fn marker_exists(path: &str) -> bool {
+    std::path::Path::new(path).exists()
+}
+
+fn write_marker(path: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Err(e) = std::fs::write(path, format!("{{\"ts\":{ts}}}\n")) {
+        tracing::warn!("[storage-boot] failed to write marker {path}: {e}");
+    }
+}
+
+fn clear_marker(path: &str) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// What the boot check should do, given the observed state. Pure —
+/// the caller gathers the inputs (including a one-shot mount retry
+/// that can flip `mounted` to true).
+#[derive(Debug, PartialEq, Eq)]
+enum BootAction {
+    /// Feature off or storage not eligible — do nothing.
+    Skip(&'static str),
+    /// Storage healthy — clear any stale incident marker.
+    ClearMarker,
+    /// Corrupt again after a previous auto attempt — notify, never loop.
+    NotifyRepeatCorruption,
+    /// First detection of this incident — run the auto repair.
+    Repair,
+}
+
+fn decide_boot_action(
+    auto_enabled: bool,
+    device_found: bool,
+    external: bool,
+    mounted: bool,
+    marker_present: bool,
+) -> BootAction {
+    if !auto_enabled {
+        return BootAction::Skip("storage_auto_repair disabled");
+    }
+    if !device_found {
+        return BootAction::Skip("no backingfiles device found");
+    }
+    if !external {
+        return BootAction::Skip("backingfiles not on an external drive");
+    }
+    if mounted {
+        return BootAction::ClearMarker;
+    }
+    if marker_present {
+        return BootAction::NotifyRepeatCorruption;
+    }
+    BootAction::Repair
+}
+
+/// Policy at the "regular repair finished" gate.
+///
+/// Interactive keeps the historical semantics: `-L` is offered only when
+/// xfs_repair says the dirty log is the blocker, and runs only with the
+/// user's explicit confirmation; other failures are terminal errors.
+/// Auto mode runs `-L` on ANY failure when the user has pre-authorized
+/// it via the force toggle (their explicit product decision), otherwise
+/// it stops and asks for a manual force fix.
+#[derive(Debug, PartialEq, Eq)]
+enum Escalation {
+    /// Repair succeeded — continue to verification.
+    Proceed,
+    /// Stop; a destructive repair is required but not authorized.
+    StopNeedsForce,
+    /// Run `xfs_repair -L` now.
+    RunForce,
+    /// Unrepairable without help `-L` can't give (interactive only).
+    Fail,
+}
+
+fn escalation_action(rep_ok: bool, needs_replay: bool, auto: bool, force_allowed: bool) -> Escalation {
+    if rep_ok {
+        return Escalation::Proceed;
+    }
+    if auto {
+        if force_allowed { Escalation::RunForce } else { Escalation::StopNeedsForce }
+    } else if needs_replay {
+        if force_allowed { Escalation::RunForce } else { Escalation::StopNeedsForce }
+    } else {
+        Escalation::Fail
+    }
+}
+
 // ───────────────────────── runtime resolution ─────────────────────────
 
 fn canonicalize_dev(src: &str) -> String {
@@ -641,6 +738,59 @@ tmpfs /run tmpfs rw 0 0";
         assert!(!is_xfs_error_line("XFS (sdb1): Metadata CRC error detected", dev));
         // Non-XFS lines are ignored.
         assert!(!is_xfs_error_line("EXT4-fs (sda1): error count", dev));
+    }
+
+    #[test]
+    fn decide_boot_action_covers_all_branches() {
+        use BootAction::*;
+        // Toggle off → never touch anything.
+        assert_eq!(decide_boot_action(false, true, true, false, false), Skip("storage_auto_repair disabled"));
+        // No device (SSD unplugged / setup incomplete) → skip.
+        assert_eq!(decide_boot_action(true, false, false, false, false), Skip("no backingfiles device found"));
+        // Not an external drive → skip (same gate as the manual card).
+        assert_eq!(decide_boot_action(true, true, false, false, false), Skip("backingfiles not on an external drive"));
+        // Healthy mount → clear any stale incident marker.
+        assert_eq!(decide_boot_action(true, true, true, true, false), ClearMarker);
+        assert_eq!(decide_boot_action(true, true, true, true, true), ClearMarker);
+        // Corrupt again after a previous auto attempt → notify, don't loop.
+        assert_eq!(decide_boot_action(true, true, true, false, true), NotifyRepeatCorruption);
+        // Corrupt, first time → repair.
+        assert_eq!(decide_boot_action(true, true, true, false, false), Repair);
+    }
+
+    #[test]
+    fn escalation_auto_forces_on_any_failure_interactive_only_on_dirty_log() {
+        use Escalation::*;
+        // Success → proceed regardless of mode.
+        assert_eq!(escalation_action(true, false, true, true), Proceed);
+        assert_eq!(escalation_action(true, true, false, false), Proceed);
+        // AUTO: -L on ANY failure when allowed (user's explicit choice),
+        // even when the output is not a dirty-log failure.
+        assert_eq!(escalation_action(false, false, true, true), RunForce);
+        assert_eq!(escalation_action(false, true, true, true), RunForce);
+        // AUTO without the force toggle → stop and tell the user.
+        assert_eq!(escalation_action(false, false, true, false), StopNeedsForce);
+        assert_eq!(escalation_action(false, true, true, false), StopNeedsForce);
+        // INTERACTIVE: unchanged semantics — -L only for dirty-log,
+        // and only when the user confirmed.
+        assert_eq!(escalation_action(false, true, false, true), RunForce);
+        assert_eq!(escalation_action(false, true, false, false), StopNeedsForce);
+        assert_eq!(escalation_action(false, false, false, true), Fail);
+        assert_eq!(escalation_action(false, false, false, false), Fail);
+    }
+
+    #[test]
+    fn marker_roundtrip() {
+        let path = std::env::temp_dir()
+            .join(format!("sentryusb_marker_test_{}", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        clear_marker(&path); // clean slate even after a failed prior run
+        assert!(!marker_exists(&path));
+        write_marker(&path);
+        assert!(marker_exists(&path));
+        clear_marker(&path);
+        assert!(!marker_exists(&path));
+        clear_marker(&path); // idempotent on missing file
     }
 
     #[test]
