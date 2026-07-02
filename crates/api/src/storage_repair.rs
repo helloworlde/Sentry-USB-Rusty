@@ -241,6 +241,49 @@ fn escalation_action(rep_ok: bool, needs_replay: bool, auto: bool, force_allowed
     }
 }
 
+/// How a repair run terminates and who authorizes `-L`.
+#[derive(Clone, Copy)]
+pub(crate) enum RepairMode {
+    /// Web-UI flow: WS broadcasts only; hard stop before `-L` unless the
+    /// user re-submitted with confirm_destructive; user presses Reboot.
+    Interactive { confirm_destructive: bool },
+    /// Boot-time flow: pushes notifications, runs `-L` on any regular
+    /// failure when pre-authorized, and reboots itself on success.
+    AutoBoot { force_allowed: bool },
+}
+
+// Auto-repair notification copy (spec-fixed wording — do not edit).
+const MSG_AUTO_SUCCESS: &str = "Backing-files corruption detected at boot. Automatic repair succeeded — rebooting the Pi now.";
+const MSG_NEEDS_MANUAL_FORCE: &str = "Backing-files corruption detected at boot. Automatic repair failed — you must run the force fix manually from Settings → System → Repair Storage.";
+const MSG_FORCE_SUCCESS: &str = "Backing-files corruption detected at boot. Force fix succeeded after the regular repair failed — rebooting the Pi now.";
+const MSG_HARD_FAIL: &str = "Backing-files corruption detected at boot. Automatic repair FAILED — the drive may be failing. Check the SSD's power, cable and enclosure.";
+const MSG_REPEAT_CORRUPTION: &str = "Backing-files corruption detected again after a recent auto repair. Not retrying automatically — the SSD may be failing. Check power/cable/enclosure and run repair manually.";
+
+/// Title for storage-repair push notifications. Mirrors the runtime
+/// scripts' `$NOTIFICATION_TITLE` (sentryusb.conf), same fallback as
+/// tesla_telemetry's keep-awake failure push.
+fn notification_title() -> String {
+    let (active, _) = sentryusb_config::parse_file(sentryusb_config::find_config_path())
+        .unwrap_or_default();
+    active
+        .get("NOTIFICATION_TITLE")
+        .cloned()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "SentryUSB".to_string())
+}
+
+/// Fire-and-record a storage_repair push (all configured channels +
+/// notification history). Best-effort; failures only log.
+async fn notify_storage_repair(message: &str) {
+    let title = notification_title();
+    if crate::notifications::dispatch_and_record(&title, message, Some("storage_repair"), None, None)
+        .await
+        .is_none()
+    {
+        tracing::info!("[storage-boot] notification suppressed (storage_repair type disabled)");
+    }
+}
+
 // ───────────────────────── runtime resolution ─────────────────────────
 
 fn canonicalize_dev(src: &str) -> String {
@@ -540,19 +583,28 @@ pub async fn storage_repair(State(s): State<AppState>, body: String) -> (StatusC
 
     let hub = s.hub.clone();
     tokio::spawn(async move {
-        run_repair(hub, device, req.confirm_destructive).await;
+        run_repair(
+            hub,
+            device,
+            RepairMode::Interactive { confirm_destructive: req.confirm_destructive },
+        )
+        .await;
     });
 
     (StatusCode::OK, Json(serde_json::json!({ "status": "started" })))
 }
 
-async fn run_repair(hub: sentryusb_ws::Hub, device: String, confirm_destructive: bool) {
+async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
     let mut log = RepairLog { hub: hub.clone(), buf: String::new() };
     let t = CMD_TIMEOUT;
+    let (auto, force_allowed) = match mode {
+        RepairMode::Interactive { confirm_destructive } => (false, confirm_destructive),
+        RepairMode::AutoBoot { force_allowed } => (true, force_allowed),
+    };
 
     log.line(
         "preflight",
-        format!("Repairing {device} (XFS backingfiles); confirm_destructive={confirm_destructive}"),
+        format!("Repairing {device} (XFS backingfiles); auto={auto} force_allowed={force_allowed}"),
     );
 
     // ── 1. Quiesce — NEVER stop the `sentryusb` service (it's us). ──
@@ -604,9 +656,11 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, confirm_destructive:
         }
     }
 
-    // ── 5. Escalation gate: destructive -L only with explicit confirmation. ──
-    if !rep.ok && needs_log_replay(&rep.output) {
-        if !confirm_destructive {
+    // ── 5. Escalation gate: policy differs by mode (see escalation_action). ──
+    let mut force_ran = false;
+    match escalation_action(rep.ok, needs_log_replay(&rep.output), auto, force_allowed) {
+        Escalation::Proceed | Escalation::Fail => {}
+        Escalation::StopNeedsForce => {
             let log_file = persist_log(&log.buf);
             hub.broadcast(
                 "storage_repair",
@@ -617,11 +671,24 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, confirm_destructive:
                     "message": "The filesystem log is damaged and can't be replayed. The only repair left destroys the pending XFS log (xfs_repair -L), which may lose the most recently written metadata — typically a few of the newest clips. Confirm to proceed.",
                 }),
             );
+            if auto {
+                notify_storage_repair(MSG_NEEDS_MANUAL_FORCE).await;
+            }
             return;
         }
-        log.line("repair", "Confirmed — clearing the XFS log (xfs_repair -L)…");
-        rep = run_capture(t, "xfs_repair", &["-L", &device]).await;
-        log.cmd("repair", &format!("xfs_repair -L {device}"), &rep);
+        Escalation::RunForce => {
+            log.line(
+                "repair",
+                if auto {
+                    "Auto force fix enabled — clearing the XFS log (xfs_repair -L)…"
+                } else {
+                    "Confirmed — clearing the XFS log (xfs_repair -L)…"
+                },
+            );
+            rep = run_capture(t, "xfs_repair", &["-L", &device]).await;
+            log.cmd("repair", &format!("xfs_repair -L {device}"), &rep);
+            force_ran = true;
+        }
     }
 
     if !rep.ok {
@@ -635,6 +702,9 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, confirm_destructive:
                 "error": "xfs_repair could not repair the filesystem. Review the log — the drive itself may be failing (check the SSD's power, cable and enclosure).",
             }),
         );
+        if auto {
+            notify_storage_repair(MSG_HARD_FAIL).await;
+        }
         return;
     }
 
@@ -676,6 +746,20 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, confirm_destructive:
             "message": message,
         }),
     );
+
+    // ── 8. Auto mode finishes the job itself: notify, then reboot. ──
+    if auto {
+        let mut push = if force_ran { MSG_FORCE_SUCCESS } else { MSG_AUTO_SUCCESS }.to_string();
+        if !cam_present {
+            push.push_str(" Note: cam_disk.bin is missing — re-run the Setup Wizard to recreate the backing files after the reboot.");
+        }
+        notify_storage_repair(&push).await;
+        tracing::info!("[storage-boot] auto repair complete — rebooting");
+        // Same mechanism as POST /api/system/reboot. Notification dispatch
+        // above has already completed (bounded by the 30s provider timeout),
+        // so nothing is cut off by the reboot.
+        let _ = run_capture(t, "reboot", &[]).await;
+    }
 }
 
 #[cfg(test)]
