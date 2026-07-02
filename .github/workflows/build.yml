@@ -8,7 +8,7 @@ on:
   # Only the `test` job runs here — see its `if` guard on `build`. The
   # release job is tag-gated, so PRs never publish a release.
   pull_request:
-    branches: [main]
+    branches: [main, main-dev]
   workflow_dispatch:
 
 env:
