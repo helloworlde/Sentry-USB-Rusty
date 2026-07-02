@@ -20,6 +20,7 @@ import {
   Loader2,
   Info,
   Plug,
+  Wrench,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 
@@ -46,6 +47,7 @@ interface NotificationSettings {
   rtc_battery: boolean
   music_sync: boolean
   keep_accessory: boolean
+  storage_repair: boolean
 }
 
 interface HistoryResponse {
@@ -70,6 +72,7 @@ const NOTIFICATION_TYPES = [
   { key: "rtc_battery", label: "RTC Battery Warning", description: "When the real-time clock battery is low or missing", icon: Battery },
   { key: "music_sync", label: "Music Sync", description: "When music files finish syncing to USB", icon: Music },
   { key: "keep_accessory", label: "Keep Accessory", description: "When the Pi releases 12V accessory power at home and is about to go offline", icon: Plug },
+  { key: "storage_repair", label: "Storage Auto Repair", description: "When boot-time repair of dashcam storage succeeds, fails, or needs manual action", icon: Wrench },
 ] as const
 
 function typeIcon(type: string) {
@@ -93,6 +96,7 @@ function typeColor(type: string): string {
     case "drives": return "text-violet-400"
     case "rtc_battery": return "text-yellow-400"
     case "music_sync": return "text-pink-400"
+    case "storage_repair": return "text-rose-400"
     default: return "text-slate-400"
   }
 }
@@ -108,6 +112,7 @@ function typeBgColor(type: string): string {
     case "drives": return "bg-violet-500/15"
     case "rtc_battery": return "bg-yellow-500/15"
     case "music_sync": return "bg-pink-500/15"
+    case "storage_repair": return "bg-rose-500/15"
     default: return "bg-white/5"
   }
 }
@@ -188,6 +193,7 @@ export default function Notifications() {
         rtc_battery: true,
         music_sync: true,
         keep_accessory: true,
+        storage_repair: true,
       })
     }
   }, [])

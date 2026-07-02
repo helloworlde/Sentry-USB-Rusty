@@ -77,6 +77,9 @@ pub struct NotificationSettings {
     /// 12V outlet is released at home). Only relevant for 12V-powered Pis.
     #[serde(default = "default_true")]
     pub keep_accessory: bool,
+    /// Boot-time storage auto repair events (success/failure/needs-manual).
+    #[serde(default = "default_true")]
+    pub storage_repair: bool,
 }
 
 fn default_true() -> bool {
@@ -96,11 +99,12 @@ impl Default for NotificationSettings {
             rtc_battery: true,
             music_sync: true,
             keep_accessory: true,
+            storage_repair: true,
         }
     }
 }
 
-fn bool_pref(prefs: &serde_json::Map<String, serde_json::Value>, key: &str, default: bool) -> bool {
+pub(crate) fn bool_pref(prefs: &serde_json::Map<String, serde_json::Value>, key: &str, default: bool) -> bool {
     match prefs.get(key) {
         Some(serde_json::Value::Bool(b)) => *b,
         Some(serde_json::Value::String(s)) => s == "true",
@@ -121,6 +125,7 @@ fn load_settings() -> NotificationSettings {
         rtc_battery: bool_pref(&prefs, "notify_rtc_battery", true),
         music_sync: bool_pref(&prefs, "notify_music_sync", true),
         keep_accessory: bool_pref(&prefs, "notify_keep_accessory", true),
+        storage_repair: bool_pref(&prefs, "notify_storage_repair", true),
     }
 }
 
@@ -141,6 +146,7 @@ fn save_settings(s: &NotificationSettings) {
     put(&mut prefs, "notify_rtc_battery", s.rtc_battery);
     put(&mut prefs, "notify_music_sync", s.music_sync);
     put(&mut prefs, "notify_keep_accessory", s.keep_accessory);
+    put(&mut prefs, "notify_storage_repair", s.storage_repair);
     crate::preferences::save_prefs(&prefs);
 }
 
@@ -272,6 +278,7 @@ pub(crate) fn is_type_enabled(notification_type: Option<&str>) -> bool {
         "rtc_battery" => s.rtc_battery,
         "music_sync" => s.music_sync,
         "keep_accessory" => s.keep_accessory,
+        "storage_repair" => s.storage_repair,
         // Unknown types default to allowed.
         _ => true,
     }
@@ -340,6 +347,7 @@ pub async fn check_notification_type(
         "rtc_battery" => s.rtc_battery,
         "music_sync" => s.music_sync,
         "keep_accessory" => s.keep_accessory,
+        "storage_repair" => s.storage_repair,
         _ => true,
     };
     (StatusCode::OK, Json(serde_json::json!({"type": ntype, "enabled": enabled})))
@@ -357,4 +365,28 @@ fn to_base36(mut n: u64) -> String {
     }
     buf.reverse();
     String::from_utf8(buf).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_deserialize_defaults_storage_repair_on() {
+        // A PUT from an older UI won't include storage_repair — it must
+        // default to enabled rather than failing deserialization.
+        let json = r#"{
+            "archive_start": true, "archive_complete": true,
+            "archive_error": true, "temperature": true,
+            "keep_awake_failure": true, "update": true, "drives": true,
+            "rtc_battery": true, "music_sync": true, "keep_accessory": true
+        }"#;
+        let s: NotificationSettings = serde_json::from_str(json).unwrap();
+        assert!(s.storage_repair);
+    }
+
+    #[test]
+    fn settings_default_includes_storage_repair() {
+        assert!(NotificationSettings::default().storage_repair);
+    }
 }

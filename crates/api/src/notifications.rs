@@ -551,42 +551,37 @@ pub struct SendNotificationRequest {
     pub archive_total_count: Option<u32>,
 }
 
-/// POST /api/notifications/send
-///
-/// Single entry point used by the runtime scripts (archiveloop,
-/// temperature_monitor, post-archive-process.sh, …) via the
-/// `/root/bin/send-push-message` curl wrapper. Behaviourally mirrors
-/// the bash script it replaces:
-///   1. Gate-check the notification_type against user settings. If
-///      disabled, return `{"skipped": true, "reason": "type_disabled"}`
-///      without touching any provider (no history event written).
-///   2. Dispatch to every configured notifier via the Rust notify crate.
-///   3. Record a history event with the per-provider results.
-pub async fn send_notification(
-    State(_s): State<AppState>,
-    Json(body): Json<SendNotificationRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    // Gate check.
-    let notification_type = body.notification_type.as_deref();
+/// Per-provider outcome summary from a dispatch, pre-digested so callers
+/// don't need to name the notify crate's error types.
+pub(crate) struct DispatchOutcome {
+    pub providers: Vec<String>,
+    /// "Provider: error text" for each failure
+    pub failures: Vec<String>,
+}
+
+/// Internal (non-HTTP) notification dispatch: gate by type, fan out to
+/// every configured provider, record a history event. Returns `None`
+/// when the type is disabled in notification settings (nothing sent).
+/// This is the same pipeline as `POST /api/notifications/send`, callable
+/// from inside the server (boot-time storage repair).
+pub(crate) async fn dispatch_and_record(
+    title: &str,
+    message: &str,
+    notification_type: Option<&str>,
+    type_hint: Option<&str>,
+    archive_total_count: Option<u32>,
+) -> Option<DispatchOutcome> {
     if !crate::notification_center::is_type_enabled(notification_type) {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "skipped": true,
-                "reason": "type_disabled",
-                "type": notification_type.unwrap_or(""),
-            })),
-        );
+        return None;
     }
 
-    // Dispatch.
     let config = sentryusb_notify::NotifyConfig::from_config();
     let req = sentryusb_notify::NotifyRequest {
-        title: &body.title,
-        message: &body.message,
-        type_hint: body.type_hint.as_deref(),
+        title,
+        message,
+        type_hint,
         notification_type,
-        archive_total_count: body.archive_total_count,
+        archive_total_count,
     };
     let results = sentryusb_notify::send_to_all_with_context(&config, &req).await;
 
@@ -608,8 +603,6 @@ pub async fn send_notification(
             }
         }
     }
-    let attempted = results.len();
-    let providers_for_response = providers.clone();
 
     // Record history. Type falls back to "general" when unset — matches
     // bash's `${notification_type:-general}`.
@@ -617,22 +610,60 @@ pub async fn send_notification(
         id: String::new(),
         timestamp: 0,
         event_type: notification_type.unwrap_or("general").to_string(),
-        title: body.title.clone(),
-        message: body.message.clone(),
-        providers,
+        title: title.to_string(),
+        message: message.to_string(),
+        providers: providers.clone(),
         results: result_map,
     };
     if let Err(e) = crate::notification_center::record_event(event) {
         tracing::warn!("[notifications] Failed to record history event: {}", e);
     }
 
+    Some(DispatchOutcome { providers, failures })
+}
+
+/// POST /api/notifications/send
+///
+/// Single entry point used by the runtime scripts (archiveloop,
+/// temperature_monitor, post-archive-process.sh, …) via the
+/// `/root/bin/send-push-message` curl wrapper. Behaviourally mirrors
+/// the bash script it replaces:
+///   1. Gate-check the notification_type against user settings. If
+///      disabled, return `{"skipped": true, "reason": "type_disabled"}`
+///      without touching any provider (no history event written).
+///   2. Dispatch to every configured notifier via the Rust notify crate.
+///   3. Record a history event with the per-provider results.
+pub async fn send_notification(
+    State(_s): State<AppState>,
+    Json(body): Json<SendNotificationRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let notification_type = body.notification_type.as_deref();
+    let Some(out) = dispatch_and_record(
+        &body.title,
+        &body.message,
+        notification_type,
+        body.type_hint.as_deref(),
+        body.archive_total_count,
+    )
+    .await
+    else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "skipped": true,
+                "reason": "type_disabled",
+                "type": notification_type.unwrap_or(""),
+            })),
+        );
+    };
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "ok",
-            "attempted": attempted,
-            "providers": providers_for_response,
-            "failed": failures,
+            "attempted": out.providers.len(),
+            "providers": out.providers,
+            "failed": out.failures,
         })),
     )
 }
