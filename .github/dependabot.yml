@@ -1,14 +1,17 @@
 # Dependency monitoring for Sentry-USB-Rusty.
 #
 # Weekly grouped PRs for minor + patch updates to keep noise down.
-# Security advisories fire immediately as separate ungrouped PRs
-# (Dependabot default — security updates ignore the schedule).
+# Version updates target main-dev (release flow: main-dev -> main).
+# Security advisories fire immediately as separate ungrouped PRs and
+# always target the default branch (Dependabot ignores target-branch
+# for security updates) — retarget those to main-dev before merging.
 
 version: 2
 
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
+    target-branch: "main-dev"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -29,6 +32,7 @@ updates:
 
   - package-ecosystem: "npm"
     directory: "/web"
+    target-branch: "main-dev"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -49,6 +53,7 @@ updates:
 
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: "main-dev"
     schedule:
       interval: "weekly"
       day: "monday"
