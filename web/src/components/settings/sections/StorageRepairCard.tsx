@@ -6,6 +6,7 @@ import {
   CheckCircle,
   AlertCircle,
   RotateCw,
+  Wrench,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { PrefCard } from "@/components/settings/PrefCard"
@@ -76,6 +77,9 @@ export function StorageRepairCard() {
   const [doneMsg, setDoneMsg] = useState<string>("")
   const [errorMsg, setErrorMsg] = useState<string>("")
   const [rebooting, setRebooting] = useState(false)
+  const [autoRepair, setAutoRepair] = useState(false)
+  const [autoForce, setAutoForce] = useState(false)
+  const [prefsLoaded, setPrefsLoaded] = useState(false)
   const logRef = useRef<HTMLDivElement>(null)
   const rebootPollRef = useRef<number | null>(null)
 
@@ -99,6 +103,37 @@ export function StorageRepairCard() {
   useEffect(() => {
     refreshHealth()
   }, [refreshHealth])
+
+  // Auto-repair toggles (preferences). Values may be stored as booleans
+  // or "true"/"false" strings — accept both, default off.
+  useEffect(() => {
+    const isOn = (v: unknown) => v === true || v === "true"
+    Promise.all([
+      fetch("/api/config/preference?key=storage_auto_repair")
+        .then((r) => r.json())
+        .catch(() => ({ value: null })),
+      fetch("/api/config/preference?key=storage_auto_force_repair")
+        .then((r) => r.json())
+        .catch(() => ({ value: null })),
+    ]).then(([auto, force]) => {
+      setAutoRepair(isOn(auto?.value))
+      setAutoForce(isOn(force?.value))
+      setPrefsLoaded(true)
+    })
+  }, [])
+
+  async function setAutoPref(
+    key: "storage_auto_repair" | "storage_auto_force_repair",
+    value: boolean
+  ) {
+    if (key === "storage_auto_repair") setAutoRepair(value)
+    else setAutoForce(value)
+    await fetch("/api/config/preference", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key, value }),
+    }).catch(() => {})
+  }
 
   // Live progress + terminal states from the backend repair task.
   useEffect(() => {
@@ -381,6 +416,59 @@ export function StorageRepairCard() {
             Refresh
           </button>
         )}
+      </div>
+
+      {/* Boot-time auto repair toggles */}
+      <div className="space-y-3 border-t border-white/5 pt-3">
+        <label className="flex cursor-pointer items-start justify-between gap-3">
+          <div className="flex items-start gap-2">
+            <Wrench className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-400" />
+            <div>
+              <span className="text-xs font-medium text-slate-200">Auto repair at boot</span>
+              <span className="mt-0.5 block text-[10px] text-slate-500">
+                If storage is corrupt after a power loss, run the
+                non-destructive repair automatically at boot and reboot when
+                it succeeds. You&apos;ll get a notification either way.
+              </span>
+            </div>
+          </div>
+          <input
+            type="checkbox"
+            checked={autoRepair}
+            disabled={!prefsLoaded}
+            onChange={(e) => setAutoPref("storage_auto_repair", e.target.checked)}
+            className="toggle-switch mt-0.5"
+          />
+        </label>
+
+        <label
+          className={cn(
+            "flex items-start justify-between gap-3",
+            autoRepair ? "cursor-pointer" : "cursor-not-allowed opacity-50"
+          )}
+        >
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
+            <div>
+              <span className="text-xs font-medium text-slate-200">
+                Auto force fix (destructive)
+              </span>
+              <span className="mt-0.5 block text-[10px] text-slate-500">
+                If the regular repair fails, automatically run{" "}
+                <span className="font-mono">xfs_repair -L</span> and reboot.
+                Destroys the pending XFS log — can lose the most recently
+                written data (typically the newest clips).
+              </span>
+            </div>
+          </div>
+          <input
+            type="checkbox"
+            checked={autoForce}
+            disabled={!prefsLoaded || !autoRepair}
+            onChange={(e) => setAutoPref("storage_auto_force_repair", e.target.checked)}
+            className="toggle-switch mt-0.5"
+          />
+        </label>
       </div>
 
       <p className="text-[10px] leading-relaxed text-slate-500">
