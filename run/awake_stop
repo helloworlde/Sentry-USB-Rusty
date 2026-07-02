@@ -77,6 +77,29 @@ ble_is_enabled() {
   esac
 }
 
+# Mirror of archiveloop's travel_mode_active(): read TRAVEL_MODE_ENABLED fresh
+# from the config (same search order as find_config_path) so a mid-cycle
+# toggle is honored. Travel Mode gates ONLY the SENTRY_CASE 1/2 "Sentry Mode
+# OFF" command below — the user is away from home and wants Sentry recording
+# continuously. Every cleanup step (nudge-loop reap, BLE lock release, GATT
+# daemon restore) still runs regardless: archiveloop calls awake_stop
+# unconditionally and relies on it being safe under Travel Mode, so a
+# keep-awake session started before the toggle flipped is still torn down
+# instead of nudging the car every 5 minutes for the rest of the trip.
+travel_mode_active() {
+  local conf val
+  for conf in /root/sentryusb.conf /boot/firmware/sentryusb.conf /boot/sentryusb.conf
+  do
+    [ -f "$conf" ] || continue
+    val=$( set +eu; . "$conf" >/dev/null 2>&1; printf '%s' "${TRAVEL_MODE_ENABLED:-}" )
+    case "${val,,}" in
+      yes|true|1|on) return 0 ;;
+    esac
+    return 1
+  done
+  return 1
+}
+
 ble_restore_gatt_daemon() {
   local have_lock=0
   # Only count the lock as ours if keep_awake wrote it. On the multi-role
@@ -159,7 +182,13 @@ function nudge_label {
 
 case "${SENTRY_CASE}" in
   1 | 2)
-    if [[ ( -n "${TESLAFI_API_TOKEN:+x}" ) ]]
+    if travel_mode_active
+    then
+      # Travel Mode: never send "Sentry Mode OFF" while the user is on the
+      # road. Fall through to the BLE restore below so a session that began
+      # before Travel Mode was enabled still releases the radio cleanly.
+      log "Travel Mode: skipping Sentry Mode OFF command."
+    elif [[ ( -n "${TESLAFI_API_TOKEN:+x}" ) ]]
     # Use TeslaFi API to disable Sentry Mode
     then
       http_response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" \
