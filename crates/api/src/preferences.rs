@@ -20,9 +20,15 @@ use serde::Deserialize;
 
 use crate::router::AppState;
 
-pub(crate) const PREFS_FILE: &str = "/mutable/.sentryusb_preferences.json";
+/// Preferences store path (`/mutable` on the Pi; honors the
+/// `SENTRYUSB_MUTABLE_DIR` dev override for off-Pi runs).
+pub(crate) fn prefs_file() -> String {
+    format!("{}/.sentryusb_preferences.json", sentryusb_config::mutable_dir())
+}
 /// Legacy Go preferences path — read-only fallback so upgrades don't lose data.
-pub(crate) const LEGACY_PREFS_FILE: &str = "/mutable/sentryusb-prefs.json";
+fn legacy_prefs_file() -> String {
+    format!("{}/sentryusb-prefs.json", sentryusb_config::mutable_dir())
+}
 
 /// Serializes concurrent preference reads + writes. Held around the
 /// RMW in `set_preference` so interleaved PUTs can't lose updates.
@@ -30,12 +36,12 @@ static PREFS_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn load_prefs() -> serde_json::Map<String, serde_json::Value> {
     // Primary path first, legacy path as fallback.
-    if let Ok(d) = std::fs::read_to_string(PREFS_FILE) {
+    if let Ok(d) = std::fs::read_to_string(prefs_file()) {
         if let Ok(v) = serde_json::from_str(&d) {
             return v;
         }
     }
-    std::fs::read_to_string(LEGACY_PREFS_FILE)
+    std::fs::read_to_string(legacy_prefs_file())
         .ok()
         .and_then(|d| serde_json::from_str(&d).ok())
         .unwrap_or_default()
@@ -55,15 +61,16 @@ pub(crate) fn save_prefs(prefs: &serde_json::Map<String, serde_json::Value>) {
     // succeeds onto rootfs as a placeholder; once /mutable is mounted
     // any subsequent save lands on the persistent partition.
     let data = serde_json::to_string_pretty(prefs).unwrap_or_default();
-    if let Some(parent) = std::path::Path::new(PREFS_FILE).parent() {
+    let prefs_path = prefs_file();
+    if let Some(parent) = std::path::Path::new(&prefs_path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = format!("{}.tmp", PREFS_FILE);
+    let tmp = format!("{}.tmp", prefs_path);
     if let Err(e) = std::fs::write(&tmp, &data) {
         tracing::warn!("[preferences] failed to write tmp: {}", e);
         return;
     }
-    if let Err(e) = std::fs::rename(&tmp, PREFS_FILE) {
+    if let Err(e) = std::fs::rename(&tmp, &prefs_path) {
         let _ = std::fs::remove_file(&tmp);
         tracing::warn!("[preferences] failed to rename into place: {}", e);
     }

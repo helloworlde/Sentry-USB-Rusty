@@ -101,9 +101,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_DURATION_MIN: u64 = 24 * 60;
 
 // ── Automatic (geofence) mode ──
-/// The car's last GPS fix, written by the telemetry daemon's location
-/// poll (shared with keep-accessory). We read lat/lon/ts from it.
-const GPS_FILE: &str = "/mutable/keep_accessory_gps.json";
+// The car's last GPS fix, written by the telemetry daemon's location
+// poll, is read from `crate::keep_accessory::gps_file()` (shared path).
 /// Default home geofence radius (meters) when `AWAY_MODE_HOME_RADIUS_M`
 /// is unset. Matches keep-accessory's default.
 const DEFAULT_HOME_RADIUS_M: f64 = 120.0;
@@ -334,7 +333,7 @@ fn auto_seed_decision(flag_exists: bool) -> Option<bool> {
 /// file is missing/unparseable or has no coordinates. `age_sec` is how
 /// long ago the fix was taken (clamped ≥ 0).
 fn read_gps_fix() -> Option<(f64, f64, i64)> {
-    let s = std::fs::read_to_string(GPS_FILE).ok()?;
+    let s = std::fs::read_to_string(crate::keep_accessory::gps_file()).ok()?;
     let v: serde_json::Value = serde_json::from_str(&s).ok()?;
     let lat = v.get("lat").and_then(|x| x.as_f64())?;
     let lon = v.get("lon").and_then(|x| x.as_f64())?;

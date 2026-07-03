@@ -216,6 +216,13 @@ pub async fn keep_accessory_config_set(
     }
 }
 
+/// The telemetry daemon's GPS fix cache (`/mutable` on the Pi; honors
+/// the `SENTRYUSB_MUTABLE_DIR` dev override). Shared with away-mode's
+/// geofence watcher.
+pub(crate) fn gps_file() -> String {
+    format!("{}/keep_accessory_gps.json", sentryusb_config::mutable_dir())
+}
+
 /// GET /api/system/keep-accessory-gps → the car's last raw GPS fix, written
 /// by the telemetry daemon's location poll. Drives the Settings/setup
 /// "Use current location" button. Returns nulls until a fix is available
@@ -223,7 +230,7 @@ pub async fn keep_accessory_config_set(
 pub async fn keep_accessory_gps_get(
     State(_s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let body = std::fs::read_to_string("/mutable/keep_accessory_gps.json")
+    let body = std::fs::read_to_string(gps_file())
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .unwrap_or_else(|| serde_json::json!({ "lat": null, "lon": null, "ts": null }));
