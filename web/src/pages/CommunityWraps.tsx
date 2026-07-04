@@ -7,7 +7,8 @@ const API_BASE = "/api"
 
 const TESLA_MODELS = [
   "Cybertruck",
-  "Model S",
+  "Model S (2021+)",
+  "Model S Plaid (2025+)",
   "Model 3",
   "Model 3 (2024+) Standard & Premium",
   "Model 3 (2024+) Performance",
@@ -22,12 +23,16 @@ const TESLA_MODELS = [
 const FILTER_MODELS = ["All", ...TESLA_MODELS]
 
 // Maps display names to Godot scene IDs from Tesla Wrap Studio
-// Model S and Model X have no Godot 3D counterpart — uploads for those skip 3D preview generation and fall back to the thumbnail
+// Model S ("models") and Model X ("modelx") load the 2021+ Palladium scenes; they
+// require the patched index.pck on the cloud renderer (SceneManager SCENE_MAP patch)
 const MODEL_TO_GODOT_ID: Record<string, string> = {
   "Cybertruck": "cybertruck",
   "Model 3": "model3",
   "Model 3 (2024+) Standard & Premium": "model3-2024-base",
   "Model 3 (2024+) Performance": "model3-2024-performance",
+  "Model S (2021+)": "models",
+  "Model S Plaid (2025+)": "models-2025-plaid",
+  "Model X": "modelx",
   "Model Y": "modely",
   "Model Y (2025+) Standard": "modely-2025-base",
   "Model Y (2025+) Premium": "modely-2025-premium",
@@ -40,6 +45,9 @@ const GODOT_CAMERA_DISTANCE: Record<string, number> = {
   "model3": 8,
   "model3-2024-base": 8,
   "model3-2024-performance": 8,
+  "models": 8,
+  "models-2025-plaid": 8,
+  "modelx": 8,
   "modely": 8,
   "modely-2025-base": 8,
   "modely-2025-premium": 8,
