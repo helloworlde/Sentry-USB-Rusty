@@ -259,6 +259,20 @@ export default function FSDAnalytics() {
         </div>
       </div>
 
+      {data.total_drives === 0 ? (
+        // No drives logged in this period — the backend still grades the
+        // zeros ("Bad 0%"), which reads like the driver did badly when
+        // they simply haven't driven yet. Show a neutral empty state and
+        // keep the period selector above usable.
+        <div className="rounded-xl border border-white/10 bg-white/[0.03] p-10 text-center backdrop-blur-sm">
+          <p className="text-sm font-semibold text-slate-200">
+            {period === "day" ? "No drives yet today" : "No drives in this period"}
+          </p>
+          <p className="mt-1 text-xs text-slate-500">
+            Go for a drive — FSD stats will show up here.
+          </p>
+        </div>
+      ) : (<>
       {/* Grade Hero */}
       <div className={cn("rounded-xl border p-5 backdrop-blur-sm", grade.bgClass)}>
         <div className="flex flex-col items-center gap-5 sm:flex-row">
@@ -395,6 +409,7 @@ export default function FSDAnalytics() {
           </div>
         </div>
       </div>
+      </>)}
     </div>
   )
 }
