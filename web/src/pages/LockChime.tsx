@@ -330,6 +330,8 @@ function MyLibraryTab({ volume }: { volume: number }) {
   const volumeSaveTimer = useRef<number | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const audioCtxRef = useRef<AudioContext | null>(null)
+  const gainNodeRef = useRef<GainNode | null>(null)
 
   // Random mode state
   const [randomCfg, setRandomCfg] = useState<RandomConfig>({
@@ -403,6 +405,9 @@ function MyLibraryTab({ volume }: { volume: number }) {
 
   function handleGainChange(name: string, db: number) {
     setGains((g) => ({ ...g, [name]: db }))
+    if (playingName === name && gainNodeRef.current) {
+      gainNodeRef.current.gain.value = Math.pow(10, db / 20)
+    }
     if (volumeSaveTimer.current) window.clearTimeout(volumeSaveTimer.current)
     volumeSaveTimer.current = window.setTimeout(() => saveVolume(name, db), 400)
   }
@@ -413,7 +418,10 @@ function MyLibraryTab({ volume }: { volume: number }) {
   }, [fetchSounds, fetchRandomConfig])
 
   useEffect(() => {
-    return () => { audioRef.current?.pause() }
+    return () => {
+      audioRef.current?.pause()
+      void audioCtxRef.current?.close()
+    }
   }, [])
 
   function togglePlay(name: string) {
@@ -428,6 +436,22 @@ function MyLibraryTab({ volume }: { volume: number }) {
     // user-gesture chain on mobile Safari, causing play() to be rejected.
     if (!audioRef.current) audioRef.current = new Audio()
     const audio = audioRef.current
+    // Route the shared element through a GainNode so per-sound boost (>1x)
+    // is audible in preview — element.volume alone can only attenuate.
+    // createMediaElementSource may only ever be called once per element.
+    if (!audioCtxRef.current) {
+      const ctx = new AudioContext()
+      const source = ctx.createMediaElementSource(audio)
+      const gainNode = ctx.createGain()
+      source.connect(gainNode)
+      gainNode.connect(ctx.destination)
+      audioCtxRef.current = ctx
+      gainNodeRef.current = gainNode
+    }
+    void audioCtxRef.current.resume()
+    if (gainNodeRef.current) {
+      gainNodeRef.current.gain.value = Math.pow(10, (gains[name] ?? 0) / 20)
+    }
     audio.onended = () => setPlayingName(null)
     audio.onerror = () => {
       setPlayingName(null)
