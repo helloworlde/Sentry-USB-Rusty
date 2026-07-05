@@ -144,6 +144,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/lockchime/activate/{filename}", post(crate::lock_chime::activate))
         .route("/api/lockchime/clear-active", post(crate::lock_chime::clear_active))
         .route("/api/lockchime/{filename}", delete(crate::lock_chime::delete_chime))
+        .route("/api/lockchime/volume/{filename}", put(crate::lock_chime::set_volume))
         .route("/api/lockchime/random-config", get(crate::lock_chime::get_random_config).put(crate::lock_chime::save_random_config))
         .route("/api/lockchime/randomize", post(crate::lock_chime::randomize))
         .route("/api/lockchime/randomize-on-connect", post(crate::lock_chime::randomize_on_connect))

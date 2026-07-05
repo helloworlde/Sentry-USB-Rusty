@@ -742,11 +742,14 @@ fn pick_and_activate_random() -> String {
         }
     };
 
-    if let Err(e) = write_chime_file_atomic(LOCK_CHIME_TARGET, &data) {
+    let gain_db = gain_for(&chosen);
+    let processed = apply_gain_db(&data, gain_db);
+    if let Err(e) = write_chime_file_atomic(LOCK_CHIME_TARGET, &processed) {
         info!("lockchime: failed to write target: {}", e);
         return String::new();
     }
     let _ = std::fs::write(LOCK_CHIME_ACTIVE_FILE, &chosen);
+    write_active_gain(gain_db);
     info!("lockchime: random mode activated {:?}", chosen);
 
     chosen
@@ -988,6 +991,8 @@ pub async fn list(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::V
         .trim()
         .to_string();
 
+    let volumes = load_volumes();
+
     let mut sounds = Vec::new();
     for entry in entries.flatten() {
         if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(true) {
@@ -1002,6 +1007,7 @@ pub async fn list(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::V
             "name": name,
             "size": size,
             "active": name == active_name,
+            "gain_db": volumes.get(&name).copied().unwrap_or(0.0),
         }));
     }
 
@@ -1013,6 +1019,7 @@ pub async fn list(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::V
             "sounds": sounds,
             "active_name": active_name,
             "active_set": active_set,
+            "active_gain_applied": read_active_gain(),
         })),
     )
 }
@@ -1142,8 +1149,10 @@ pub async fn activate(
         }
     };
 
+    let gain_db = gain_for(&filename);
     let write_ok = tokio::task::spawn_blocking(move || {
-        write_chime_file_atomic(LOCK_CHIME_TARGET, &data)
+        let processed = apply_gain_db(&data, gain_db);
+        write_chime_file_atomic(LOCK_CHIME_TARGET, &processed)
     })
     .await
     .map(|r| r.is_ok())
@@ -1153,6 +1162,7 @@ pub async fn activate(
     }
 
     let _ = std::fs::write(LOCK_CHIME_ACTIVE_FILE, &filename);
+    write_active_gain(gain_db);
 
     // Sync to cam disk in background
     tokio::spawn(async {
@@ -1181,6 +1191,7 @@ pub async fn clear_active(
         }
     }
     let _ = std::fs::remove_file(LOCK_CHIME_ACTIVE_FILE);
+    let _ = std::fs::remove_file(LOCK_CHIME_ACTIVE_GAIN_FILE);
     let _ = sentryusb_shell::run_with_timeout(Duration::from_secs(60), "sync", &[]).await;
 
     // Clear from cam disk in background
@@ -1220,11 +1231,14 @@ pub async fn delete_chime(
         }
     }
 
+    remove_volume_entry(&filename);
+
     // If the deleted file was the active chime, clear it
     if let Ok(data) = std::fs::read_to_string(LOCK_CHIME_ACTIVE_FILE) {
         if data.trim() == filename {
             let _ = std::fs::remove_file(LOCK_CHIME_TARGET);
             let _ = std::fs::remove_file(LOCK_CHIME_ACTIVE_FILE);
+            let _ = std::fs::remove_file(LOCK_CHIME_ACTIVE_GAIN_FILE);
             let _ = sentryusb_shell::run_with_timeout(Duration::from_secs(60), "sync", &[]).await;
             tokio::spawn(async {
                 if let Err(e) = clear_lock_chime_from_cam_disk().await {
@@ -1235,6 +1249,58 @@ pub async fn delete_chime(
     }
 
     crate::json_ok()
+}
+
+/// PUT /api/lockchime/volume/{filename}
+///
+/// Saves the desired gain to the sidecar only. The car is untouched until
+/// the user activates / re-applies — that is where the gain gets baked into
+/// LockChime.wav.
+pub async fn set_volume(
+    State(_s): State<AppState>,
+    AxumPath(filename): AxumPath<String>,
+    body: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !is_valid_lock_chime_file(&filename) {
+        return crate::json_error(StatusCode::BAD_REQUEST, "Invalid filename");
+    }
+
+    let src_path = PathBuf::from(LOCK_CHIME_DIR).join(&filename);
+    if !src_path.to_string_lossy().starts_with(LOCK_CHIME_DIR) {
+        return crate::json_error(StatusCode::BAD_REQUEST, "Invalid filename");
+    }
+    if !src_path.exists() {
+        return crate::json_error(StatusCode::NOT_FOUND, "Sound file not found");
+    }
+
+    #[derive(Deserialize)]
+    struct VolumeRequest {
+        gain_db: f32,
+    }
+    let req: VolumeRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(_) => return crate::json_error(StatusCode::BAD_REQUEST, "Invalid JSON"),
+    };
+    if !req.gain_db.is_finite() {
+        return crate::json_error(StatusCode::BAD_REQUEST, "Invalid gain value");
+    }
+    let db = req.gain_db.clamp(LOCK_CHIME_GAIN_MIN_DB, LOCK_CHIME_GAIN_MAX_DB);
+
+    if let Err(e) = save_volume(&filename, db) {
+        return crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to save volume: {}", e),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "name": filename,
+            "gain_db": db,
+        })),
+    )
 }
 
 /// GET /api/lockchime/random-config
