@@ -24,6 +24,10 @@ pub(crate) const LOCK_CHIME_MAX_BYTES: usize = 1 * 1024 * 1024;
 pub(crate) const LOCK_CHIME_MAX_SECONDS: f64 = 5.0;
 const LOCK_CHIME_CONFIG_FILE: &str = "/mutable/LockChime/.random_config.json";
 const LOCK_CHIME_ACTIVE_FILE: &str = "/mutable/LockChime/.active_name";
+const LOCK_CHIME_VOLUMES_FILE: &str = "/mutable/LockChime/.volumes.json";
+const LOCK_CHIME_ACTIVE_GAIN_FILE: &str = "/mutable/LockChime/.active_gain";
+pub(crate) const LOCK_CHIME_GAIN_MIN_DB: f32 = -12.0;
+pub(crate) const LOCK_CHIME_GAIN_MAX_DB: f32 = 12.0;
 const CAM_DISK_IMAGE: &str = "/backingfiles/cam_disk.bin";
 const CAM_MOUNT_POINT: &str = "/mnt/cam";
 const GADGET_CONFIG_DIR: &str = "/sys/kernel/config/usb_gadget/sentryusb";
@@ -560,6 +564,65 @@ pub(crate) fn apply_gain_db(data: &[u8], db: f32) -> Vec<u8> {
         i += 2;
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Volume sidecar (.volumes.json) + applied-gain record (.active_gain)
+// ---------------------------------------------------------------------------
+
+fn parse_volumes_json(s: &str) -> std::collections::HashMap<String, f32> {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
+fn load_volumes() -> std::collections::HashMap<String, f32> {
+    match std::fs::read_to_string(LOCK_CHIME_VOLUMES_FILE) {
+        Ok(s) => parse_volumes_json(&s),
+        Err(_) => Default::default(),
+    }
+}
+
+fn gain_for(name: &str) -> f32 {
+    load_volumes()
+        .get(name)
+        .copied()
+        .unwrap_or(0.0)
+        .clamp(LOCK_CHIME_GAIN_MIN_DB, LOCK_CHIME_GAIN_MAX_DB)
+}
+
+fn save_volume(name: &str, db: f32) -> Result<(), String> {
+    let mut m = load_volumes();
+    if db == 0.0 {
+        m.remove(name);
+    } else {
+        m.insert(name.to_string(), db);
+    }
+    let _ = std::fs::create_dir_all(LOCK_CHIME_DIR);
+    let json = serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?;
+    std::fs::write(LOCK_CHIME_VOLUMES_FILE, json).map_err(|e| e.to_string())
+}
+
+fn remove_volume_entry(name: &str) {
+    let mut m = load_volumes();
+    if m.remove(name).is_some() {
+        if let Ok(json) = serde_json::to_string_pretty(&m) {
+            let _ = std::fs::write(LOCK_CHIME_VOLUMES_FILE, json);
+        }
+    }
+}
+
+fn parse_active_gain(s: &str) -> f32 {
+    s.trim().parse::<f32>().unwrap_or(0.0)
+}
+
+fn read_active_gain() -> f32 {
+    match std::fs::read_to_string(LOCK_CHIME_ACTIVE_GAIN_FILE) {
+        Ok(s) => parse_active_gain(&s),
+        Err(_) => 0.0,
+    }
+}
+
+fn write_active_gain(db: f32) {
+    let _ = std::fs::write(LOCK_CHIME_ACTIVE_GAIN_FILE, format!("{db}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1570,5 +1633,27 @@ mod tests {
         let out = apply_gain_db(&wav, 6.0);
         assert_eq!(out.len(), wav.len());
         assert_eq!(&out[..44], &wav[..44]);
+    }
+
+    #[test]
+    fn volumes_json_parses_valid_map() {
+        let m = parse_volumes_json(r#"{"Smoke Alarm.wav": 6.0, "Faaaah.wav": -3.5}"#);
+        assert_eq!(m.get("Smoke Alarm.wav"), Some(&6.0));
+        assert_eq!(m.get("Faaaah.wav"), Some(&-3.5));
+    }
+
+    #[test]
+    fn volumes_json_corrupt_returns_empty() {
+        assert!(parse_volumes_json("{not json").is_empty());
+        assert!(parse_volumes_json("").is_empty());
+        assert!(parse_volumes_json("[1,2]").is_empty());
+    }
+
+    #[test]
+    fn active_gain_parses_and_defaults() {
+        assert_eq!(parse_active_gain("6"), 6.0);
+        assert_eq!(parse_active_gain(" -3.5\n"), -3.5);
+        assert_eq!(parse_active_gain("garbage"), 0.0);
+        assert_eq!(parse_active_gain(""), 0.0);
     }
 }
