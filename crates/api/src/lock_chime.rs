@@ -514,6 +514,55 @@ pub(crate) fn ensure_mono_wav(data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-sound gain (volume) application
+// ---------------------------------------------------------------------------
+
+/// Applies a dB gain to 16-bit PCM WAV data. Boosted peaks are rounded off
+/// with a tanh soft limiter above -1 dBFS so they cannot clip; attenuation
+/// is a plain multiply. 0 dB, non-PCM-16, or unparseable input is returned
+/// unchanged — the caller always gets playable bytes.
+pub(crate) fn apply_gain_db(data: &[u8], db: f32) -> Vec<u8> {
+    if db == 0.0 {
+        return data.to_vec();
+    }
+    let info = match parse_wav_info(data) {
+        Ok(i) => i,
+        Err(_) => return data.to_vec(),
+    };
+    if info.audio_format != 1 || info.bits_per_sample != 16 {
+        return data.to_vec();
+    }
+
+    let gain = 10f32.powf(db / 20.0);
+    // Soft-limit knee at -1 dBFS (normalized).
+    const KNEE: f32 = 0.891_25;
+
+    let mut out = data.to_vec();
+    let start = info.data_offset;
+    let end = (info.data_offset + info.data_size as usize).min(out.len());
+    let mut i = start;
+    while i + 1 < end {
+        let s = i16::from_le_bytes([out[i], out[i + 1]]) as f32 / 32768.0;
+        let amplified = s * gain;
+        let shaped = if db <= 0.0 {
+            amplified
+        } else {
+            let mag = amplified.abs();
+            if mag <= KNEE {
+                amplified
+            } else {
+                (KNEE + (1.0 - KNEE) * ((mag - KNEE) / (1.0 - KNEE)).tanh())
+                    .copysign(amplified)
+            }
+        };
+        let q = (shaped * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
+        out[i..i + 2].copy_from_slice(&q.to_le_bytes());
+        i += 2;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Random config
 // ---------------------------------------------------------------------------
 
@@ -1439,4 +1488,87 @@ fn extract_filename_from_header(header: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal mono 44100 Hz 16-bit PCM WAV around the given samples.
+    fn make_wav(samples: &[i16]) -> Vec<u8> {
+        let data_size = (samples.len() * 2) as u32;
+        let mut out = vec![0u8; 44 + data_size as usize];
+        out[0..4].copy_from_slice(b"RIFF");
+        out[4..8].copy_from_slice(&(36 + data_size).to_le_bytes());
+        out[8..12].copy_from_slice(b"WAVE");
+        out[12..16].copy_from_slice(b"fmt ");
+        out[16..20].copy_from_slice(&16u32.to_le_bytes());
+        out[20..22].copy_from_slice(&1u16.to_le_bytes());
+        out[22..24].copy_from_slice(&1u16.to_le_bytes());
+        out[24..28].copy_from_slice(&44100u32.to_le_bytes());
+        out[28..32].copy_from_slice(&(44100u32 * 2).to_le_bytes());
+        out[32..34].copy_from_slice(&2u16.to_le_bytes());
+        out[34..36].copy_from_slice(&16u16.to_le_bytes());
+        out[36..40].copy_from_slice(b"data");
+        out[40..44].copy_from_slice(&data_size.to_le_bytes());
+        for (i, &s) in samples.iter().enumerate() {
+            out[44 + i * 2..46 + i * 2].copy_from_slice(&s.to_le_bytes());
+        }
+        out
+    }
+
+    fn samples_of(wav: &[u8]) -> Vec<i16> {
+        wav[44..]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    #[test]
+    fn gain_zero_db_is_byte_identical() {
+        let wav = make_wav(&[0, 1000, -1000, 30000]);
+        assert_eq!(apply_gain_db(&wav, 0.0), wav);
+    }
+
+    #[test]
+    fn gain_non_wav_passthrough() {
+        let junk = b"definitely not a wav".to_vec();
+        assert_eq!(apply_gain_db(&junk, 6.0), junk);
+    }
+
+    #[test]
+    fn gain_minus_six_db_halves_amplitude() {
+        let wav = make_wav(&[10000, -10000, 0]);
+        let out = samples_of(&apply_gain_db(&wav, -6.02));
+        assert!((out[0] - 5000).abs() <= 5, "got {}", out[0]);
+        assert!((out[1] + 5000).abs() <= 5, "got {}", out[1]);
+        assert_eq!(out[2], 0);
+    }
+
+    #[test]
+    fn gain_boost_below_threshold_is_linear() {
+        let wav = make_wav(&[8000, -8000]);
+        let out = samples_of(&apply_gain_db(&wav, 6.0));
+        // 8000 * 10^(6/20) = 15962, well below the -1 dBFS knee (29204)
+        assert!((out[0] - 15962).abs() <= 5, "got {}", out[0]);
+        assert!((out[1] + 15962).abs() <= 5, "got {}", out[1]);
+    }
+
+    #[test]
+    fn gain_boost_never_wraps_or_clips_hard() {
+        let wav = make_wav(&[30000, -30000, 32000]);
+        let out = samples_of(&apply_gain_db(&wav, 12.0));
+        // Soft limiter: loud but inside i16, sign preserved, no wraparound
+        assert!(out[0] > 28000 && out[0] <= 32767, "got {}", out[0]);
+        assert!(out[1] < -28000, "got {}", out[1]);
+        assert!(out[2] > 28000 && out[2] <= 32767, "got {}", out[2]);
+    }
+
+    #[test]
+    fn gain_preserves_header_and_length() {
+        let wav = make_wav(&[1, 2, 3, 4]);
+        let out = apply_gain_db(&wav, 6.0);
+        assert_eq!(out.len(), wav.len());
+        assert_eq!(&out[..44], &wav[..44]);
+    }
 }
