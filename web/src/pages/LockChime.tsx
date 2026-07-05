@@ -35,12 +35,14 @@ interface SoundEntry {
   name: string
   size: number
   active: boolean
+  gain_db?: number
 }
 
 interface ListResponse {
   sounds: SoundEntry[]
   active_name: string
   active_set: boolean
+  active_gain_applied?: number
 }
 
 interface RandomConfig {
@@ -321,6 +323,11 @@ function MyLibraryTab({ volume }: { volume: number }) {
   const [libPage, setLibPage] = useState(1)
   const [pendingFile, setPendingFile] = useState<File | null>(null)
   const [pendingName, setPendingName] = useState("")
+  const [gains, setGains] = useState<Record<string, number>>({})
+  const [activeGainApplied, setActiveGainApplied] = useState(0)
+  const [volumeOpen, setVolumeOpen] = useState<string | null>(null)
+  const [savingVolume, setSavingVolume] = useState(false)
+  const volumeSaveTimer = useRef<number | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
 
@@ -353,6 +360,8 @@ function MyLibraryTab({ volume }: { volume: number }) {
       setSounds(data.sounds ?? [])
       setActiveName(data.active_name ?? "")
       setActiveSet(data.active_set ?? false)
+      setActiveGainApplied(data.active_gain_applied ?? 0)
+      setGains(Object.fromEntries((data.sounds ?? []).map((s) => [s.name, s.gain_db ?? 0])))
     } catch {
       showToast("Failed to load sounds", "error")
     } finally {
@@ -372,6 +381,31 @@ function MyLibraryTab({ volume }: { volume: number }) {
       setRandomLoading(false)
     }
   }, [])
+
+  const saveVolume = useCallback(async (name: string, db: number) => {
+    setSavingVolume(true)
+    try {
+      const res = await fetch(`${API_BASE}/lockchime/volume/${encodeURIComponent(name)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gain_db: db }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || `HTTP ${res.status}`)
+      }
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? e.message : "Failed to save volume", "error")
+    } finally {
+      setSavingVolume(false)
+    }
+  }, [showToast])
+
+  function handleGainChange(name: string, db: number) {
+    setGains((g) => ({ ...g, [name]: db }))
+    if (volumeSaveTimer.current) window.clearTimeout(volumeSaveTimer.current)
+    volumeSaveTimer.current = window.setTimeout(() => saveVolume(name, db), 400)
+  }
 
   useEffect(() => {
     fetchSounds()
@@ -636,16 +670,21 @@ function MyLibraryTab({ volume }: { volume: number }) {
                   const isActive = activeSet && activeName === sound.name
                   const isActivating = activating === sound.name
                   const isDeleting = deleting === sound.name
+                  const gainDb = gains[sound.name] ?? sound.gain_db ?? 0
+                  const needsReapply = isActive && gainDb !== activeGainApplied
 
                   return (
                     <div
                       key={sound.name}
-                      className={`group flex items-center gap-3 rounded-xl border px-4 py-3 transition-colors ${
+                      className={`group rounded-xl border transition-colors ${
                         isActive
-                          ? "border-violet-500/40 bg-violet-500/[0.08]"
+                          ? needsReapply
+                            ? "border-amber-500/40 bg-amber-500/[0.06]"
+                            : "border-violet-500/40 bg-violet-500/[0.08]"
                           : "border-white/10 bg-white/[0.02] hover:bg-white/[0.04]"
                       }`}
                     >
+                      <div className="flex items-center gap-3 px-4 py-3">
                       <button
                         onClick={() => togglePlay(sound.name)}
                         className={`shrink-0 flex h-9 w-9 items-center justify-center rounded-full transition-colors ${
@@ -663,11 +702,27 @@ function MyLibraryTab({ volume }: { volume: number }) {
                         <p className="text-xs text-slate-500">{formatSize(sound.size)}</p>
                       </div>
 
-                      {isActive && (
+                      {isActive && !needsReapply && (
                         <span className="shrink-0 flex items-center gap-1 rounded-full bg-violet-500/20 px-2 py-0.5 text-xs font-medium text-violet-300">
                           <CheckCircle2 className="h-3 w-3" />
                           Active
                         </span>
+                      )}
+
+                      {needsReapply && (
+                        <>
+                          <span className="shrink-0 flex items-center gap-1 rounded-full bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-300">
+                            <AlertTriangle className="h-3 w-3" />
+                            Volume changed
+                          </span>
+                          <button
+                            onClick={() => handleActivate(sound.name)}
+                            disabled={savingVolume || isActivating || isDeleting}
+                            className="shrink-0 rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/10 disabled:opacity-50"
+                          >
+                            {isActivating ? "Applying..." : "Re-apply"}
+                          </button>
+                        </>
                       )}
 
                       {!isActive && (
@@ -679,6 +734,16 @@ function MyLibraryTab({ volume }: { volume: number }) {
                           {isActivating ? "Setting..." : "Set Active"}
                         </button>
                       )}
+
+                      <button
+                        onClick={() => setVolumeOpen(volumeOpen === sound.name ? null : sound.name)}
+                        className={`shrink-0 rounded-lg p-1.5 transition-colors ${
+                          gainDb !== 0 ? "text-violet-400 hover:text-violet-300" : "text-slate-600 hover:text-slate-300"
+                        }`}
+                        title="Adjust volume"
+                      >
+                        <Volume2 className="h-4 w-4" />
+                      </button>
 
                       {deleteConfirm === sound.name ? (
                         <div className="shrink-0 flex items-center gap-1">
@@ -705,6 +770,33 @@ function MyLibraryTab({ volume }: { volume: number }) {
                         >
                           <Trash2 className="h-4 w-4" />
                         </button>
+                      )}
+                      </div>
+
+                      {volumeOpen === sound.name && (
+                        <div className="flex items-center gap-3 border-t border-white/5 px-4 pb-3 pt-2.5">
+                          <span className="text-xs font-medium text-slate-400 whitespace-nowrap">Volume</span>
+                          <input
+                            type="range"
+                            min={-12}
+                            max={12}
+                            step={1}
+                            value={gainDb}
+                            onChange={(e) => handleGainChange(sound.name, Number(e.target.value))}
+                            className="flex-1 h-1.5 accent-violet-500 cursor-pointer"
+                          />
+                          <span className="w-14 text-right text-xs tabular-nums text-slate-400">
+                            {gainDb > 0 ? `+${gainDb}` : gainDb} dB
+                          </span>
+                          {gainDb !== 0 && (
+                            <button
+                              onClick={() => handleGainChange(sound.name, 0)}
+                              className="text-xs text-slate-500 transition-colors hover:text-slate-300"
+                            >
+                              Reset
+                            </button>
+                          )}
+                        </div>
                       )}
                     </div>
                   )
