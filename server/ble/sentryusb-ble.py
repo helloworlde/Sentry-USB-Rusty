@@ -489,7 +489,11 @@ def proxy_api_request(method, path, body=None, retries=2, retry_delay=1.5):
             return {'status': resp.getcode(), 'body': parsed}
         except urllib.error.HTTPError as e:
             body_text = e.read().decode() if e.fp else ''
-            return {'status': e.code, 'body': body_text}
+            try:
+                parsed_body = json.loads(body_text)
+            except (json.JSONDecodeError, ValueError):
+                parsed_body = body_text
+            return {'status': e.code, 'body': parsed_body}
         except (urllib.error.URLError, ConnectionRefusedError, OSError) as e:
             last_error = e
             if attempt < retries:
