@@ -26,6 +26,14 @@ const DRIVE_GAP_MS: i64 = 5 * 60 * 1000;
 /// as a recording hole (≥1 missing minute-clip; normal spacing is ~60s).
 pub(crate) const GAP_FILL_MIN_MS: i64 = 90 * 1000;
 
+/// Max hole (ms) event clips may fill. Sentry-covered dropouts run long —
+/// the car parked, so the gap spans the arrival + a chain of ~10-min
+/// pre-roll events (real data: 9-19 min). Wider than DRIVE_GAP_MS on
+/// purpose; the coverage requirement (an event clip must exist for each
+/// filled minute) is what actually bounds the fill. Beyond this it's a
+/// genuine multi-drive boundary, not a recording dropout.
+pub(crate) const GAP_FILL_MAX_MS: i64 = 30 * 60 * 1000;
+
 /// Minimum Park duration (seconds) that ends the current drive within a clip.
 const PARK_GAP_SECONDS: f64 = 2.0;
 
@@ -325,7 +333,7 @@ pub(crate) fn fillable_holes(sorted_ts: &[NaiveDateTime]) -> Vec<(NaiveDateTime,
         .windows(2)
         .filter(|w| {
             let gap = (w[1] - w[0]).num_milliseconds();
-            gap > GAP_FILL_MIN_MS && gap <= DRIVE_GAP_MS
+            gap > GAP_FILL_MIN_MS && gap <= GAP_FILL_MAX_MS
         })
         .map(|w| (w[0], w[1]))
         .collect()
@@ -3028,22 +3036,35 @@ mod tests {
 
     #[test]
     fn test_fillable_holes_bounds() {
-        // Normal 60s spacing → no holes; a 3-min gap → hole; a 6-min gap
-        // is a park/drive boundary the grouper splits on → not a hole.
+        // Normal 60s spacing → no hole. A 3-min and a 6-min gap are both
+        // fillable holes: sentry-covered dropouts run long (the car parked,
+        // so the gap spans arrival + a chain of ~10-min pre-roll events —
+        // real data shows 9-19 min). A 35-min gap exceeds GAP_FILL_MAX_MS →
+        // a genuine multi-drive boundary, not a recording dropout.
         let seq = vec![
             dts("2026-06-01 10:00:00"),
             dts("2026-06-01 10:01:00"),
             dts("2026-06-01 10:04:00"), // 3-min gap after 10:01
             dts("2026-06-01 10:05:00"),
             dts("2026-06-01 10:11:00"), // 6-min gap after 10:05
+            dts("2026-06-01 10:46:00"), // 35-min gap after 10:11 (> GAP_FILL_MAX_MS)
         ];
         let holes = fillable_holes(&seq);
-        assert_eq!(holes, vec![(dts("2026-06-01 10:01:00"), dts("2026-06-01 10:04:00"))]);
+        assert_eq!(
+            holes,
+            vec![
+                (dts("2026-06-01 10:01:00"), dts("2026-06-01 10:04:00")),
+                (dts("2026-06-01 10:05:00"), dts("2026-06-01 10:11:00")),
+            ]
+        );
         // Strict interior: endpoints are occupied RecentClips slots.
         assert!(ts_in_holes(&holes, dts("2026-06-01 10:02:00")));
+        assert!(ts_in_holes(&holes, dts("2026-06-01 10:07:00"))); // inside the 6-min hole
         assert!(!ts_in_holes(&holes, dts("2026-06-01 10:01:00")));
         assert!(!ts_in_holes(&holes, dts("2026-06-01 10:04:00")));
-        assert!(!ts_in_holes(&holes, dts("2026-06-01 10:07:00")));
+        assert!(!ts_in_holes(&holes, dts("2026-06-01 10:11:00")));
+        // The 35-min gap is a drive boundary, never fillable.
+        assert!(!ts_in_holes(&holes, dts("2026-06-01 10:30:00")));
     }
 
     #[test]
