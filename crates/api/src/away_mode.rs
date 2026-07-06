@@ -506,6 +506,30 @@ async fn ensure_ap0() -> Result<(), String> {
     Ok(())
 }
 
+/// After ap0 is (re)created, NetworkManager takes a moment to move it from
+/// `unavailable` to a usable state (`disconnected`/`connected`). Activating
+/// `SENTRYUSB_AP` before that transition races NetworkManager and fails with
+/// exit 4 ("No suitable device found for this connection") — the interface
+/// exists but isn't yet usable at the instant of activation. Poll the device
+/// state until ap0 is ready (up to ~10s) so `nmcli con up` runs against a
+/// usable interface. Returns whether ap0 reached a ready state.
+async fn wait_for_ap0_ready() -> bool {
+    for _ in 0..20 {
+        if let Ok(out) =
+            sentryusb_shell::run("nmcli", &["-t", "-f", "DEVICE,STATE", "device", "status"]).await
+        {
+            if let Some(state) = out.lines().find_map(|l| l.strip_prefix("ap0:")) {
+                let state = state.trim();
+                if state.starts_with("disconnected") || state.starts_with("connected") {
+                    return true;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
 fn start_ap_bg() {
     tokio::spawn(async {
         if use_networkmanager() {
@@ -513,6 +537,16 @@ fn start_ap_bg() {
             if let Err(e) = ensure_ap0().await {
                 away_mode_log(&format!("Failed to create ap0: {}", e));
                 warn!("[away-mode] Failed to create ap0: {}", e);
+            }
+            // Wait for ap0 to become usable before activating — see
+            // wait_for_ap0_ready. Without this, activation can race the
+            // interface's `unavailable -> disconnected` transition and fail
+            // with exit 4.
+            if !wait_for_ap0_ready().await {
+                away_mode_log(
+                    "ap0 did not reach a ready state within timeout; attempting AP activation anyway",
+                );
+                warn!("[away-mode] ap0 not ready within timeout; activating anyway");
             }
             match sentryusb_shell::run("nmcli", &["con", "up", AP_PROFILE]).await {
                 Ok(_) => {
