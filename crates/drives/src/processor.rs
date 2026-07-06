@@ -132,16 +132,49 @@ impl Processor {
         // query failure instead of silently treating everything as
         // unprocessed and re-ingesting the whole tree.
         let processed = self.store.processed_set()?;
+
+        // Continuous-recording timeline for gap-fill hole detection: the
+        // disk scan ∪ already-processed keys (clips rotated off disk still
+        // anchor historical holes). Event keys are excluded — a gap-filled
+        // clip must keep reading as a filled hole, not a new slot.
+        let mut recent_ts: Vec<chrono::NaiveDateTime> = files
+            .iter()
+            .filter_map(|f| crate::grouper::parse_clip_timestamp(f))
+            .collect();
+        recent_ts.extend(
+            processed
+                .iter()
+                .filter(|k| !crate::grouper::is_event_folder_path(k))
+                .filter_map(|k| crate::grouper::parse_clip_timestamp(k)),
+        );
+        recent_ts.sort();
+        recent_ts.dedup();
+
         // Membership must compare CANONICAL keys: the scan yields physical
         // paths (`RecentClips/YYYY-MM-DD/x.mp4` under the snapshot symlink
         // layout) while the store keys rows by `normalize_path` — which
         // strips that prefix. Comparing the raw scan path would miss every
         // stored row and re-extract the whole RecentClips tree each run.
         // The physical path is kept for the extraction read below.
-        let unprocessed: Vec<String> = files
+        let mut unprocessed: Vec<String> = files
             .into_iter()
             .filter(|f| !processed.contains(crate::db::normalize_path(f).as_str()))
             .collect();
+
+        // Gap-fill: append event clips that cover RecentClips holes. They
+        // ride the same extraction loop (throttle, progress, resume via
+        // processed_files) and land keyed at their real event-folder path.
+        match self.scan_event_gap_fill(&recent_ts, &processed) {
+            Ok(gap_fill) if !gap_fill.is_empty() => {
+                info!(
+                    "gap-fill: {} event clip(s) cover RecentClips holes",
+                    gap_fill.len()
+                );
+                unprocessed.extend(gap_fill);
+            }
+            Ok(_) => {}
+            Err(e) => warn!("gap-fill event scan failed: {}", e),
+        }
 
         let total = unprocessed.len();
         let mut routes_found: usize = 0;
@@ -312,6 +345,15 @@ impl Processor {
 
     /// Recursively scan for -front.mp4 files.
     fn scan_dir(&self, dir: &std::path::Path, files: &mut Vec<String>) -> Result<()> {
+        self.scan_dir_inner(dir, files, true)
+    }
+
+    fn scan_dir_inner(
+        &self,
+        dir: &std::path::Path,
+        files: &mut Vec<String>,
+        skip_event_dirs: bool,
+    ) -> Result<()> {
         let entries = std::fs::read_dir(dir)?;
         for entry in entries {
             let entry = entry?;
@@ -323,13 +365,16 @@ impl Processor {
                 // catch). SentryClips contains parked Sentry-mode recordings
                 // that the gear-state splitter emits as spurious "drives"
                 // bordering an actual trip. Matches Sentry-Drive's
-                // discoverFrontCameraFiles (process.js:91-94).
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if is_event_folder(name) {
-                        continue;
+                // discoverFrontCameraFiles (process.js:91-94). The gap-fill
+                // scan (scan_event_gap_fill) walks these deliberately.
+                if skip_event_dirs {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if is_event_folder(name) {
+                            continue;
+                        }
                     }
                 }
-                self.scan_dir(&path, files)?;
+                self.scan_dir_inner(&path, files, skip_event_dirs)?;
             } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.ends_with("-front.mp4") {
                     // Store relative path from clip_dir
@@ -342,6 +387,41 @@ impl Processor {
             }
         }
         Ok(())
+    }
+
+    /// Find Saved/Sentry event clips that fill RecentClips holes: the
+    /// continuous recording gapped mid-drive, but the same minute exists in
+    /// an event folder's ~10-minute pre-roll. Returns unprocessed relative
+    /// paths (kept at their real event-folder location — no copies or
+    /// symlinks). Selective by construction: a parked car's event clips
+    /// have no surrounding continuous footage, so they never fall inside a
+    /// hole and never qualify. One clip per missing timestamp
+    /// (grouper::select_gap_fill_events picks the winner).
+    fn scan_event_gap_fill(
+        &self,
+        recent_sorted_ts: &[chrono::NaiveDateTime],
+        processed: &std::collections::HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let mut event_files: Vec<String> = Vec::new();
+        for sub in ["SavedClips", "SentryClips"] {
+            let dir = std::path::Path::new(&self.clip_dir).join(sub);
+            if dir.is_dir() {
+                self.scan_dir_inner(&dir, &mut event_files, false)?;
+            }
+        }
+        event_files.sort();
+
+        let cands: Vec<(chrono::NaiveDateTime, &str)> = event_files
+            .iter()
+            .filter(|f| !processed.contains(crate::db::normalize_path(f).as_str()))
+            .filter_map(|f| {
+                crate::grouper::parse_clip_timestamp(f).map(|ts| (ts, f.as_str()))
+            })
+            .collect();
+        Ok(crate::grouper::select_gap_fill_events(recent_sorted_ts, &cands)
+            .into_iter()
+            .map(|i| cands[i].1.to_string())
+            .collect())
     }
 }
 

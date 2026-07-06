@@ -95,7 +95,11 @@ const ARCHIVE_SYNC_SAMPLE_COUNT_KEY: &str = "archive_sync_sample_count";
 // to the numerically-stable atan2(haversine) form (calc.rs), fixing a
 // ~0.7% short-segment undercount on native dashcam drives. Per-drive
 // distance shifts up; stale v6 caches hold the undercounted mileage.
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "7";
+//
+// v8 (2026-07-06): event-clip gap-fill — the summary grouper now admits
+// SavedClips/SentryClips rows that fill RecentClips holes (and filters
+// all other event rows, which it previously passed through untouched).
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "8";
 
 /// Version tag for the per-clip aggregate FORMULA (compute_route_aggregates).
 /// Distinct from the cache algo version above: this gates a one-shot
@@ -297,6 +301,9 @@ impl DriveStore {
                 // Stray SavedClips/SentryClips routes pre-date the
                 // processor's event-folder skip; the grouper already hides
                 // them from drives, so deleting only trims dead rows.
+                // NOTE for future key-format bumps: event rows can now be
+                // legitimate gap-fills (processor::scan_event_gap_fill) —
+                // a canon-2 migration must not blanket-delete them.
                 let events = mg.execute(
                     "DELETE FROM routes \
                      WHERE file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%'",
