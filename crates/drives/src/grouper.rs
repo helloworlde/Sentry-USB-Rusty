@@ -278,7 +278,13 @@ pub fn build_single_drive_from_clips(
     let mut timed: Vec<TimedRoute> = routes
         .iter()
         .filter_map(|r| {
-            parse_file_timestamp(&r.file).map(|ts| TimedRoute {
+            // parse_clip_timestamp (basename), NOT parse_file_timestamp:
+            // gap-fill routes are keyed at event-folder paths
+            // (SentryClips/<event-ts>/<clip-ts>-front.mp4) whose folder
+            // timestamp a left-to-right scan would win, placing the clip at
+            // the event time instead of its own — a phantom gap in the
+            // drive's point/speed timeline.
+            parse_clip_timestamp(&r.file).map(|ts| TimedRoute {
                 route: r.clone(),
                 timestamp: ts,
             })
@@ -425,7 +431,7 @@ fn group_clips(routes: Vec<Route>) -> Vec<Vec<TimedRoute>> {
     let mut dropped_total: usize = 0;
     let mut timed: Vec<TimedRoute> = unique
         .into_iter()
-        .filter_map(|r| match parse_file_timestamp(&r.file) {
+        .filter_map(|r| match parse_clip_timestamp(&r.file) {
             Some(ts) => Some(TimedRoute { route: r, timestamp: ts }),
             None => {
                 dropped_total += 1;
@@ -1880,7 +1886,7 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<SubClipSumm
     let mut timed: Vec<TimedSummary> = unique
         .into_iter()
         .filter_map(|s| {
-            let ts = parse_file_timestamp(&s.file)?;
+            let ts = parse_clip_timestamp(&s.file)?;
             Some(TimedSummary { summary: s, timestamp: ts })
         })
         .collect();
@@ -2696,6 +2702,34 @@ mod tests {
         let groups = group_clips(routes);
         // 1 hour gap > 5 min => 2 groups
         assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn test_build_single_drive_dates_gapfill_by_clip_not_event_folder() {
+        // Regression: a gap-fill clip lives at an event-folder path whose
+        // FOLDER timestamp (12:40:00) is 38 min after the clip's own time
+        // (12:02:00). build_single_drive_from_clips must date it by the clip
+        // (basename) time — a left-to-right path scan grabs the folder time
+        // first and drops the clip's points ~38 min late, blowing a phantom
+        // gap in the drive's speed timeline (real 4C+ bug, drive 241).
+        let native = test_route(
+            "RecentClips/2026-01-15/2026-01-15_12-00-00-front.mp4",
+            vec![[37.0, -122.0]],
+        );
+        let gapfill = test_route(
+            "SentryClips/2026-01-15_12-40-00/2026-01-15_12-02-00-front.mp4",
+            vec![[37.02, -122.0]],
+        );
+        let drive =
+            build_single_drive_from_clips(&[native, gapfill], 0, &HashMap::new()).expect("drive");
+        assert_eq!(drive.clip_count, 2);
+        let max_t = drive.points.iter().map(|p| p[2]).fold(0.0_f64, f64::max);
+        // Clip time (12:02) => ~120 000 ms. Event-folder time (12:40) =>
+        // ~2 280 000 ms. Anything past 5 min means the old path-scan bug.
+        assert!(
+            max_t < 300_000.0,
+            "gap-fill clip placed at {max_t} ms — expected ~120 000 (clip time), not the event-folder time",
+        );
     }
 
     #[test]
