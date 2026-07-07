@@ -294,6 +294,16 @@ impl Processor {
         // Final checkpoint on the way out.
         let _ = self.store.save();
 
+        // Refresh the gap-fill manifest the snapshot builder reads to
+        // cross-link driving-hole clips back into RecentClips for
+        // continuous playback. Rebuilt from the routes table every pass so
+        // it self-heals on already-processed devices (the fills are already
+        // rows) as well as fresh deploys. Best-effort — a manifest write
+        // failure only costs playback continuity, never drive data.
+        if let Err(e) = self.update_gapfill_manifest() {
+            warn!("gap-fill manifest update failed: {}", e);
+        }
+
         // Mirror drive data to a mounted CIFS/NFS archive — the counterpart
         // of post-archive-process.sh's rsync/rclone sync blocks (the Go
         // server did this in SyncToArchive; the call site was lost in the
@@ -422,6 +432,53 @@ impl Processor {
             .into_iter()
             .map(|i| cands[i].1.to_string())
             .collect())
+    }
+
+    /// Rewrite `<clip_dir>/../.gapfill_recent_links` — the manifest of
+    /// event-clip timestamps the snapshot builder cross-links back into
+    /// RecentClips for continuous drive playback. Derived from the routes
+    /// table (every Saved/Sentry route file is, by construction, a
+    /// hole-fill), so it converges to the correct set regardless of when
+    /// the fill happened. Skips the write when unchanged to avoid churn.
+    fn update_gapfill_manifest(&self) -> Result<()> {
+        let manifest = match std::path::Path::new(&self.clip_dir).parent() {
+            Some(p) => p.join(".gapfill_recent_links"),
+            None => return Ok(()),
+        };
+
+        // Reduce each gap-fill route file to its YYYY-MM-DD_HH-MM-SS stamp
+        // (shared by every camera of that minute), sorted + deduped.
+        let mut stamps: Vec<String> = self
+            .store
+            .gap_fill_files()?
+            .iter()
+            .filter_map(|f| {
+                f.rsplit('/')
+                    .next()
+                    .filter(|b| b.len() >= 19)
+                    .map(|b| b[..19].to_string())
+            })
+            .collect();
+        stamps.sort();
+        stamps.dedup();
+
+        let body = if stamps.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", stamps.join("\n"))
+        };
+
+        // No-op when the content is identical (the common case once the
+        // gap is filled) so we don't rewrite the file every archive cycle.
+        if std::fs::read_to_string(&manifest).unwrap_or_default() == body {
+            return Ok(());
+        }
+        std::fs::write(&manifest, body)?;
+        info!(
+            "gap-fill manifest: {} clip timestamp(s) flagged for RecentClips playback",
+            stamps.len()
+        );
+        Ok(())
     }
 }
 

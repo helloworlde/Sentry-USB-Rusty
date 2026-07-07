@@ -22,6 +22,7 @@
 //!   `[drive-map] RecentClips directory not found at /mutable/TeslaCam/RecentClips, skipping`
 //! every cycle and the iOS app sees an empty timeline.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -39,6 +40,46 @@ const REBUILD_FLAG: &str = "/mutable/.rebuild_snapshot_symlinks";
 const PURGE_MARKER: &str = "/mutable/.recentclips_events_purged";
 
 const TESLACAM: &str = "/mutable/TeslaCam";
+
+/// Manifest of Saved/Sentry event clips the drive-map processor spliced
+/// into a drive to fill a genuine RecentClips recording hole (car was
+/// driving, an event triggered, and the footage landed in an event
+/// folder's pre-roll instead of RecentClips). One `YYYY-MM-DD_HH-MM-SS`
+/// timestamp per line. The drives crate rewrites it from the routes table
+/// on every process pass (self-healing). We consult it here so those
+/// clips — and ONLY those — are cross-linked back into RecentClips (for
+/// continuous drive playback) and exempted from the purge. Everything
+/// else stays out of RecentClips, so Chad's dedup (parked events no
+/// longer flood the Recent tab) is preserved.
+const GAPFILL_MANIFEST: &str = "/mutable/.gapfill_recent_links";
+
+/// Load the gap-fill manifest into a set of clip timestamps. Missing or
+/// unreadable ⇒ empty set (no cross-links, no exemptions — exactly the
+/// pre-manifest behaviour), so this is safe on boards that never had a
+/// drive-data gap.
+fn load_gapfill_stamps() -> HashSet<String> {
+    match std::fs::read_to_string(GAPFILL_MANIFEST) {
+        Ok(s) => s
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
+        Err(_) => HashSet::new(),
+    }
+}
+
+/// The `YYYY-MM-DD_HH-MM-SS` timestamp prefix of a clip filename, shared
+/// by every camera angle of the same minute. Matching on this (not the
+/// full basename) means one manifest entry cross-links all cameras of
+/// that minute together.
+fn clip_stamp(name: &str) -> Option<&str> {
+    if name.len() >= 19 && looks_like_dated_clip(name) {
+        Some(&name[..19])
+    } else {
+        None
+    }
+}
 
 /// Create a snapshot of the cam disk plus all the symlink/TOC work the
 /// car-touchscreen + drive-map UI need.
@@ -167,7 +208,8 @@ pub async fn make_snapshot(skip_fsck: bool) -> Result<Option<String>> {
     // Self-guarded by a persistent marker so it runs once per device after
     // the update that stopped creating them, then never again.
     if !Path::new(PURGE_MARKER).exists() {
-        if let Err(e) = purge_event_links_in(&Path::new(TESLACAM).join("RecentClips")) {
+        let gapfill = load_gapfill_stamps();
+        if let Err(e) = purge_event_links_in(&Path::new(TESLACAM).join("RecentClips"), &gapfill) {
             warn!("purge_event_links_in: {}", e);
         }
         let _ = std::fs::write(PURGE_MARKER, b"done\n");
@@ -392,6 +434,11 @@ fn make_links_for_snapshot(cur_mnt: &str, final_mnt: &str) -> Result<()> {
     let _ = std::fs::create_dir_all(&saved);
     let _ = std::fs::create_dir_all(&sentry);
 
+    // Timestamps of event clips that fill a genuine driving hole — these
+    // (and only these) also get cross-linked into RecentClips below so the
+    // drive plays back continuously. Empty on boards with no gap.
+    let gapfill = load_gapfill_stamps();
+
     info!("Making links for {}, retargeted to {}", cur_mnt, final_mnt);
 
     // RecentClips: flat directory; date-bucket each file under YYYY-MM-DD.
@@ -431,6 +478,11 @@ fn make_links_for_snapshot(cur_mnt: &str, final_mnt: &str) -> Result<()> {
                         let target = retarget_path(&clip.path(), cur_mnt, final_mnt);
                         let _ = std::os::unix::fs::symlink(&target, &link);
                     }
+                    // Exception: a clip the drive-map flagged as filling a
+                    // driving hole IS cross-linked into RecentClips, so the
+                    // drive's video is continuous. Scoped to the manifest —
+                    // parked-event clips never qualify.
+                    maybe_gapfill_recent_link(&clip.path(), cur_mnt, final_mnt, &gapfill);
                 }
             }
         }
@@ -463,6 +515,9 @@ fn make_links_for_snapshot(cur_mnt: &str, final_mnt: &str) -> Result<()> {
                         let target = retarget_path(&clip.path(), cur_mnt, final_mnt);
                         let _ = std::os::unix::fs::symlink(&target, &link);
                     }
+                    // Scoped RecentClips cross-link for driving-hole fills
+                    // (see the SavedClips loop for the rationale).
+                    maybe_gapfill_recent_link(&clip.path(), cur_mnt, final_mnt, &gapfill);
                 }
             }
         }
@@ -515,6 +570,45 @@ fn link_clip_into_recents(file: &Path, cur_mnt: &str, final_mnt: &str) {
     }
 }
 
+/// Cross-link an event clip into `RecentClips/<date>/` IFF its timestamp
+/// is in the gap-fill manifest — the drive-map flagged it as filling a
+/// genuine driving hole. Same link shape as [`link_clip_into_recents`]
+/// (retargeted symlink under the day bucket), so the Viewer and drive
+/// player treat it as continuous footage. No-op for every other event
+/// clip, which keeps parked-event footage out of RecentClips.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn maybe_gapfill_recent_link(
+    clip: &Path,
+    cur_mnt: &str,
+    final_mnt: &str,
+    gapfill: &HashSet<String>,
+) {
+    if gapfill.is_empty() {
+        return;
+    }
+    let filename = match clip.file_name().map(|s| s.to_string_lossy().to_string()) {
+        Some(f) => f,
+        None => return,
+    };
+    let stamp = match clip_stamp(&filename) {
+        Some(s) => s,
+        None => return,
+    };
+    if !gapfill.contains(stamp) {
+        return;
+    }
+    let filedate = &filename[..10];
+    let recents = format!("{}/RecentClips/{}", TESLACAM, filedate);
+    let _ = std::fs::create_dir_all(&recents);
+    let link = format!("{}/{}", recents, filename);
+    let _ = std::fs::remove_file(&link);
+    #[cfg(unix)]
+    {
+        let target = retarget_path(clip, cur_mnt, final_mnt);
+        let _ = std::os::unix::fs::symlink(&target, &link);
+    }
+}
+
 /// One-time cleanup mirroring the bash `purge_event_links_from_recentclips`.
 ///
 /// Earlier versions cross-linked every Saved/Sentry event clip into
@@ -527,7 +621,7 @@ fn link_clip_into_recents(file: &Path, cur_mnt: &str, final_mnt: &str) {
 /// through the autofs snapshot mount). Date folders left empty afterwards
 /// (days that held only events) are pruned. Idempotent: a second run finds
 /// nothing to remove.
-fn purge_event_links_in(recents_root: &Path) -> Result<()> {
+fn purge_event_links_in(recents_root: &Path, gapfill: &HashSet<String>) -> Result<()> {
     if !recents_root.is_dir() {
         return Ok(());
     }
@@ -547,6 +641,19 @@ fn purge_event_links_in(recents_root: &Path) -> Result<()> {
         if let Ok(clips) = std::fs::read_dir(&date_dir) {
             for clip in clips.flatten() {
                 let path = clip.path();
+                // A driving-hole fill is a legitimate RecentClips entry even
+                // though it targets an event folder — keep it (it's what
+                // makes the drive play back continuously). Everything else
+                // targeting Saved/Sentry is a stray cross-link.
+                if let Some(stamp) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(clip_stamp)
+                {
+                    if gapfill.contains(stamp) {
+                        continue;
+                    }
+                }
                 // Only symlinks are candidates. Read the stored target
                 // without resolving it (symlink_metadata avoids following).
                 let is_symlink = std::fs::symlink_metadata(&path)
@@ -830,7 +937,7 @@ mod tests {
         )
         .unwrap();
 
-        purge_event_links_in(recents).unwrap();
+        purge_event_links_in(recents, &HashSet::new()).unwrap();
 
         // Event-only day pruned entirely.
         assert!(!only_events.exists(), "event-only date folder should be removed");
@@ -863,15 +970,62 @@ mod tests {
         let recents = root.path().join("RecentClips");
 
         // Missing root: returns Ok with nothing to do.
-        purge_event_links_in(&recents).unwrap();
+        purge_event_links_in(&recents, &HashSet::new()).unwrap();
 
         // A real (non-symlink) clip file is left alone, and its folder
         // survives because it isn't empty.
         let day = recents.join("2026-06-22");
         std::fs::create_dir_all(&day).unwrap();
         std::fs::write(day.join("real.mp4"), b"x").unwrap();
-        purge_event_links_in(&recents).unwrap();
+        purge_event_links_in(&recents, &HashSet::new()).unwrap();
         assert!(day.join("real.mp4").exists());
+    }
+
+    /// A gap-fill cross-link (event target, but manifest-flagged as filling
+    /// a driving hole) must SURVIVE the purge, while an ordinary event
+    /// cross-link on the same day is still removed. This is what keeps the
+    /// drive's video continuous without re-flooding the Recent tab.
+    #[cfg(unix)]
+    #[test]
+    fn purge_event_links_in_keeps_gapfill_exempt_links() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let root = TempDir::new().unwrap();
+        let recents = root.path();
+
+        let day = recents.join("2026-07-05");
+        std::fs::create_dir_all(&day).unwrap();
+
+        // Driving-hole fill: targets SentryClips but is in the manifest.
+        let gap_link = day.join("2026-07-05_16-03-46-front.mp4");
+        symlink(
+            "/backingfiles/snapshots/snap-000515/mnt/TeslaCam/SentryClips/2026-07-05_16-12-51/2026-07-05_16-03-46-front.mp4",
+            &gap_link,
+        )
+        .unwrap();
+
+        // Ordinary event cross-link the same day: NOT in the manifest.
+        let stray = day.join("2026-07-05_20-00-00-front.mp4");
+        symlink(
+            "/backingfiles/snapshots/snap-000515/mnt/TeslaCam/SentryClips/2026-07-05_20-00-00/2026-07-05_20-00-00-front.mp4",
+            &stray,
+        )
+        .unwrap();
+
+        let mut gapfill = HashSet::new();
+        gapfill.insert("2026-07-05_16-03-46".to_string());
+
+        purge_event_links_in(recents, &gapfill).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&gap_link).is_ok(),
+            "manifest-flagged driving-hole fill must survive the purge",
+        );
+        assert!(
+            std::fs::symlink_metadata(&stray).is_err(),
+            "ordinary event cross-link must still be purged",
+        );
     }
 }
 

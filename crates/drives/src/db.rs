@@ -625,6 +625,24 @@ impl DriveStore {
         Ok(f(&routes))
     }
 
+    /// Files of every route row that lives in an event folder — i.e. the
+    /// Saved/Sentry clips the gap-fill spliced into a drive to cover a
+    /// RecentClips recording hole. Normal drive routes are keyed under
+    /// `RecentClips/`, so this returns exactly the gap-fill set. The
+    /// snapshot builder reads a manifest derived from this to cross-link
+    /// those clips back into RecentClips for continuous playback.
+    pub fn gap_fill_files(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT file FROM routes \
+             WHERE file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        Ok(rows)
+    }
+
     /// Wipe routes + processed_files + drive_tags and bulk-insert `data`.
     /// Used by `POST /api/drives/data/upload` to restore a previously-
     /// downloaded `drive-data.json`.
