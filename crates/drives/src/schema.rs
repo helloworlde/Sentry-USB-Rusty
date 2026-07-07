@@ -522,6 +522,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // scans wrote. Gated on the stored schema_version so we only pay the
     // table-scan cost during the one upgrade-to-v5 open. Fresh DBs
     // (schema_version = None) have no rows to delete and skip the work.
+    // NOTE: event rows can now be legitimate gap-fills
+    // (processor::scan_event_gap_fill) — future cleanups must not
+    // blanket-delete SavedClips/SentryClips rows.
     let stored_version_for_v5 = meta_get(conn, "schema_version")?;
     let needs_v5_cleanup = matches!(
         stored_version_for_v5.as_deref(),

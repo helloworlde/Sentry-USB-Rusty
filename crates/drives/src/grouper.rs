@@ -22,6 +22,40 @@ use crate::types::*;
 /// Time gap (ms) that splits clips into separate drives (5 minutes).
 const DRIVE_GAP_MS: i64 = 5 * 60 * 1000;
 
+/// Minimum gap (ms) between consecutive RecentClips timestamps that counts
+/// as a recording hole (≥1 missing minute-clip; normal spacing is ~60s).
+pub(crate) const GAP_FILL_MIN_MS: i64 = 90 * 1000;
+
+/// Max hole (ms) event clips may fill, and the max distance a chained
+/// edge fill may extend past the nearest RecentClips clip. Sentry-covered
+/// dropouts run long — the car parked, so the gap spans the arrival + a
+/// chain of ~10-min pre-roll events (real data: 9-19 min). Wider than
+/// DRIVE_GAP_MS on purpose; the coverage requirement (an event clip must
+/// exist for each filled minute) is what actually bounds the fill. Beyond
+/// this it's a genuine multi-drive boundary, not a recording dropout.
+pub(crate) const GAP_FILL_MAX_MS: i64 = 30 * 60 * 1000;
+
+/// Chain hop window (ms): an event clip is proximity-eligible when it sits
+/// within this of a RecentClips clip or of another eligible event clip.
+/// Event pre-roll segments run ~60-77 s apart, but real chains show
+/// intra-event gaps up to ~152 s (July 4 data), so one clip length plus
+/// generous slack. Anything further is not a continuation of surrounding
+/// footage.
+pub(crate) const GAP_FILL_ADJ_MS: i64 = 3 * 60 * 1000;
+
+/// Duplicate window (ms): an event clip whose timestamp falls within this
+/// AFTER a RecentClips clip (or after an already-kept event candidate) is
+/// the same recorder segment wearing a different path — Tesla stamps the
+/// twin 0-1 s apart in practice. One-sided on purpose: a clip shortly
+/// BEFORE the next RecentClips clip is the event pre-roll's final segment,
+/// truncated at the trigger, and carries unique hole-tail footage.
+pub(crate) const GAP_FILL_DUP_MS: i64 = 30 * 1000;
+
+/// Speed (m/s) above which a clip counts as containing driving even when
+/// its gear telemetry is missing or reads Park throughout (~1.1 mph;
+/// reverse reports negative speeds, callers compare on abs()).
+pub(crate) const GAP_FILL_MIN_SPEED_MPS: f32 = 0.5;
+
 /// Minimum Park duration (seconds) that ends the current drive within a clip.
 const PARK_GAP_SECONDS: f64 = 2.0;
 
@@ -266,7 +300,13 @@ pub fn build_single_drive_from_clips(
     let mut timed: Vec<TimedRoute> = routes
         .iter()
         .filter_map(|r| {
-            parse_file_timestamp(&r.file).map(|ts| TimedRoute {
+            // parse_clip_timestamp (basename), NOT parse_file_timestamp:
+            // gap-fill routes are keyed at event-folder paths
+            // (SentryClips/<event-ts>/<clip-ts>-front.mp4) whose folder
+            // timestamp a left-to-right scan would win, placing the clip at
+            // the event time instead of its own — a phantom gap in the
+            // drive's point/speed timeline.
+            parse_clip_timestamp(&r.file).map(|ts| TimedRoute {
                 route: r.clone(),
                 timestamp: ts,
             })
@@ -287,9 +327,248 @@ pub fn build_single_drive_from_clips(
 /// (`SavedClips/` or `SentryClips/`). The `replace('\\', "/")` handles
 /// drive-data.json imports that came from a Windows export (Sentry-Drive
 /// writes backslashes in its file paths).
-fn is_event_folder_path(file: &str) -> bool {
+pub(crate) fn is_event_folder_path(file: &str) -> bool {
     let norm = file.replace('\\', "/");
     norm.starts_with("SavedClips/") || norm.starts_with("SentryClips/")
+}
+
+// ---------------------------------------------------------------------------
+// Internal: event-clip gap-fill
+//
+// The processor only ingests RecentClips, so a hole in the continuous
+// recording becomes a hole in the drive route — even when the same minute
+// clips exist inside a SavedClips/SentryClips event folder (Tesla events
+// carry a ~10-minute pre-roll). Gap-fill admits event clips in three
+// shapes:
+//   interior — timestamp strictly inside a RecentClips hole (a clip on
+//              both sides, gap ≤ GAP_FILL_MAX_MS);
+//   trailing — the drive ran PAST its last RecentClips clip into an event
+//              pre-roll before parking (no clip after, so no "hole");
+//   leading  — departure footage that only made an event pre-roll before
+//              the first RecentClips clip.
+// Edge shapes are admitted by chaining: the clip must sit within
+// GAP_FILL_ADJ_MS of a RecentClips clip or of another eligible event clip,
+// with the whole chain anchored to RecentClips and capped at
+// GAP_FILL_MAX_MS from the nearest anchor. On top of proximity, admission
+// is DRIVING-GATED wherever SEI is available: a clip whose telemetry shows
+// no movement (gear Park throughout, speed ~0) is never admitted, so a
+// parked car's sentry recordings — even ones minutes after a drive ended —
+// stay out of the drive list and out of the playback manifest. Everything
+// else in the event folders (parked recordings, duplicates of RecentClips
+// clips, isolated clusters with no adjacent driving) stays filtered.
+// ---------------------------------------------------------------------------
+
+/// Clip timestamp parsed from the FILENAME component only. Event paths
+/// embed the event-folder timestamp first (`SentryClips/<event_ts>/<clip_ts>-
+/// front.mp4`), which a left-to-right `parse_file_timestamp` would win.
+pub(crate) fn parse_clip_timestamp(file_path: &str) -> Option<NaiveDateTime> {
+    let norm = file_path.replace('\\', "/");
+    parse_file_timestamp(norm.rsplit('/').next().unwrap_or(&norm))
+}
+
+/// Holes in a SORTED continuous-clip timestamp sequence that qualify for
+/// event-clip gap-fill: wider than one missing minute-clip but within the
+/// fill cap — a longer gap is a park/drive boundary, not a recording
+/// dropout.
+pub(crate) fn fillable_holes(sorted_ts: &[NaiveDateTime]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    sorted_ts
+        .windows(2)
+        .filter(|w| {
+            let gap = (w[1] - w[0]).num_milliseconds();
+            gap > GAP_FILL_MIN_MS && gap <= GAP_FILL_MAX_MS
+        })
+        .map(|w| (w[0], w[1]))
+        .collect()
+}
+
+/// True when `ts` lies strictly inside one of `holes` (sorted,
+/// non-overlapping). Endpoints are occupied RecentClips slots and stay
+/// RecentClips-owned.
+pub(crate) fn ts_in_holes(holes: &[(NaiveDateTime, NaiveDateTime)], ts: NaiveDateTime) -> bool {
+    let i = holes.partition_point(|h| h.0 < ts);
+    i > 0 && ts < holes[i - 1].1
+}
+
+/// True when SEI telemetry shows the car moving: any non-Park gear frame
+/// or any speed sample above a crawl. All-Park + speed≈0 (or no telemetry
+/// at all — no positive evidence of driving) returns false.
+pub(crate) fn telemetry_has_driving(
+    gear_runs: &[GearRun],
+    gear_states: &[u8],
+    speeds: &[f32],
+    raw_park_count: u32,
+    raw_frame_count: u32,
+) -> bool {
+    gear_runs.iter().any(|r| r.gear != GEAR_PARK)
+        || gear_states.iter().any(|&g| g != GEAR_PARK)
+        || (gear_runs.is_empty()
+            && gear_states.is_empty()
+            && raw_frame_count > 0
+            && raw_park_count < raw_frame_count)
+        || speeds.iter().any(|&s| s.abs() > GAP_FILL_MIN_SPEED_MPS)
+}
+
+/// [`telemetry_has_driving`] over a full Route row.
+fn route_has_driving(r: &Route) -> bool {
+    telemetry_has_driving(
+        &r.gear_runs,
+        &r.gear_states,
+        &r.speeds,
+        r.raw_park_count,
+        r.raw_frame_count,
+    )
+}
+
+/// [`telemetry_has_driving`] over a stored route row: gear runs + raw
+/// frame counts + the pre-computed aggregate max speed (no per-frame
+/// arrays available post-storage). The single predicate the grouper's
+/// gap-fill admission AND the playback manifest (`Store::gap_fill_files`)
+/// both apply to stored rows, so the two never disagree on whether an
+/// event clip is driving.
+pub(crate) fn row_has_driving(
+    gear_runs: &[GearRun],
+    raw_park_count: u32,
+    raw_frame_count: u32,
+    max_speed_mps: f64,
+) -> bool {
+    telemetry_has_driving(gear_runs, &[], &[], raw_park_count, raw_frame_count)
+        || max_speed_mps > GAP_FILL_MIN_SPEED_MPS as f64
+}
+
+/// [`row_has_driving`] over a summary row.
+fn summary_has_driving(s: &RouteSummary) -> bool {
+    row_has_driving(
+        &s.gear_runs,
+        s.raw_park_count,
+        s.raw_frame_count,
+        s.aggregates.max_speed_mps,
+    )
+}
+
+/// An event clip proposed for gap-fill. `driving` is the SEI verdict:
+/// `Some(true)` = movement frames present, `Some(false)` = parked
+/// throughout (never admitted), `None` = not yet extracted (the
+/// processor's pre-extraction scan, which selects a timestamp-bounded
+/// superset and lets the post-extraction gate discard the parked ones).
+pub(crate) struct GapFillCandidate<'a> {
+    pub(crate) ts: NaiveDateTime,
+    pub(crate) file: &'a str,
+    pub(crate) driving: Option<bool>,
+}
+
+/// Timestamp-only wrapper around [`select_gap_fill`] for callers without
+/// SEI in hand (the processor's disk scan).
+pub(crate) fn select_gap_fill_events(
+    recent_sorted_ts: &[NaiveDateTime],
+    candidates: &[(NaiveDateTime, &str)],
+) -> Vec<usize> {
+    let cands: Vec<GapFillCandidate> = candidates
+        .iter()
+        .map(|&(ts, file)| GapFillCandidate { ts, file, driving: None })
+        .collect();
+    select_gap_fill(recent_sorted_ts, &cands)
+}
+
+/// Select which event clips fill RecentClips gaps. `recent_sorted_ts` is
+/// the sorted continuous-clip timeline. Returns indices into `candidates`.
+///
+/// Admission pipeline:
+/// 1. drop clips whose SEI says parked-only (`driving == Some(false)`);
+/// 2. drop duplicates of occupied RecentClips slots (timestamp within
+///    GAP_FILL_DUP_MS after a recent clip — Tesla stamps the Saved/Sentry
+///    twin of a segment 0-1 s later);
+/// 3. dedup overlapping candidates (lowest path wins within the dup
+///    window, so twins of the same minute never both land);
+/// 4. admit what remains if it lies strictly inside a RecentClips hole
+///    (interior) OR chains to the recent timeline: hops ≤ GAP_FILL_ADJ_MS
+///    through recent clips / other kept candidates, anchored to at least
+///    one recent clip, capped at GAP_FILL_MAX_MS from the nearest one
+///    (bounds trailing/leading fills; isolated event clusters have no
+///    anchor and never qualify).
+pub(crate) fn select_gap_fill(
+    recent_sorted_ts: &[NaiveDateTime],
+    candidates: &[GapFillCandidate],
+) -> Vec<usize> {
+    if recent_sorted_ts.is_empty() || candidates.is_empty() {
+        return Vec::new();
+    }
+    let holes = fillable_holes(recent_sorted_ts);
+
+    // Same recorder segment as an occupied RecentClips slot? One-sided:
+    // shortly-BEFORE-next-recent clips are truncated pre-roll tails that
+    // carry unique footage (see GAP_FILL_DUP_MS).
+    let dup_of_recent = |ts: NaiveDateTime| -> bool {
+        let i = recent_sorted_ts.partition_point(|&r| r <= ts);
+        i > 0 && (ts - recent_sorted_ts[i - 1]).num_milliseconds() <= GAP_FILL_DUP_MS
+    };
+    let nearest_recent_ms = |ts: NaiveDateTime| -> i64 {
+        let i = recent_sorted_ts.partition_point(|&r| r < ts);
+        let mut best = i64::MAX;
+        if i > 0 {
+            best = best.min((ts - recent_sorted_ts[i - 1]).num_milliseconds());
+        }
+        if i < recent_sorted_ts.len() {
+            best = best.min((recent_sorted_ts[i] - ts).num_milliseconds());
+        }
+        best
+    };
+
+    // Steps 1-3: eligibility, then dedup in (timestamp, path) order.
+    let mut order: Vec<usize> = (0..candidates.len())
+        .filter(|&i| candidates[i].driving != Some(false) && !dup_of_recent(candidates[i].ts))
+        .collect();
+    order.sort_by(|&a, &b| {
+        (candidates[a].ts, candidates[a].file).cmp(&(candidates[b].ts, candidates[b].file))
+    });
+    let mut kept: Vec<usize> = Vec::new();
+    for i in order {
+        if let Some(&last) = kept.last()
+            && (candidates[i].ts - candidates[last].ts).num_milliseconds() <= GAP_FILL_DUP_MS
+        {
+            continue;
+        }
+        kept.push(i);
+    }
+
+    // Step 4b: chain connectivity over the merged recent+kept timeline.
+    // Clusters are maximal runs whose consecutive gaps stay within
+    // GAP_FILL_ADJ_MS; a kept candidate is chained when its cluster holds
+    // at least one recent clip and it sits within GAP_FILL_MAX_MS of the
+    // nearest recent clip.
+    let mut merged: Vec<(NaiveDateTime, Option<usize>)> = recent_sorted_ts
+        .iter()
+        .map(|&t| (t, None))
+        .chain(kept.iter().enumerate().map(|(k, &i)| (candidates[i].ts, Some(k))))
+        .collect();
+    merged.sort_by_key(|&(t, _)| t);
+
+    let mut chained = vec![false; kept.len()];
+    let mut cluster_start = 0usize;
+    for idx in 0..=merged.len() {
+        let cluster_ends = idx == merged.len()
+            || (idx > 0
+                && (merged[idx].0 - merged[idx - 1].0).num_milliseconds() > GAP_FILL_ADJ_MS);
+        if !cluster_ends {
+            continue;
+        }
+        let cluster = &merged[cluster_start..idx];
+        if cluster.iter().any(|&(_, k)| k.is_none()) {
+            for &(ts, k) in cluster {
+                if let Some(k) = k
+                    && nearest_recent_ms(ts) <= GAP_FILL_MAX_MS
+                {
+                    chained[k] = true;
+                }
+            }
+        }
+        cluster_start = idx;
+    }
+
+    kept.iter()
+        .enumerate()
+        .filter(|&(k, &i)| ts_in_holes(&holes, candidates[i].ts) || chained[k])
+        .map(|(_, &i)| i)
+        .collect()
 }
 
 /// Dedup by normalized file path, parse timestamps, sort, split on 5-min gaps,
@@ -300,42 +579,38 @@ fn group_clips(routes: Vec<Route>) -> Vec<Vec<TimedRoute>> {
         return Vec::new();
     }
 
-    // Filter out routes that live under SavedClips/SentryClips event folders
-    // BEFORE dedup. These contain (a) clips that duplicate RecentClips data
-    // with a different path the dedup-by-path can't catch, and (b) parked
-    // Sentry-mode recordings the gear-state splitter would otherwise emit
-    // as a spurious "drive" bordering an actual trip. Mirrors the discovery
-    // filter in processor.rs::scan_dir and Sentry-Drive's process.js:91-94.
-    // Safety net for: pre-v5 DB rows the migration may have missed, and
-    // imports of a drive-data.json produced by an unfixed build.
+    // Partition off routes that live under SavedClips/SentryClips event
+    // folders BEFORE dedup. These contain (a) clips that duplicate
+    // RecentClips data with a different path the dedup-by-path can't catch,
+    // and (b) parked Sentry-mode recordings the gear-state splitter would
+    // otherwise emit as a spurious "drive" bordering an actual trip.
+    // Mirrors the discovery filter in processor.rs::scan_dir and
+    // Sentry-Drive's process.js:91-94. The only event routes admitted are
+    // gap-fills (see below); the rest are dropped exactly as before.
     let input_count = routes.len();
     let mut seen = HashMap::with_capacity(routes.len());
     let mut unique: Vec<Route> = Vec::with_capacity(routes.len());
+    let mut event_candidates: Vec<Route> = Vec::new();
     let mut filtered_event_folder = 0usize;
     for r in routes {
-        if is_event_folder_path(&r.file) {
-            filtered_event_folder += 1;
+        let norm = r.file.replace('\\', "/");
+        if seen.insert(norm, ()).is_some() {
             continue;
         }
-        let norm = r.file.replace('\\', "/");
-        if seen.insert(norm, ()).is_none() {
+        if is_event_folder_path(&r.file) {
+            event_candidates.push(r);
+        } else {
             unique.push(r);
         }
     }
     let unique_count = unique.len();
-    if filtered_event_folder > 0 {
-        info!(
-            "group_clips: filtered {} SavedClips/SentryClips route(s)",
-            filtered_event_folder
-        );
-    }
-    if unique_count + filtered_event_folder < input_count {
+    if unique_count + event_candidates.len() < input_count {
         warn!(
-            "group_clips: dedup dropped {} duplicate-path route(s) (input={} unique={} event_filtered={})",
-            input_count - unique_count - filtered_event_folder,
+            "group_clips: dedup dropped {} duplicate-path route(s) (input={} unique={} event_candidates={})",
+            input_count - unique_count - event_candidates.len(),
             input_count,
             unique_count,
-            filtered_event_folder,
+            event_candidates.len(),
         );
     }
 
@@ -347,7 +622,7 @@ fn group_clips(routes: Vec<Route>) -> Vec<Vec<TimedRoute>> {
     let mut dropped_total: usize = 0;
     let mut timed: Vec<TimedRoute> = unique
         .into_iter()
-        .filter_map(|r| match parse_file_timestamp(&r.file) {
+        .filter_map(|r| match parse_clip_timestamp(&r.file) {
             Some(ts) => Some(TimedRoute { route: r, timestamp: ts }),
             None => {
                 dropped_total += 1;
@@ -374,6 +649,52 @@ fn group_clips(routes: Vec<Route>) -> Vec<Vec<TimedRoute>> {
     }
 
     timed.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    // Gap-fill: admit event routes whose CLIP timestamp (filename, not
+    // event-folder name) fills a RecentClips gap — interior hole or a
+    // driving-gated trailing/leading chain (see the section comment
+    // above). One route per timestamp; everything else stays filtered.
+    if !event_candidates.is_empty() {
+        let recent_ts: Vec<NaiveDateTime> = timed.iter().map(|t| t.timestamp).collect();
+        let mut cands: Vec<(NaiveDateTime, Option<Route>)> = Vec::new();
+        for r in event_candidates {
+            match parse_clip_timestamp(&r.file) {
+                Some(ts) => cands.push((ts, Some(r))),
+                None => filtered_event_folder += 1,
+            }
+        }
+        let keys: Vec<GapFillCandidate> = cands
+            .iter()
+            .map(|(ts, r)| {
+                let r = r.as_ref().unwrap();
+                GapFillCandidate {
+                    ts: *ts,
+                    file: r.file.as_str(),
+                    driving: Some(route_has_driving(r)),
+                }
+            })
+            .collect();
+        let mut gap_filled = 0usize;
+        for i in select_gap_fill(&recent_ts, &keys) {
+            let (ts, r) = &mut cands[i];
+            timed.push(TimedRoute { route: r.take().unwrap(), timestamp: *ts });
+            gap_filled += 1;
+        }
+        filtered_event_folder += cands.iter().filter(|(_, r)| r.is_some()).count();
+        if gap_filled > 0 {
+            timed.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+            info!(
+                "group_clips: gap-filled {} event route(s) into RecentClips holes",
+                gap_filled
+            );
+        }
+        if filtered_event_folder > 0 {
+            info!(
+                "group_clips: filtered {} SavedClips/SentryClips route(s)",
+                filtered_event_folder
+            );
+        }
+    }
     let timed_count = timed.len();
 
     // First pass: group by time gap
@@ -1741,11 +2062,21 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<SubClipSumm
         return Vec::new();
     }
 
+    // Event-folder rows are partitioned off like `group_clips` does — the
+    // processor only ingests them as gap-fills, but a drive-data.json
+    // import from an unfixed build can carry arbitrary event rows, so the
+    // same hole-gated admission applies here.
     let mut seen = HashMap::with_capacity(summaries.len());
     let mut unique: Vec<&RouteSummary> = Vec::with_capacity(summaries.len());
+    let mut event_candidates: Vec<&RouteSummary> = Vec::new();
     for s in summaries {
         let norm = s.file.replace('\\', "/");
-        if seen.insert(norm, ()).is_none() {
+        if seen.insert(norm, ()).is_some() {
+            continue;
+        }
+        if is_event_folder_path(&s.file) {
+            event_candidates.push(s);
+        } else {
             unique.push(s);
         }
     }
@@ -1753,7 +2084,7 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<SubClipSumm
     let mut timed: Vec<TimedSummary> = unique
         .into_iter()
         .filter_map(|s| {
-            let ts = parse_file_timestamp(&s.file)?;
+            let ts = parse_clip_timestamp(&s.file)?;
             Some(TimedSummary { summary: s, timestamp: ts })
         })
         .collect();
@@ -1761,6 +2092,33 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<SubClipSumm
         return Vec::new();
     }
     timed.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    // Gap-fill admission — see group_clips for the rationale. Clip
+    // timestamps come from the filename component (the event-folder name
+    // also matches the timestamp pattern and would win a full-path scan).
+    if !event_candidates.is_empty() {
+        let recent_ts: Vec<NaiveDateTime> = timed.iter().map(|t| t.timestamp).collect();
+        let cands: Vec<(NaiveDateTime, &RouteSummary)> = event_candidates
+            .into_iter()
+            .filter_map(|s| parse_clip_timestamp(&s.file).map(|ts| (ts, s)))
+            .collect();
+        let keys: Vec<GapFillCandidate> = cands
+            .iter()
+            .map(|(ts, s)| GapFillCandidate {
+                ts: *ts,
+                file: s.file.as_str(),
+                driving: Some(summary_has_driving(s)),
+            })
+            .collect();
+        let admitted = select_gap_fill(&recent_ts, &keys);
+        if !admitted.is_empty() {
+            for i in admitted {
+                let (ts, s) = cands[i];
+                timed.push(TimedSummary { summary: s, timestamp: ts });
+            }
+            timed.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        }
+    }
 
     // Time-gap split.
     let mut time_groups: Vec<Vec<TimedSummary>> = Vec::new();
@@ -2551,6 +2909,34 @@ mod tests {
     }
 
     #[test]
+    fn test_build_single_drive_dates_gapfill_by_clip_not_event_folder() {
+        // Regression: a gap-fill clip lives at an event-folder path whose
+        // FOLDER timestamp (12:40:00) is 38 min after the clip's own time
+        // (12:02:00). build_single_drive_from_clips must date it by the clip
+        // (basename) time — a left-to-right path scan grabs the folder time
+        // first and drops the clip's points ~38 min late, blowing a phantom
+        // gap in the drive's speed timeline (real 4C+ bug, drive 241).
+        let native = test_route(
+            "RecentClips/2026-01-15/2026-01-15_12-00-00-front.mp4",
+            vec![[37.0, -122.0]],
+        );
+        let gapfill = test_route(
+            "SentryClips/2026-01-15_12-40-00/2026-01-15_12-02-00-front.mp4",
+            vec![[37.02, -122.0]],
+        );
+        let drive =
+            build_single_drive_from_clips(&[native, gapfill], 0, &HashMap::new()).expect("drive");
+        assert_eq!(drive.clip_count, 2);
+        let max_t = drive.points.iter().map(|p| p[2]).fold(0.0_f64, f64::max);
+        // Clip time (12:02) => ~120 000 ms. Event-folder time (12:40) =>
+        // ~2 280 000 ms. Anything past 5 min means the old path-scan bug.
+        assert!(
+            max_t < 300_000.0,
+            "gap-fill clip placed at {max_t} ms — expected ~120 000 (clip time), not the event-folder time",
+        );
+    }
+
+    #[test]
     fn test_distance_from_summary_clips_includes_inter_clip_gap() {
         let mut a1 = RouteAggregates::default();
         a1.distance_m = 100.0;
@@ -2859,6 +3245,411 @@ mod tests {
                 clip.route.file
             );
         }
+    }
+
+    // ── Event-clip gap-fill tests ────────────────────────────────────
+
+    fn dts(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn test_parse_clip_timestamp_uses_filename_component() {
+        // Event paths embed the event-folder timestamp FIRST — a full-path
+        // scan would return 18:46:39 instead of the clip's 18:35:39.
+        assert_eq!(
+            parse_clip_timestamp("SentryClips/2026-05-17_18-46-39/2026-05-17_18-35-39-front.mp4"),
+            Some(dts("2026-05-17 18:35:39"))
+        );
+        assert_eq!(
+            parse_clip_timestamp("SavedClips\\2026-05-17_18-47-59\\2026-05-17_18-47-34-front.mp4"),
+            Some(dts("2026-05-17 18:47:34"))
+        );
+        assert_eq!(
+            parse_clip_timestamp("RecentClips/2026-05-17/2026-05-17_18-47-34-front.mp4"),
+            Some(dts("2026-05-17 18:47:34"))
+        );
+        assert_eq!(parse_clip_timestamp("SentryClips/2026-05-17_18-46-39/event.json"), None);
+    }
+
+    #[test]
+    fn test_fillable_holes_bounds() {
+        // Normal 60s spacing → no hole. A 3-min and a 6-min gap are both
+        // fillable holes: sentry-covered dropouts run long (the car parked,
+        // so the gap spans arrival + a chain of ~10-min pre-roll events —
+        // real data shows 9-19 min). A 35-min gap exceeds GAP_FILL_MAX_MS →
+        // a genuine multi-drive boundary, not a recording dropout.
+        let seq = vec![
+            dts("2026-06-01 10:00:00"),
+            dts("2026-06-01 10:01:00"),
+            dts("2026-06-01 10:04:00"), // 3-min gap after 10:01
+            dts("2026-06-01 10:05:00"),
+            dts("2026-06-01 10:11:00"), // 6-min gap after 10:05
+            dts("2026-06-01 10:46:00"), // 35-min gap after 10:11 (> GAP_FILL_MAX_MS)
+        ];
+        let holes = fillable_holes(&seq);
+        assert_eq!(
+            holes,
+            vec![
+                (dts("2026-06-01 10:01:00"), dts("2026-06-01 10:04:00")),
+                (dts("2026-06-01 10:05:00"), dts("2026-06-01 10:11:00")),
+            ]
+        );
+        // Strict interior: endpoints are occupied RecentClips slots.
+        assert!(ts_in_holes(&holes, dts("2026-06-01 10:02:00")));
+        assert!(ts_in_holes(&holes, dts("2026-06-01 10:07:00"))); // inside the 6-min hole
+        assert!(!ts_in_holes(&holes, dts("2026-06-01 10:01:00")));
+        assert!(!ts_in_holes(&holes, dts("2026-06-01 10:04:00")));
+        assert!(!ts_in_holes(&holes, dts("2026-06-01 10:11:00")));
+        // The 35-min gap is a drive boundary, never fillable.
+        assert!(!ts_in_holes(&holes, dts("2026-06-01 10:30:00")));
+    }
+
+    #[test]
+    fn test_select_gap_fill_events_dedup() {
+        let recent = vec![
+            dts("2026-06-01 10:00:00"),
+            dts("2026-06-01 10:03:00"),
+        ];
+        // Same missing minute exists in both event folders (overlapping
+        // events) → exactly one winner, lowest path.
+        let cands = vec![
+            (dts("2026-06-01 10:01:00"), "SentryClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4"),
+            (dts("2026-06-01 10:01:00"), "SavedClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4"),
+            (dts("2026-06-01 10:02:00"), "SentryClips/2026-06-01_10-02-30/2026-06-01_10-02-00-front.mp4"),
+            // Outside any hole (parked recording) → rejected.
+            (dts("2026-06-01 09:30:00"), "SentryClips/2026-06-01_09-31-00/2026-06-01_09-30-00-front.mp4"),
+        ];
+        let mut picked: Vec<&str> =
+            select_gap_fill_events(&recent, &cands).into_iter().map(|i| cands[i].1).collect();
+        picked.sort();
+        assert_eq!(
+            picked,
+            vec![
+                "SavedClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4",
+                "SentryClips/2026-06-01_10-02-30/2026-06-01_10-02-00-front.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_group_clips_gap_fills_event_route_into_hole() {
+        // RecentClips drive with one missing minute (10:01); the same
+        // minute exists in a SentryClips pre-roll. It must be admitted
+        // once; the duplicate of an occupied slot and the parked clip
+        // must stay filtered.
+        let routes = vec![
+            test_route("RecentClips/2026-06-01/2026-06-01_10-00-00-front.mp4", vec![[37.0, -122.0]]),
+            test_route("RecentClips/2026-06-01/2026-06-01_10-02-00-front.mp4", vec![[37.002, -122.0]]),
+            test_route("RecentClips/2026-06-01/2026-06-01_10-03-00-front.mp4", vec![[37.003, -122.0]]),
+            // Fills the hole.
+            test_route("SentryClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4", vec![[37.001, -122.0]]),
+            // Duplicate of the occupied 10:02 slot → filtered.
+            test_route("SavedClips/2026-06-01_10-02-30/2026-06-01_10-02-00-front.mp4", vec![[37.002, -122.0]]),
+            // Parked recording hours earlier, no surrounding drive → filtered.
+            park_route("SentryClips/2026-06-01_02-00-00/2026-06-01_01-59-00-front.mp4", 37.0),
+        ];
+        let groups = group_clips(routes);
+        assert_eq!(groups.len(), 1, "expected a single gap-filled drive");
+        let files: Vec<&str> = groups[0].iter().map(|c| c.route.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec![
+                "RecentClips/2026-06-01/2026-06-01_10-00-00-front.mp4",
+                "SentryClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4",
+                "RecentClips/2026-06-01/2026-06-01_10-02-00-front.mp4",
+                "RecentClips/2026-06-01/2026-06-01_10-03-00-front.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_group_summary_clips_gap_fill_and_event_filter() {
+        let mk = |file: &str| RouteSummary {
+            file: file.to_string(),
+            date: "2026-06-01".to_string(),
+            raw_park_count: 0,
+            raw_frame_count: 60,
+            gear_runs: vec![GearRun { gear: 1, frames: 60 }],
+            aggregates: RouteAggregates::default(),
+            source: None,
+            external_signature: None,
+            telemetry: Default::default(),
+        };
+        let summaries = vec![
+            mk("2026-06-01/2026-06-01_10-00-00-front.mp4"),
+            mk("2026-06-01/2026-06-01_10-02-00-front.mp4"),
+            mk("SentryClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4"),
+            // Parked event row far from any drive → filtered.
+            mk("SentryClips/2026-06-01_02-00-00/2026-06-01_01-59-00-front.mp4"),
+        ];
+        let groups = group_summary_clips(&summaries);
+        assert_eq!(groups.len(), 1);
+        let files: Vec<&str> = groups[0].iter().map(|c| c.summary.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec![
+                "2026-06-01/2026-06-01_10-00-00-front.mp4",
+                "SentryClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4",
+                "2026-06-01/2026-06-01_10-02-00-front.mp4",
+            ]
+        );
+    }
+
+    // ── Comprehensive gap-fill: driving gate + trailing/leading chains ──
+
+    #[test]
+    fn test_telemetry_has_driving() {
+        let d = |g| GearRun { gear: g, frames: 30 };
+        // Non-park gear run → driving.
+        assert!(telemetry_has_driving(&[d(GEAR_PARK), d(1)], &[], &[], 0, 0));
+        // All-park gear runs, no speed → parked.
+        assert!(!telemetry_has_driving(&[d(GEAR_PARK)], &[GEAR_PARK; 60], &[0.0; 60], 60, 60));
+        // Reverse reports NEGATIVE speeds — abs() must count as driving.
+        assert!(telemetry_has_driving(&[d(GEAR_PARK)], &[], &[-2.0], 0, 0));
+        // Crawl below threshold is not driving.
+        assert!(!telemetry_has_driving(&[], &[], &[0.2], 0, 0));
+        // Legacy row: raw counts only, some non-park frames.
+        assert!(telemetry_has_driving(&[], &[], &[], 40, 60));
+        // No telemetry at all: no positive evidence → not driving.
+        assert!(!telemetry_has_driving(&[], &[], &[], 0, 0));
+    }
+
+    #[test]
+    fn test_gap_fill_trailing_chain_admits_driving_rejects_parked_tail() {
+        // Drive 236 shape (Jul 4): RecentClips end mid-drive; the rest of
+        // the drive lives in an event pre-roll, followed by parked pre-roll
+        // clips after the car stopped. Driving clips chain in; parked ones
+        // never do, so the fill can't bleed into the parked sentry bloat.
+        let routes = vec![
+            test_route("RecentClips/2026-07-04/2026-07-04_20-42-50-front.mp4", vec![[37.0, -122.0]]),
+            test_route("RecentClips/2026-07-04/2026-07-04_20-43-50-front.mp4", vec![[37.001, -122.0]]),
+            // Trailing fill: drive continues in the pre-roll.
+            test_route("SentryClips/2026-07-04_20-55-50/2026-07-04_20-44-51-front.mp4", vec![[37.002, -122.0]]),
+            test_route("SentryClips/2026-07-04_20-55-50/2026-07-04_20-45-51-front.mp4", vec![[37.003, -122.0]]),
+            // Parked pre-roll clips after the car stopped → excluded.
+            park_route("SentryClips/2026-07-04_20-55-50/2026-07-04_20-46-52-front.mp4", 37.003),
+            park_route("SentryClips/2026-07-04_20-55-50/2026-07-04_20-47-52-front.mp4", 37.003),
+        ];
+        let groups = group_clips(routes);
+        assert_eq!(groups.len(), 1, "expected a single extended drive");
+        let files: Vec<&str> = groups[0].iter().map(|c| c.route.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec![
+                "RecentClips/2026-07-04/2026-07-04_20-42-50-front.mp4",
+                "RecentClips/2026-07-04/2026-07-04_20-43-50-front.mp4",
+                "SentryClips/2026-07-04_20-55-50/2026-07-04_20-44-51-front.mp4",
+                "SentryClips/2026-07-04_20-55-50/2026-07-04_20-45-51-front.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_gap_fill_leading_chain_admits_departure_footage() {
+        // Departure footage that only made an event pre-roll before the
+        // first RecentClips clip: chains backwards off the drive start.
+        let routes = vec![
+            test_route("SentryClips/2026-06-27_10-05-00/2026-06-27_09-58-10-front.mp4", vec![[37.0, -122.0]]),
+            test_route("SentryClips/2026-06-27_10-05-00/2026-06-27_09-59-10-front.mp4", vec![[37.001, -122.0]]),
+            test_route("RecentClips/2026-06-27/2026-06-27_10-00-10-front.mp4", vec![[37.002, -122.0]]),
+            test_route("RecentClips/2026-06-27/2026-06-27_10-01-10-front.mp4", vec![[37.003, -122.0]]),
+        ];
+        let groups = group_clips(routes);
+        assert_eq!(groups.len(), 1, "expected a single drive starting at the leading fill");
+        assert_eq!(groups[0].len(), 4);
+        assert_eq!(
+            groups[0][0].route.file,
+            "SentryClips/2026-06-27_10-05-00/2026-06-27_09-58-10-front.mp4"
+        );
+    }
+
+    #[test]
+    fn test_gap_fill_isolated_driving_cluster_stays_out() {
+        // Driving footage with NO adjacent RecentClips anchor (e.g. a
+        // weeks-old event cluster after the continuous footage rotated
+        // off) must stay out — proximity bound, independent of the
+        // driving gate.
+        let routes = vec![
+            test_route("RecentClips/2026-05-28/2026-05-28_10-00-00-front.mp4", vec![[37.0, -122.0]]),
+            test_route("SentryClips/2026-05-28_14-05-00/2026-05-28_14-00-00-front.mp4", vec![[37.1, -122.1]]),
+            test_route("SentryClips/2026-05-28_14-05-00/2026-05-28_14-01-00-front.mp4", vec![[37.1, -122.1]]),
+        ];
+        let groups = group_clips(routes);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 1);
+        assert!(groups[0][0].route.file.starts_with("RecentClips/"));
+    }
+
+    #[test]
+    fn test_select_gap_fill_chain_cap_and_hop_window() {
+        let recent = vec![dts("2026-06-01 10:00:00")];
+        let mk = |s: &str| dts(s);
+        let files: Vec<(NaiveDateTime, String)> = vec![
+            // Chained trailing clips every ~61s...
+            (mk("2026-06-01 10:01:01"), "a"),
+            (mk("2026-06-01 10:02:02"), "b"),
+            // ...across a real-data intra-chain gap (~152s ≤ 3-min hop)...
+            (mk("2026-06-01 10:04:34"), "c"),
+            // ...far link still inside the 30-min cap...
+            (mk("2026-06-01 10:07:00"), "d"),
+            // Beyond a 3-min hop from anything → chain broken.
+            (mk("2026-06-01 10:12:00"), "e"),
+        ]
+        .into_iter()
+        .map(|(ts, n)| (ts, format!("SentryClips/2026-06-01_10-20-00/{}-front.mp4", n)))
+        .collect();
+        let cands: Vec<GapFillCandidate> = files
+            .iter()
+            .map(|(ts, f)| GapFillCandidate { ts: *ts, file: f.as_str(), driving: Some(true) })
+            .collect();
+        let picked = select_gap_fill(&recent, &cands);
+        assert_eq!(picked, vec![0, 1, 2, 3], "chain must stop at the broken hop");
+
+        // Cap: a chain of driving clips can't extend past GAP_FILL_MAX_MS
+        // from the nearest RecentClips clip.
+        let long: Vec<(NaiveDateTime, String)> = (1..=35)
+            .map(|m| {
+                (
+                    dts("2026-06-01 10:00:00") + chrono::Duration::seconds(m * 61),
+                    format!("SentryClips/2026-06-01_11-00-00/clip{:02}-front.mp4", m),
+                )
+            })
+            .collect();
+        let cands: Vec<GapFillCandidate> = long
+            .iter()
+            .map(|(ts, f)| GapFillCandidate { ts: *ts, file: f.as_str(), driving: Some(true) })
+            .collect();
+        let picked = select_gap_fill(&recent, &cands);
+        assert!(!picked.is_empty());
+        for &i in &picked {
+            assert!(
+                (cands[i].ts - recent[0]).num_milliseconds() <= GAP_FILL_MAX_MS,
+                "{} exceeds the chain cap",
+                cands[i].file
+            );
+        }
+        assert!(picked.len() < cands.len(), "cap must cut the tail of the chain");
+    }
+
+    #[test]
+    fn test_select_gap_fill_rejects_recent_twin_and_overlap_dup() {
+        // Tesla stamps the Saved/Sentry twin of an occupied segment 0-1 s
+        // after the RecentClips original (drive 236: 20:44:50 vs
+        // 20:44:51) — a duplicate, never a fill. A second candidate
+        // within the dup window of a kept one is an overlapping segment
+        // of the same footage — one winner.
+        let recent = vec![dts("2026-07-04 20:43:50"), dts("2026-07-04 20:44:50")];
+        let cands = vec![
+            GapFillCandidate {
+                ts: dts("2026-07-04 20:44:51"), // 1s after occupied slot → twin
+                file: "SentryClips/e/2026-07-04_20-44-51-front.mp4",
+                driving: Some(true),
+            },
+            GapFillCandidate {
+                ts: dts("2026-07-04 20:45:51"), // real trailing fill
+                file: "SentryClips/e/2026-07-04_20-45-51-front.mp4",
+                driving: Some(true),
+            },
+            GapFillCandidate {
+                ts: dts("2026-07-04 20:46:11"), // 20s after the kept fill → overlap dup
+                file: "SavedClips/e2/2026-07-04_20-46-11-front.mp4",
+                driving: Some(true),
+            },
+        ];
+        assert_eq!(select_gap_fill(&recent, &cands), vec![1]);
+    }
+
+    #[test]
+    fn test_select_gap_fill_events_superset_without_sei() {
+        // Processor-side scan has no SEI yet: trailing/leading candidates
+        // are selected on timestamps alone (the post-extraction driving
+        // gate discards the parked ones later); isolated clusters still
+        // never qualify.
+        let recent = vec![dts("2026-06-01 10:00:00"), dts("2026-06-01 10:01:00")];
+        let cands = vec![
+            (dts("2026-06-01 10:02:01"), "SentryClips/e/2026-06-01_10-02-01-front.mp4"),
+            (dts("2026-06-01 09:58:30"), "SentryClips/e/2026-06-01_09-58-30-front.mp4"),
+            (dts("2026-06-01 12:00:00"), "SentryClips/far/2026-06-01_12-00-00-front.mp4"),
+        ];
+        let mut picked = select_gap_fill_events(&recent, &cands);
+        picked.sort();
+        assert_eq!(picked, vec![0, 1], "trailing+leading in, isolated out");
+    }
+
+    #[test]
+    fn test_gap_fill_trailing_clip_park_tail_is_trimmed() {
+        // The last admitted trailing clip typically decelerates and parks
+        // mid-clip. The gear-state splitter must trim the drive at the
+        // Park transition — points from the parked tail don't survive.
+        let mut mixed = test_route(
+            "SentryClips/2026-07-04_20-55-50/2026-07-04_20-45-51-front.mp4",
+            (0..10).map(|i| [37.002 + i as f64 * 1e-4, -122.0]).collect(),
+        );
+        mixed.gear_runs = vec![
+            GearRun { gear: 1, frames: 30 },
+            GearRun { gear: GEAR_PARK, frames: 30 },
+        ];
+        mixed.gear_states = vec![1; 10];
+        mixed.speeds = vec![5.0; 10];
+        let routes = vec![
+            test_route("RecentClips/2026-07-04/2026-07-04_20-44-50-front.mp4", vec![[37.001, -122.0]]),
+            mixed,
+        ];
+        let groups = group_clips(routes);
+        assert_eq!(groups.len(), 1);
+        let fill = groups[0]
+            .iter()
+            .find(|c| c.route.file.starts_with("SentryClips/"))
+            .expect("trailing fill admitted");
+        assert_eq!(
+            fill.route.points.len(),
+            5,
+            "parked half of the trailing clip must be trimmed off"
+        );
+    }
+
+    #[test]
+    fn test_group_summary_clips_trailing_chain() {
+        let mk = |file: &str| RouteSummary {
+            file: file.to_string(),
+            date: "2026-07-04".to_string(),
+            raw_park_count: 0,
+            raw_frame_count: 60,
+            gear_runs: vec![GearRun { gear: 1, frames: 60 }],
+            aggregates: RouteAggregates::default(),
+            source: None,
+            external_signature: None,
+            telemetry: Default::default(),
+        };
+        let parked = |file: &str| RouteSummary {
+            file: file.to_string(),
+            date: "2026-07-04".to_string(),
+            raw_park_count: 60,
+            raw_frame_count: 60,
+            gear_runs: vec![GearRun { gear: GEAR_PARK, frames: 60 }],
+            aggregates: RouteAggregates::default(),
+            source: None,
+            external_signature: None,
+            telemetry: Default::default(),
+        };
+        let summaries = vec![
+            mk("2026-07-04/2026-07-04_20-43-50-front.mp4"),
+            mk("SentryClips/2026-07-04_20-55-50/2026-07-04_20-44-51-front.mp4"),
+            mk("SentryClips/2026-07-04_20-55-50/2026-07-04_20-45-51-front.mp4"),
+            parked("SentryClips/2026-07-04_20-55-50/2026-07-04_20-46-52-front.mp4"),
+        ];
+        let groups = group_summary_clips(&summaries);
+        assert_eq!(groups.len(), 1);
+        let files: Vec<&str> = groups[0].iter().map(|c| c.summary.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec![
+                "2026-07-04/2026-07-04_20-43-50-front.mp4",
+                "SentryClips/2026-07-04_20-55-50/2026-07-04_20-44-51-front.mp4",
+                "SentryClips/2026-07-04_20-55-50/2026-07-04_20-45-51-front.mp4",
+            ]
+        );
     }
 
     // ── Telemetry rollup tests ───────────────────────────────────────

@@ -17,7 +17,7 @@ use anyhow::Result;
 use chrono::{Local, TimeZone};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::grouper::parse_file_timestamp;
+use crate::grouper::parse_clip_timestamp;
 pub use crate::types::RouteTelemetryAggregates;
 
 /// Clip duration in seconds — must match `clip_duration_ms` in
@@ -28,7 +28,10 @@ const CLIP_WINDOW_SECS: i64 = 60;
 /// Returns `None` when the filename doesn't embed a parseable
 /// timestamp — pre-grouper / corrupted paths just skip telemetry.
 pub fn window_for_route_file(file: &str) -> Option<(i64, i64)> {
-    let naive = parse_file_timestamp(file)?;
+    // Basename parse: gap-fill routes live at event-folder paths whose
+    // folder timestamp a left-to-right scan would pick over the clip's own,
+    // matching telemetry against the wrong minute.
+    let naive = parse_clip_timestamp(file)?;
     // Tesla writes the filename using the car's local clock, and the
     // Pi writes telemetry samples using its own local clock — on the
     // same install these are the same zone, so reading both as

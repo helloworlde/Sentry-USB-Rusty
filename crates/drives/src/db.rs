@@ -95,7 +95,11 @@ const ARCHIVE_SYNC_SAMPLE_COUNT_KEY: &str = "archive_sync_sample_count";
 // to the numerically-stable atan2(haversine) form (calc.rs), fixing a
 // ~0.7% short-segment undercount on native dashcam drives. Per-drive
 // distance shifts up; stale v6 caches hold the undercounted mileage.
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "7";
+//
+// v8 (2026-07-06): event-clip gap-fill — the summary grouper now admits
+// SavedClips/SentryClips rows that fill RecentClips holes (and filters
+// all other event rows, which it previously passed through untouched).
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "8";
 
 /// Version tag for the per-clip aggregate FORMULA (compute_route_aggregates).
 /// Distinct from the cache algo version above: this gates a one-shot
@@ -297,6 +301,9 @@ impl DriveStore {
                 // Stray SavedClips/SentryClips routes pre-date the
                 // processor's event-folder skip; the grouper already hides
                 // them from drives, so deleting only trims dead rows.
+                // NOTE for future key-format bumps: event rows can now be
+                // legitimate gap-fills (processor::scan_event_gap_fill) —
+                // a canon-2 migration must not blanket-delete them.
                 let events = mg.execute(
                     "DELETE FROM routes \
                      WHERE file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%'",
@@ -616,6 +623,56 @@ impl DriveStore {
         let conn = self.conn.lock().unwrap();
         let routes = select_routes_by_files(&conn, files)?;
         Ok(f(&routes))
+    }
+
+    /// Files of every **driving** event-folder route row — i.e. the
+    /// Saved/Sentry clips the gap-fill spliced into a drive to cover a
+    /// RecentClips recording hole. Normal drive routes are keyed under
+    /// `RecentClips/`, so the LIKE clause returns exactly the gap-fill
+    /// set, and the driving filter drops any parked row that entered the
+    /// table before the `do_process` driving gate existed (older builds,
+    /// drive-data.json imports). The snapshot builder reads a manifest
+    /// derived from this to cross-link those clips back into RecentClips
+    /// for continuous playback — a parked event clip in the manifest would
+    /// reintroduce exactly the parked presence 60c5602 removed.
+    ///
+    /// The predicate is `grouper::row_has_driving` — the SAME one the
+    /// grouper applies to stored rows when admitting gap-fills — so the
+    /// manifest and the drive list never disagree on which event clips are
+    /// part of a drive.
+    pub fn gap_fill_files(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT file, raw_park_count, raw_frame_count, gear_runs_blob, max_speed_mps \
+             FROM routes \
+             WHERE file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, i64>(2)? as u32,
+                    r.get::<_, Option<Vec<u8>>>(3)?,
+                    r.get::<_, Option<f64>>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (file, raw_park, raw_frame, gear_blob, max_speed) in rows {
+            let gear_runs = decode_gear_runs(gear_blob.as_deref())
+                .with_context(|| format!("decode gear_runs {}", file))?
+                .unwrap_or_default();
+            if crate::grouper::row_has_driving(
+                &gear_runs,
+                raw_park,
+                raw_frame,
+                max_speed.unwrap_or(0.0),
+            ) {
+                out.push(file);
+            }
+        }
+        Ok(out)
     }
 
     /// Wipe routes + processed_files + drive_tags and bulk-insert `data`.
@@ -2773,6 +2830,71 @@ mod tests {
         let conn = store.conn.lock().unwrap();
         let ver = meta_get(&conn, "aggregate_formula_version").unwrap();
         assert_eq!(ver.as_deref(), Some(AGGREGATE_FORMULA_VERSION));
+    }
+
+    #[test]
+    fn gap_fill_files_excludes_parked_event_rows() {
+        use crate::extract::{GEAR_DRIVE, GEAR_PARK};
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.0, -122.0], [37.001, -122.0]];
+
+        // A driving event row (real gap-fill) — must appear.
+        store
+            .add_route(
+                "SentryClips/2026-07-05_16-12-51/2026-07-05_16-05-47-front.mp4",
+                "2026-07-05",
+                &pts,
+                &[GEAR_DRIVE, GEAR_DRIVE],
+                &[0, 0],
+                &[20.0, 21.0],
+                &[0.0, 0.0],
+                0,
+                2,
+                &[GearRun { gear: GEAR_DRIVE, frames: 2 }],
+            )
+            .unwrap();
+
+        // A fully-PARKED event row (drive 241's arrival residue from an
+        // older build, before the do_process gate) — must be filtered out
+        // so the playback manifest never cross-links it into RecentClips.
+        let parked_pts: Vec<GpsPoint> = vec![[37.001, -122.0], [37.001, -122.0]];
+        store
+            .add_route(
+                "SentryClips/2026-07-05_16-12-51/2026-07-05_16-07-48-front.mp4",
+                "2026-07-05",
+                &parked_pts,
+                &[GEAR_PARK, GEAR_PARK],
+                &[0, 0],
+                &[0.0, 0.0],
+                &[0.0, 0.0],
+                60,
+                60,
+                &[GearRun { gear: GEAR_PARK, frames: 60 }],
+            )
+            .unwrap();
+
+        // A normal RecentClips drive row is never in the event-folder set.
+        store
+            .add_route(
+                "2026-07-05/2026-07-05_16-04-47-front.mp4",
+                "2026-07-05",
+                &pts,
+                &[GEAR_DRIVE, GEAR_DRIVE],
+                &[0, 0],
+                &[20.0, 21.0],
+                &[0.0, 0.0],
+                0,
+                2,
+                &[GearRun { gear: GEAR_DRIVE, frames: 2 }],
+            )
+            .unwrap();
+
+        let files = store.gap_fill_files().unwrap();
+        assert_eq!(
+            files,
+            vec!["SentryClips/2026-07-05_16-12-51/2026-07-05_16-05-47-front.mp4".to_string()],
+            "manifest must list the driving event clip and exclude the parked arrival"
+        );
     }
 
     /// 61-point clip (dt = 1000 ms) for boundary tests: per-point AP and

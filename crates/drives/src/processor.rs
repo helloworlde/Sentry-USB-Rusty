@@ -132,20 +132,54 @@ impl Processor {
         // query failure instead of silently treating everything as
         // unprocessed and re-ingesting the whole tree.
         let processed = self.store.processed_set()?;
+
+        // Continuous-recording timeline for gap-fill hole detection: the
+        // disk scan ∪ already-processed keys (clips rotated off disk still
+        // anchor historical holes). Event keys are excluded — a gap-filled
+        // clip must keep reading as a filled hole, not a new slot.
+        let mut recent_ts: Vec<chrono::NaiveDateTime> = files
+            .iter()
+            .filter_map(|f| crate::grouper::parse_clip_timestamp(f))
+            .collect();
+        recent_ts.extend(
+            processed
+                .iter()
+                .filter(|k| !crate::grouper::is_event_folder_path(k))
+                .filter_map(|k| crate::grouper::parse_clip_timestamp(k)),
+        );
+        recent_ts.sort();
+        recent_ts.dedup();
+
         // Membership must compare CANONICAL keys: the scan yields physical
         // paths (`RecentClips/YYYY-MM-DD/x.mp4` under the snapshot symlink
         // layout) while the store keys rows by `normalize_path` — which
         // strips that prefix. Comparing the raw scan path would miss every
         // stored row and re-extract the whole RecentClips tree each run.
         // The physical path is kept for the extraction read below.
-        let unprocessed: Vec<String> = files
+        let mut unprocessed: Vec<String> = files
             .into_iter()
             .filter(|f| !processed.contains(crate::db::normalize_path(f).as_str()))
             .collect();
 
+        // Gap-fill: append event clips that cover RecentClips holes. They
+        // ride the same extraction loop (throttle, progress, resume via
+        // processed_files) and land keyed at their real event-folder path.
+        match self.scan_event_gap_fill(&recent_ts, &processed) {
+            Ok(gap_fill) if !gap_fill.is_empty() => {
+                info!(
+                    "gap-fill: {} event clip(s) cover RecentClips holes",
+                    gap_fill.len()
+                );
+                unprocessed.extend(gap_fill);
+            }
+            Ok(_) => {}
+            Err(e) => warn!("gap-fill event scan failed: {}", e),
+        }
+
         let total = unprocessed.len();
         let mut routes_found: usize = 0;
         let mut files_with_gps: usize = 0;
+        let mut gap_fill_parked_skipped: usize = 0;
         let mut errors: Vec<String> = Vec::new();
         let mut error_count: usize = 0;
         info!("found {} unprocessed clip files", total);
@@ -185,6 +219,29 @@ impl Processor {
             // an owned String just to take a slice of it.
             let date: &str = file.split('/').next().unwrap_or("");
             match extract::extract_gps_from_file(&full_path) {
+                // Driving gate for gap-fill event clips: the
+                // pre-extraction scan is timestamp-only, so a parked
+                // car's sentry clips chained after a drive reach here
+                // too. A route row under SavedClips/SentryClips feeds
+                // gap_fill_files() → the playback manifest →
+                // RecentClips cross-links — exactly the parked bloat
+                // 60c5602 removed — so a no-driving event clip is never
+                // stored, only marked processed.
+                Ok(gps)
+                    if crate::grouper::is_event_folder_path(file)
+                        && !crate::grouper::telemetry_has_driving(
+                            &gps.gear_runs,
+                            &gps.gear_states,
+                            &gps.speeds,
+                            gps.raw_park_count,
+                            gps.raw_frame_count,
+                        ) =>
+                {
+                    gap_fill_parked_skipped += 1;
+                    if let Err(me) = self.store.mark_processed(file) {
+                        warn!("failed to mark {} processed: {}", file, me);
+                    }
+                }
                 Ok(gps) => {
                     if !gps.points.is_empty() {
                         files_with_gps += 1;
@@ -261,6 +318,16 @@ impl Processor {
         // Final checkpoint on the way out.
         let _ = self.store.save();
 
+        // Refresh the gap-fill manifest the snapshot builder reads to
+        // cross-link driving-hole clips back into RecentClips for
+        // continuous playback. Rebuilt from the routes table every pass so
+        // it self-heals on already-processed devices (the fills are already
+        // rows) as well as fresh deploys. Best-effort — a manifest write
+        // failure only costs playback continuity, never drive data.
+        if let Err(e) = self.update_gapfill_manifest() {
+            warn!("gap-fill manifest update failed: {}", e);
+        }
+
         // Mirror drive data to a mounted CIFS/NFS archive — the counterpart
         // of post-archive-process.sh's rsync/rclone sync blocks (the Go
         // server did this in SyncToArchive; the call site was lost in the
@@ -301,6 +368,12 @@ impl Processor {
             "processing complete: {} files processed, {} routes found, {} with GPS, {} errors",
             total, routes_found, files_with_gps, error_count
         );
+        if gap_fill_parked_skipped > 0 {
+            info!(
+                "gap-fill: {} event clip(s) skipped by the driving gate (parked pre-roll)",
+                gap_fill_parked_skipped
+            );
+        }
 
         // Wake the cloud-uploader if it's listening. Cheap; idempotent
         // (notify_one with no waiter is a no-op).
@@ -312,6 +385,15 @@ impl Processor {
 
     /// Recursively scan for -front.mp4 files.
     fn scan_dir(&self, dir: &std::path::Path, files: &mut Vec<String>) -> Result<()> {
+        self.scan_dir_inner(dir, files, true)
+    }
+
+    fn scan_dir_inner(
+        &self,
+        dir: &std::path::Path,
+        files: &mut Vec<String>,
+        skip_event_dirs: bool,
+    ) -> Result<()> {
         let entries = std::fs::read_dir(dir)?;
         for entry in entries {
             let entry = entry?;
@@ -323,13 +405,16 @@ impl Processor {
                 // catch). SentryClips contains parked Sentry-mode recordings
                 // that the gear-state splitter emits as spurious "drives"
                 // bordering an actual trip. Matches Sentry-Drive's
-                // discoverFrontCameraFiles (process.js:91-94).
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if is_event_folder(name) {
-                        continue;
+                // discoverFrontCameraFiles (process.js:91-94). The gap-fill
+                // scan (scan_event_gap_fill) walks these deliberately.
+                if skip_event_dirs {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if is_event_folder(name) {
+                            continue;
+                        }
                     }
                 }
-                self.scan_dir(&path, files)?;
+                self.scan_dir_inner(&path, files, skip_event_dirs)?;
             } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.ends_with("-front.mp4") {
                     // Store relative path from clip_dir
@@ -341,6 +426,97 @@ impl Processor {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Find Saved/Sentry event clips that fill RecentClips gaps: the
+    /// continuous recording gapped mid-drive (interior hole), or the drive
+    /// ran past its last RecentClips clip / started before its first one
+    /// and the footage only made an event folder's ~10-minute pre-roll
+    /// (trailing/leading chain). Returns unprocessed relative paths (kept
+    /// at their real event-folder location — no copies or symlinks).
+    ///
+    /// This is a timestamp-bounded SUPERSET of the final fill set: without
+    /// SEI in hand, a parked car's event clips chained shortly after a
+    /// drive can qualify here too. They are extracted once, rejected by
+    /// the driving gate in `do_process` (never stored, only marked
+    /// processed), and the chain cap (grouper::GAP_FILL_MAX_MS from the
+    /// nearest RecentClips clip) bounds that one-time waste to ~30 clips
+    /// per drive boundary on a sentry-heavy install. Isolated event
+    /// clusters with no adjacent continuous footage never qualify at all.
+    /// One clip per missing timestamp (grouper::select_gap_fill_events
+    /// picks the winner).
+    fn scan_event_gap_fill(
+        &self,
+        recent_sorted_ts: &[chrono::NaiveDateTime],
+        processed: &std::collections::HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let mut event_files: Vec<String> = Vec::new();
+        for sub in ["SavedClips", "SentryClips"] {
+            let dir = std::path::Path::new(&self.clip_dir).join(sub);
+            if dir.is_dir() {
+                self.scan_dir_inner(&dir, &mut event_files, false)?;
+            }
+        }
+        event_files.sort();
+
+        let cands: Vec<(chrono::NaiveDateTime, &str)> = event_files
+            .iter()
+            .filter(|f| !processed.contains(crate::db::normalize_path(f).as_str()))
+            .filter_map(|f| {
+                crate::grouper::parse_clip_timestamp(f).map(|ts| (ts, f.as_str()))
+            })
+            .collect();
+        Ok(crate::grouper::select_gap_fill_events(recent_sorted_ts, &cands)
+            .into_iter()
+            .map(|i| cands[i].1.to_string())
+            .collect())
+    }
+
+    /// Rewrite `<clip_dir>/../.gapfill_recent_links` — the manifest of
+    /// event-clip timestamps the snapshot builder cross-links back into
+    /// RecentClips for continuous drive playback. Derived from the routes
+    /// table (every Saved/Sentry route file is, by construction, a
+    /// hole-fill), so it converges to the correct set regardless of when
+    /// the fill happened. Skips the write when unchanged to avoid churn.
+    fn update_gapfill_manifest(&self) -> Result<()> {
+        let manifest = match std::path::Path::new(&self.clip_dir).parent() {
+            Some(p) => p.join(".gapfill_recent_links"),
+            None => return Ok(()),
+        };
+
+        // Reduce each gap-fill route file to its YYYY-MM-DD_HH-MM-SS stamp
+        // (shared by every camera of that minute), sorted + deduped.
+        let mut stamps: Vec<String> = self
+            .store
+            .gap_fill_files()?
+            .iter()
+            .filter_map(|f| {
+                f.rsplit('/')
+                    .next()
+                    .filter(|b| b.len() >= 19)
+                    .map(|b| b[..19].to_string())
+            })
+            .collect();
+        stamps.sort();
+        stamps.dedup();
+
+        let body = if stamps.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", stamps.join("\n"))
+        };
+
+        // No-op when the content is identical (the common case once the
+        // gap is filled) so we don't rewrite the file every archive cycle.
+        if std::fs::read_to_string(&manifest).unwrap_or_default() == body {
+            return Ok(());
+        }
+        std::fs::write(&manifest, body)?;
+        info!(
+            "gap-fill manifest: {} clip timestamp(s) flagged for RecentClips playback",
+            stamps.len()
+        );
         Ok(())
     }
 }
