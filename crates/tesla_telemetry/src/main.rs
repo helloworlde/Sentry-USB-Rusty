@@ -487,6 +487,35 @@ fn should_enter_quiet(
         && !keep_awake_active
 }
 
+/// Resolve optional charge/sentry readings into the booleans that feed the
+/// Quiet gate.
+///
+/// Unknown values stay conservative while the car is not yet parked-confirmed
+/// and during explicit keep-awake work. Once the sampler has independently
+/// confirmed the car is parked/asleep and keep-awake is not active, unread
+/// charge/sentry values must not pin Active forever: doing so turns telemetry
+/// itself into an accidental keep-awake loop when Tesla omits those optional
+/// fields or encrypted responses fail to decode.
+fn resolve_gate_inputs(
+    car_truly_asleep: bool,
+    parked_confirmed: bool,
+    last_charging_state: Option<sample::ChargingState>,
+    last_sentry_mode: Option<sample::SentryMode>,
+    keep_awake_active: bool,
+) -> (bool, bool) {
+    let sleep_candidate = car_truly_asleep || parked_confirmed;
+    let unknown_should_pin_active = keep_awake_active || !sleep_candidate;
+
+    let actively_charging = last_charging_state
+        .map(|s| s.is_active_charging())
+        .unwrap_or(unknown_should_pin_active);
+    let sentry_on = last_sentry_mode
+        .map(|s| s.is_on())
+        .unwrap_or(unknown_should_pin_active);
+
+    (actively_charging, sentry_on)
+}
+
 /// One main-loop iteration; returns how long to sleep before the next,
 /// plus the config snapshot it parsed (so the caller's keep-accessory
 /// pass doesn't re-read the file; `None` = config load failed).
@@ -576,21 +605,20 @@ async fn tick(
     let car_truly_asleep = observation == CarState::Asleep;
     let parked_confirmed = *parked_polls >= PARK_CONFIRMATIONS_BEFORE_QUIET;
 
-    // Conservative defaults: with no successful charge/closures poll yet,
-    // assume charging / sentry-on to stay Active. Costs a brief Active
-    // burst (~30-60s) at cold start before the first polls confirm the
-    // car can sleep.
-    let actively_charging = last_charging_state
-        .map(|s| s.is_active_charging())
-        .unwrap_or(true);
-    let sentry_on = last_sentry_mode.map(|s| s.is_on()).unwrap_or(true);
-
     // A keep-awake in effect — an archive cycle or any nudge loop (web-UI,
     // drive processing) — must pin us Active. Dropping to sleep-safe
     // polling mid-archive lets the car sleep, which cuts USB power and
     // aborts the copy. Self-clears when the work finishes, so it can't
     // wedge the car permanently awake (see lock::keep_awake_requested).
     let keep_awake_active = lock::keep_awake_requested();
+
+    let (actively_charging, sentry_on) = resolve_gate_inputs(
+        car_truly_asleep,
+        parked_confirmed,
+        *last_charging_state,
+        *last_sentry_mode,
+        keep_awake_active,
+    );
 
     // Keep-awake state cleanup happens here; the nudge itself fires
     // AFTER the polls below (see "Sampler keep-awake CPC dispatch"
@@ -1774,6 +1802,36 @@ mod tests {
     fn charging_or_sentry_still_pins_active() {
         assert!(!should_enter_quiet(false, true, true, false, false)); // charging
         assert!(!should_enter_quiet(false, true, false, true, false)); // sentry on
+    }
+
+    #[test]
+    fn unread_charge_and_sentry_do_not_pin_parked_car_when_keep_awake_is_off() {
+        let (actively_charging, sentry_on) = resolve_gate_inputs(
+            false, // car_truly_asleep
+            true,  // parked_confirmed
+            None,  // charging_state unread
+            None,  // sentry_mode unread
+            false, // keep_awake_active
+        );
+
+        assert!(!actively_charging);
+        assert!(!sentry_on);
+        assert!(should_enter_quiet(false, true, actively_charging, sentry_on, false));
+    }
+
+    #[test]
+    fn unread_charge_and_sentry_still_pin_active_during_keep_awake() {
+        let (actively_charging, sentry_on) = resolve_gate_inputs(
+            false, // car_truly_asleep
+            true,  // parked_confirmed
+            None,  // charging_state unread
+            None,  // sentry_mode unread
+            true,  // keep_awake_active
+        );
+
+        assert!(actively_charging);
+        assert!(sentry_on);
+        assert!(!should_enter_quiet(false, true, actively_charging, sentry_on, true));
     }
 
     #[test]
