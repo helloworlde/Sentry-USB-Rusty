@@ -179,6 +179,7 @@ impl Processor {
         let total = unprocessed.len();
         let mut routes_found: usize = 0;
         let mut files_with_gps: usize = 0;
+        let mut gap_fill_parked_skipped: usize = 0;
         let mut errors: Vec<String> = Vec::new();
         let mut error_count: usize = 0;
         info!("found {} unprocessed clip files", total);
@@ -218,6 +219,29 @@ impl Processor {
             // an owned String just to take a slice of it.
             let date: &str = file.split('/').next().unwrap_or("");
             match extract::extract_gps_from_file(&full_path) {
+                // Driving gate for gap-fill event clips: the
+                // pre-extraction scan is timestamp-only, so a parked
+                // car's sentry clips chained after a drive reach here
+                // too. A route row under SavedClips/SentryClips feeds
+                // gap_fill_files() → the playback manifest →
+                // RecentClips cross-links — exactly the parked bloat
+                // 60c5602 removed — so a no-driving event clip is never
+                // stored, only marked processed.
+                Ok(gps)
+                    if crate::grouper::is_event_folder_path(file)
+                        && !crate::grouper::telemetry_has_driving(
+                            &gps.gear_runs,
+                            &gps.gear_states,
+                            &gps.speeds,
+                            gps.raw_park_count,
+                            gps.raw_frame_count,
+                        ) =>
+                {
+                    gap_fill_parked_skipped += 1;
+                    if let Err(me) = self.store.mark_processed(file) {
+                        warn!("failed to mark {} processed: {}", file, me);
+                    }
+                }
                 Ok(gps) => {
                     if !gps.points.is_empty() {
                         files_with_gps += 1;
@@ -344,6 +368,12 @@ impl Processor {
             "processing complete: {} files processed, {} routes found, {} with GPS, {} errors",
             total, routes_found, files_with_gps, error_count
         );
+        if gap_fill_parked_skipped > 0 {
+            info!(
+                "gap-fill: {} event clip(s) skipped by the driving gate (parked pre-roll)",
+                gap_fill_parked_skipped
+            );
+        }
 
         // Wake the cloud-uploader if it's listening. Cheap; idempotent
         // (notify_one with no waiter is a no-op).
@@ -399,14 +429,23 @@ impl Processor {
         Ok(())
     }
 
-    /// Find Saved/Sentry event clips that fill RecentClips holes: the
-    /// continuous recording gapped mid-drive, but the same minute exists in
-    /// an event folder's ~10-minute pre-roll. Returns unprocessed relative
-    /// paths (kept at their real event-folder location — no copies or
-    /// symlinks). Selective by construction: a parked car's event clips
-    /// have no surrounding continuous footage, so they never fall inside a
-    /// hole and never qualify. One clip per missing timestamp
-    /// (grouper::select_gap_fill_events picks the winner).
+    /// Find Saved/Sentry event clips that fill RecentClips gaps: the
+    /// continuous recording gapped mid-drive (interior hole), or the drive
+    /// ran past its last RecentClips clip / started before its first one
+    /// and the footage only made an event folder's ~10-minute pre-roll
+    /// (trailing/leading chain). Returns unprocessed relative paths (kept
+    /// at their real event-folder location — no copies or symlinks).
+    ///
+    /// This is a timestamp-bounded SUPERSET of the final fill set: without
+    /// SEI in hand, a parked car's event clips chained shortly after a
+    /// drive can qualify here too. They are extracted once, rejected by
+    /// the driving gate in `do_process` (never stored, only marked
+    /// processed), and the chain cap (grouper::GAP_FILL_MAX_MS from the
+    /// nearest RecentClips clip) bounds that one-time waste to ~30 clips
+    /// per drive boundary on a sentry-heavy install. Isolated event
+    /// clusters with no adjacent continuous footage never qualify at all.
+    /// One clip per missing timestamp (grouper::select_gap_fill_events
+    /// picks the winner).
     fn scan_event_gap_fill(
         &self,
         recent_sorted_ts: &[chrono::NaiveDateTime],
