@@ -202,6 +202,28 @@ fn write_backup_to_dir(dir: &str, data: &BackupData) -> Result<(), String> {
     Ok(())
 }
 
+async fn ensure_archive_mounted_for_backup() -> Result<(), String> {
+    if !Path::new("/mnt/archive").exists() {
+        return Err("archive mount point /mnt/archive does not exist".to_string());
+    }
+
+    if sentryusb_shell::run("findmnt", &["--mountpoint", "/mnt/archive"])
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    sentryusb_shell::run_with_timeout(Duration::from_secs(30), "mount", &["/mnt/archive"])
+        .await
+        .map_err(|e| format!("mount /mnt/archive: {}", e))?;
+
+    sentryusb_shell::run("findmnt", &["--mountpoint", "/mnt/archive"])
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("archive not mounted at /mnt/archive after mount: {}", e))
+}
+
 async fn sync_backup_to_rsync(data: &BackupData) -> Result<(), String> {
     let config_path = sentryusb_config::find_config_path();
     let (active, _) = sentryusb_config::parse_file(config_path)
@@ -367,9 +389,7 @@ async fn ship_drive_data(location: &str, gz_path: &str, date: &str) -> Result<()
     let archive_system = active.get("ARCHIVE_SYSTEM").cloned().unwrap_or_default();
     match archive_system.as_str() {
         "cifs" | "nfs" => {
-            if !Path::new("/mnt/archive").exists() {
-                return Err("archive not mounted at /mnt/archive".to_string());
-            }
+            ensure_archive_mounted_for_backup().await?;
             let gz = gz_path.to_string();
             let dest = format!("{}/{}", ARCHIVE_BACKUP_DIR, filename);
             // Tens of MB onto a network mount — keep it off the runtime.
@@ -501,13 +521,11 @@ pub async fn create_backup(
             .and_then(|(active, _)| active.get("ARCHIVE_SYSTEM").cloned())
             .unwrap_or_default();
         match archive_system.as_str() {
-            "cifs" | "nfs" => {
-                if Path::new("/mnt/archive").exists() {
-                    write_backup_to_dir(ARCHIVE_BACKUP_DIR, &data)
-                } else {
-                    Err("archive not mounted at /mnt/archive".to_string())
-                }
+            "cifs" | "nfs" => async {
+                ensure_archive_mounted_for_backup().await?;
+                write_backup_to_dir(ARCHIVE_BACKUP_DIR, &data)
             }
+            .await,
             "rsync" => sync_backup_to_rsync(&data).await,
             "rclone" => sync_backup_to_rclone(&data).await,
             _ => {
