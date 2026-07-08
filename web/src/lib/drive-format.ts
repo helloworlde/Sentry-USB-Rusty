@@ -86,8 +86,14 @@ export function formatRelativeTime(iso: string, now: Date = new Date()): string 
   return `${t.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`
 }
 
-export function formatPsi(psi: number | undefined): string {
+// Telemetry reports TPMS in PSI; bar is a display conversion driven by the
+// Display & Units "Tire pressure" toggle (PRESSURE_UNIT). Same constant and
+// precision as TirePressureCard so both readouts agree.
+const PSI_TO_BAR = 0.0689476
+
+export function formatPsi(psi: number | undefined, bar: boolean): string {
   if (psi === undefined) return "—"
+  if (bar) return `${(psi * PSI_TO_BAR).toFixed(2)} bar`
   return `${psi.toFixed(1)} psi`
 }
 

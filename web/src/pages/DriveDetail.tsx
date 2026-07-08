@@ -15,6 +15,7 @@ import {
 import { cn } from "@/lib/utils"
 import { monotonicTrack } from "@/lib/drive-track"
 import { useDriveDetail } from "@/hooks/useDriveDetail"
+import { useUnits } from "@/lib/units"
 import { ScrubberProvider, useScrubberActions } from "@/hooks/useScrubberSync"
 import {
   formatDistance,
@@ -609,6 +610,10 @@ function ClimateSection({ drive, metric }: ClimateSectionProps) {
 }
 
 function TirePressureSection({ drive }: { drive: DriveDetailType }) {
+  // Pressure has its own unit key (PRESSURE_UNIT) independent of the page's
+  // DRIVE_MAP_UNIT-derived `metric` — read it from the shared units store so
+  // this section stays in sync with the dashboard's TirePressureCard.
+  const { pressureBar } = useUnits()
   const any =
     drive.tireFlPsi !== undefined ||
     drive.tireFrPsi !== undefined ||
@@ -619,10 +624,10 @@ function TirePressureSection({ drive }: { drive: DriveDetailType }) {
     <>
       <SectionHeading>Tire pressure</SectionHeading>
       <div className="grid grid-cols-2 gap-4">
-        <StatTile label="FL" value={formatPsi(drive.tireFlPsi)} icon={<Disc className="h-4 w-4" />} />
-        <StatTile label="FR" value={formatPsi(drive.tireFrPsi)} icon={<Disc className="h-4 w-4" />} />
-        <StatTile label="RL" value={formatPsi(drive.tireRlPsi)} icon={<Disc className="h-4 w-4" />} />
-        <StatTile label="RR" value={formatPsi(drive.tireRrPsi)} icon={<Disc className="h-4 w-4" />} />
+        <StatTile label="FL" value={formatPsi(drive.tireFlPsi, pressureBar)} icon={<Disc className="h-4 w-4" />} />
+        <StatTile label="FR" value={formatPsi(drive.tireFrPsi, pressureBar)} icon={<Disc className="h-4 w-4" />} />
+        <StatTile label="RL" value={formatPsi(drive.tireRlPsi, pressureBar)} icon={<Disc className="h-4 w-4" />} />
+        <StatTile label="RR" value={formatPsi(drive.tireRrPsi, pressureBar)} icon={<Disc className="h-4 w-4" />} />
       </div>
     </>
   )
