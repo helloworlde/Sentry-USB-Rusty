@@ -35,18 +35,30 @@ pub async fn shutdown(State(_s): State<AppState>) -> (StatusCode, Json<serde_jso
 
 /// POST /api/system/toggle-drives
 pub async fn toggle_drives(State(_s): State<AppState>, _body: String) -> (StatusCode, Json<serde_json::Value>) {
-    let was_active = sentryusb_gadget::is_active();
-    let result = if was_active {
-        tokio::task::spawn_blocking(sentryusb_gadget::disable).await
-    } else {
-        tokio::task::spawn_blocking(sentryusb_gadget::enable).await
-    };
+    // A user toggle owns a full gadget cycle, so it takes the cross-process
+    // flock archiveloop wraps around its own cycles — otherwise it can race
+    // an archive sync or a stall-watchdog recovery and flip the gadget while
+    // cam_disk.bin is mounted on the host. gadget_enable/gadget_disable
+    // below stay lockless: archiveloop's shims call them while it already
+    // holds this flock.
+    let result = tokio::task::spawn_blocking(|| -> Result<(), String> {
+        let _cycle = sentryusb_gadget::cycle_lock::acquire(Duration::from_secs(30))
+            .map_err(|e| format!("USB drives are busy ({}) — try again shortly", e))?;
+        // Re-read under the lock: whoever held it may have flipped the state.
+        let was_active = sentryusb_gadget::is_active();
+        let r = if was_active {
+            sentryusb_gadget::disable()
+        } else {
+            sentryusb_gadget::enable()
+        };
+        r.map_err(|e| {
+            format!("USB gadget {} failed: {}", if was_active { "disable" } else { "enable" }, e)
+        })
+    })
+    .await;
     match result {
         Ok(Ok(())) => crate::json_ok(),
-        Ok(Err(e)) => crate::json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("USB gadget {} failed: {}", if was_active { "disable" } else { "enable" }, e),
-        ),
+        Ok(Err(msg)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &msg),
         Err(e) => crate::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("USB gadget task panicked: {}", e),
@@ -58,6 +70,10 @@ pub async fn toggle_drives(State(_s): State<AppState>, _body: String) -> (Status
 ///
 /// Called from the `/root/bin/enable_gadget.sh` shim so archiveloop coordinates
 /// with this server instead of driving configfs directly in parallel.
+///
+/// This handler (and gadget_disable below) must NOT take the gadget-cycle
+/// flock: archiveloop already holds it when the shim runs, so locking here
+/// would wedge the shim's curl until its --max-time kills the request.
 pub async fn gadget_enable(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     if sentryusb_gadget::is_active() {
         return crate::json_ok();

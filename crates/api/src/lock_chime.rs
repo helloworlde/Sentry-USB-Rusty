@@ -158,6 +158,19 @@ async fn gadget_enable() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Waits (on a blocking thread) for the cross-process gadget-cycle flock
+/// shared with archiveloop — see `sentryusb_gadget::cycle_lock`. Always
+/// taken BEFORE `CAM_DISK_MU`; one fixed order for the pair keeps them
+/// deadlock-free. 600s covers an archive media sync holding the flock.
+async fn acquire_gadget_cycle_lock() -> Result<sentryusb_gadget::cycle_lock::CycleGuard, String> {
+    tokio::task::spawn_blocking(|| {
+        sentryusb_gadget::cycle_lock::acquire(Duration::from_secs(600))
+    })
+    .await
+    .map_err(|e| format!("join: {}", e))?
+    .map_err(|e| format!("gadget cycle lock: {}", e))
+}
+
 fn is_mount_point_active(mount_point: &str) -> bool {
     let Ok(data) = std::fs::read_to_string("/proc/mounts") else {
         return false;
@@ -218,6 +231,11 @@ async fn copy_lock_chime_to_cam_mount() -> Result<(), String> {
 }
 
 async fn sync_lock_chime_to_cam_disk() -> Result<(), String> {
+    // The flock keeps archiveloop's gadget cycles (and its stall watchdog)
+    // out of our disable→mount→write→umount→enable window; without it a
+    // watchdog recovery can re-present cam_disk.bin to the car while we
+    // still have it mounted — two writers on one block device.
+    let _cycle = acquire_gadget_cycle_lock().await?;
     let _guard = CAM_DISK_MU.lock().await;
 
     if !Path::new(CAM_DISK_IMAGE).exists() {
@@ -248,6 +266,8 @@ async fn sync_lock_chime_to_cam_disk() -> Result<(), String> {
 }
 
 async fn clear_lock_chime_from_cam_disk() -> Result<(), String> {
+    // Same flock-then-mutex order as sync_lock_chime_to_cam_disk.
+    let _cycle = acquire_gadget_cycle_lock().await?;
     let _guard = CAM_DISK_MU.lock().await;
 
     if !Path::new(CAM_DISK_IMAGE).exists() {

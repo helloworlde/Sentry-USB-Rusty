@@ -265,17 +265,26 @@ function sync_disk_media_to_host () {
   log "Done reverse-syncing disk media to host paths."
 }
 
-# Serializes gadget teardown/bring-up between the main loop and the gadget
-# stall watchdog. Without it the watchdog could re-enable the gadget while
-# the main loop has cam_disk.bin mounted for a sync (two writers on one
-# block device — filesystem corruption, car stops recording).
+# Serializes gadget teardown/bring-up between the main loop, the gadget
+# stall watchdog, and the Rust server's own gadget cycles (lock-chime
+# cam-disk sync, toggle-drives — see crates/usb_gadget/src/cycle_lock.rs).
+# Without it one party could re-enable the gadget while another has
+# cam_disk.bin mounted for a sync (two writers on one block device —
+# filesystem corruption, car stops recording).
 GADGET_CYCLE_LOCK=/tmp/sentryusb_gadget_cycle.lock
 
-function connect_usb_drives_to_host() {
+# Run "$@" holding the gadget-cycle lock. Single definition so the fd
+# number and lock path can never drift between call sites — a mismatch
+# would silently stop the mutual exclusion.
+function with_gadget_lock () {
   (
     flock 209
-    connect_usb_drives_to_host_locked
+    "$@"
   ) 209>"$GADGET_CYCLE_LOCK"
+}
+
+function connect_usb_drives_to_host() {
+  with_gadget_lock connect_usb_drives_to_host_locked
 }
 
 function connect_usb_drives_to_host_locked() {
@@ -610,10 +619,7 @@ function fix_errors_in_images () {
 }
 
 function disconnect_usb_drives_from_host () {
-  (
-    flock 209
-    disconnect_usb_drives_from_host_locked
-  ) 209>"$GADGET_CYCLE_LOCK"
+  with_gadget_lock disconnect_usb_drives_from_host_locked
 }
 
 function disconnect_usb_drives_from_host_locked () {

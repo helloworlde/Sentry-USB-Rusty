@@ -3,6 +3,7 @@
 //! Replaces `enable_gadget.sh` and `disable_gadget.sh` with native Rust
 //! operations on `/sys/kernel/config/usb_gadget/sentryusb`.
 
+pub mod cycle_lock;
 pub mod snapshot;
 pub mod space;
 
