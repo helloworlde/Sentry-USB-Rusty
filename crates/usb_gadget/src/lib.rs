@@ -159,6 +159,10 @@ pub fn enable() -> Result<()> {
                     continue;
                 }
                 let _ = fs::write(&lun_file, "\n");
+                // Enforce nofua while the medium is detached — a gadget dir
+                // built by an older version predates the nofua=1 policy (see
+                // the fresh-build path below for why Tesla needs it).
+                let _ = fs::write(func_dir.join(format!("lun.{}/nofua", i)), "1");
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let _ = fs::write(&lun_file, &current);
             }
@@ -226,6 +230,14 @@ pub fn enable() -> Result<()> {
             // Writing to `lun.0/file` before the dir exists silently fails.
             fs::create_dir_all(&lun_dir)
                 .with_context(|| format!("failed to create lun.{} at {}", lun, lun_dir.display()))?;
+            // Tesla issues FUA (force-unit-access) writes, which the
+            // mass_storage function honors as synchronous flushes through its
+            // single-threaded worker. One slow flush under disk contention can
+            // exceed the car's SCSI timeout, making it drop the drive (X on
+            // the cam icon) until it is re-plugged. nofua=1 lets FUA writes
+            // complete as normal cached writes; the images are fsck'd on
+            // every gadget cycle, so the integrity tradeoff is already priced in.
+            write_file(&lun_dir.join("nofua"), "1")?;
             write_file(&lun_dir.join("file"), image_path)?;
 
             // Get file size for inquiry string

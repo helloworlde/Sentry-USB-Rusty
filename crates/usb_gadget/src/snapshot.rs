@@ -113,10 +113,13 @@ pub async fn make_snapshot(skip_fsck: bool) -> Result<Option<String>> {
     // ── reflink copy (bash line 313) ──────────────────────────────────
     // `--reflink=auto` so non-XFS backingfiles (rare — setup wizard XFS
     // verify usually catches this) still works at the cost of a full copy.
+    // Idle I/O priority: the copy runs while the car may be writing dashcam
+    // footage to the same disk through the gadget; at default priority it
+    // can stall those writes past the car's SCSI timeout (needs bfq to bite).
     let cp_result = sentryusb_shell::run_with_timeout(
         Duration::from_secs(600),
-        "cp",
-        &["--reflink=auto", CAM_DISK, &snap_file],
+        "ionice",
+        &["-c3", "nice", "-n19", "cp", "--reflink=auto", CAM_DISK, &snap_file],
     )
     .await;
     if let Err(e) = cp_result {

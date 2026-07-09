@@ -51,7 +51,12 @@ connectionmonitor $$ &
 
 while [ -n "${1+x}" ]
 do
-  if ! (rsync -avhRL --timeout=600 --remove-source-files --no-perms --omit-dir-times \
+  # Idle I/O + CPU priority: the archive reads tens of GB from the same disk
+  # the car is writing dashcam footage to through the USB gadget. At default
+  # priority those reads compete head-to-head with the car's writes and can
+  # stall them past the car's SCSI timeout (it drops the drive with an X).
+  # ionice -c3 requires the bfq scheduler to have effect (udev rule ships it).
+  if ! (ionice -c3 nice -n19 rsync -avhRL --timeout=600 --remove-source-files --no-perms --omit-dir-times \
         ${RSYNC_EXTRA[@]+"${RSYNC_EXTRA[@]}"} \
         --stats --log-file=/tmp/archive-rsync-cmd.log --ignore-missing-args \
         --files-from="$2" "$1" "$RSYNC_USER@$RSYNC_SERVER:$RSYNC_PATH" &> /tmp/rsynclog || [[ "$?" = "24" ]] )

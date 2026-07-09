@@ -572,12 +572,27 @@ function SystemTile({
           value={`${status.fan_speed} RPM`}
         />
       )}
+      {/* Three-state: "Connected" needs the host link up ("configured"),
+          not just the gadget bound in configfs — a bound gadget with a
+          dead link is exactly how the car shows an X while the old
+          two-state pill stayed green. udc_state is absent on older
+          backends; treat absent as link-unknown and keep the old view. */}
       <Row
         icon={<HardDrive className="h-3.5 w-3.5" />}
         label="USB Drives"
-        value={status.drives_active === "yes" ? "Connected" : "Disconnected"}
+        value={
+          status.drives_active !== "yes"
+            ? "Disconnected"
+            : status.udc_state && status.udc_state !== "configured"
+              ? "No host link"
+              : "Connected"
+        }
         valueColor={
-          status.drives_active === "yes" ? "oklch(0.82 0.18 150)" : "#fbbf24"
+          status.drives_active !== "yes"
+            ? "#fbbf24"
+            : status.udc_state && status.udc_state !== "configured"
+              ? "#f87171"
+              : "oklch(0.82 0.18 150)"
         }
       />
       {keepAwakeIdle && (

@@ -174,6 +174,15 @@ struct PiStatus {
     free_space: String,
     uptime: String,
     drives_active: String,
+    /// Host-link state from /sys/class/udc/<udc>/state ("configured" =
+    /// the car is actually enumerated and talking; "suspended"/"not
+    /// attached" = it is not, even when drives_active says "yes").
+    /// drives_active only reflects the configfs binding — the Pi's
+    /// *intent* to present — which stays "yes" through a dead link.
+    udc_state: String,
+    /// Seconds since the car last wrote to cam_disk.bin (mtime age),
+    /// -1 when unknown. Same signal the telemetry heartbeat uses.
+    cam_last_write_secs: i64,
     wifi_ssid: String,
     /// Frequency in Hz as a string (e.g. "5180000000" for 5.18 GHz).
     /// Empty when not on WiFi or `iw` isn't installed. iOS renders this
@@ -213,6 +222,8 @@ pub async fn get_status(
         free_space: String::new(),
         uptime: String::new(),
         drives_active: "no".into(),
+        udc_state: String::new(),
+        cam_last_write_secs: -1,
         wifi_ssid: String::new(),
         wifi_freq: String::new(),
         wifi_strength: String::new(),
@@ -254,6 +265,8 @@ pub async fn get_status(
     if sentryusb_gadget::is_active() {
         s.drives_active = "yes".into();
     }
+    s.udc_state = read_udc_state();
+    s.cam_last_write_secs = cam_last_write_secs();
 
     // Snapshots
     let snapshots = find_snapshots();
@@ -676,6 +689,32 @@ fn read_fan_speed() -> String {
         }
     }
     String::new()
+}
+
+/// Host-link state of the first UDC ("configured", "suspended",
+/// "not attached", ...). Empty when there is no UDC (non-gadget dev box).
+fn read_udc_state() -> String {
+    let Ok(entries) = std::fs::read_dir("/sys/class/udc") else {
+        return String::new();
+    };
+    for entry in entries.flatten() {
+        if let Ok(data) = std::fs::read_to_string(entry.path().join("state")) {
+            return data.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// Seconds since the last write to cam_disk.bin, -1 when unknown.
+fn cam_last_write_secs() -> i64 {
+    let Ok(meta) = std::fs::metadata("/backingfiles/cam_disk.bin") else {
+        return -1;
+    };
+    meta.modified()
+        .ok()
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(-1)
 }
 
 /// Last segment after the final `-` of the system hostname — e.g.

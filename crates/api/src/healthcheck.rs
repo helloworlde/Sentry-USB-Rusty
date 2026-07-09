@@ -312,6 +312,30 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
                 Some("gadget is bound but exposes no LUN.0 — car will see the drive but nothing on it".to_string()),
             )),
         }
+        // Bound-in-configfs is the Pi's *intent*; the UDC link state is
+        // what the car actually sees. A gadget can stay "bound" through a
+        // dead link (2026-07-08 incident: car showed an X for ~6 min while
+        // this check would have passed).
+        let mut udc_state = String::new();
+        if let Ok(entries) = std::fs::read_dir("/sys/class/udc") {
+            for entry in entries.flatten() {
+                if let Ok(s) = std::fs::read_to_string(entry.path().join("state")) {
+                    udc_state = s.trim().to_string();
+                    break;
+                }
+            }
+        }
+        match udc_state.as_str() {
+            "configured" => gad.push(item("Host link (UDC state)", "pass", None)),
+            "" => {}
+            other => gad.push(item(
+                "Host link (UDC state)",
+                "warn",
+                Some(format!(
+                    "gadget is bound but the host link reads '{other}' — the car may not see the drive"
+                )),
+            )),
+        }
     } else if std::path::Path::new("/sys/kernel/config/usb_gadget/sentryusb").exists() {
         gad.push(item(
             "Gadget UDC bound",

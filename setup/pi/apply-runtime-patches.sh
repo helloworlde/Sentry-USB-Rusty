@@ -248,11 +248,91 @@ apply_ble_adv_helper() {
     return 0
 }
 
+# ── bfq scheduler on the backingfiles disk (all boards) ─────────────────
+#
+# The archive pipeline (rsync reads, snapshot cp) now runs under
+# `ionice -c3` so the car's dashcam writes through the USB gadget always
+# win disk access — but ionice only has effect under the bfq I/O
+# scheduler (mq-deadline, the Pi OS default, ignores I/O priorities).
+# Ship a udev rule so every sd disk gets bfq at hotplug/boot, and apply
+# it to the live backingfiles disk immediately so no reboot is needed.
+apply_backingfiles_bfq() {
+    local rule=/etc/udev/rules.d/60-sentryusb-bfq.rules
+    local want='ACTION=="add|change", KERNEL=="sd[a-z]", SUBSYSTEM=="block", ATTR{queue/scheduler}="bfq"'
+
+    modprobe bfq 2>/dev/null || true
+
+    if [ ! -f "$rule" ] || [ "$(cat "$rule" 2>/dev/null)" != "$want" ]; then
+        [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+        if printf '%s\n' "$want" > "$rule" 2>/dev/null; then
+            udevadm control --reload-rules 2>/dev/null || true
+            log "bfq: installed $rule"
+        else
+            err "bfq: failed to write $rule (read-only fs? check remountfs_rw)"
+        fi
+    else
+        log "bfq: udev rule already current"
+    fi
+
+    # Apply to the running system now. Resolve the disk backing
+    # /backingfiles (e.g. /dev/sda2 -> sda) rather than assuming sda.
+    local src disk sched
+    src="$(findmnt -n -o SOURCE /backingfiles 2>/dev/null)" || true
+    [ -n "${src:-}" ] || { log "bfq: /backingfiles not mounted — udev rule will cover next boot"; return 0; }
+    disk="$(lsblk -n -o PKNAME "$src" 2>/dev/null | head -1)"
+    [ -n "$disk" ] || disk="$(basename "$src" | sed 's/[0-9]*$//')"
+    sched="/sys/block/$disk/queue/scheduler"
+    if [ -w "$sched" ]; then
+        if grep -q '\[bfq\]' "$sched"; then
+            log "bfq: already active on $disk"
+        elif echo bfq > "$sched" 2>/dev/null; then
+            log "bfq: activated on $disk"
+        else
+            warn "bfq: could not activate on $disk (kernel without bfq?) — ionice will be a no-op"
+        fi
+    fi
+    return 0
+}
+
+# ── systemd hardware watchdog (all boards) ──────────────────────────────
+#
+# journald on these installs is volatile, so a full kernel hang leaves the
+# car with a dead drive indefinitely AND destroys the evidence. With the
+# hardware watchdog armed, a hung kernel becomes a ~15s reboot and the
+# gadget re-presents ~90s later. 15s is within the BCM283x/BCM2712
+# watchdog hardware maximum (~15.9s). Userspace-only wedges don't trip
+# this (systemd itself pets the watchdog) — it is strictly kernel-hang
+# protection.
+apply_hardware_watchdog() {
+    local dropin_dir=/etc/systemd/system.conf.d
+    local dropin=$dropin_dir/10-sentryusb-watchdog.conf
+    local want='[Manager]
+RuntimeWatchdogSec=15'
+
+    if [ -f "$dropin" ] && [ "$(cat "$dropin" 2>/dev/null)" = "$want" ]; then
+        log "watchdog: drop-in already current"
+        return 0
+    fi
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+    mkdir -p "$dropin_dir" 2>/dev/null || true
+    if printf '%s\n' "$want" > "$dropin" 2>/dev/null; then
+        # daemon-reexec makes PID 1 re-read system.conf.d and start petting
+        # /dev/watchdog0 immediately (no reboot needed). Safe on a live system.
+        systemctl daemon-reexec 2>/dev/null || true
+        log "watchdog: RuntimeWatchdogSec=15 installed + armed"
+    else
+        err "watchdog: failed to write $dropin (read-only fs? check remountfs_rw)"
+    fi
+    return 0
+}
+
 # ── Run all patches ─────────────────────────────────────────────────────
 
 apply_ble_nonfatal_adv
 apply_ble_adv_helper
 apply_eatt_disable
+apply_backingfiles_bfq
+apply_hardware_watchdog
 
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays
