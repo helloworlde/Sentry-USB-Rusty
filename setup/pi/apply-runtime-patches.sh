@@ -251,11 +251,11 @@ apply_ble_adv_helper() {
 # ── bfq scheduler on the backingfiles disk (all boards) ─────────────────
 #
 # The archive pipeline (rsync reads, snapshot cp) now runs under
-# `ionice -c3` so the car's dashcam writes through the USB gadget always
-# win disk access — but ionice only has effect under the bfq I/O
+# `ionice -c2 -n7` so the car's dashcam writes through the USB gadget
+# always win disk access — but ionice only has effect under the bfq I/O
 # scheduler (mq-deadline, the Pi OS default, ignores I/O priorities).
 # Ship a udev rule so every sd disk gets bfq at hotplug/boot, and apply
-# it to the live backingfiles disk immediately so no reboot is needed.
+# it to the live backingfiles disk immediately when that is safe.
 apply_backingfiles_bfq() {
     local rule=/etc/udev/rules.d/60-sentryusb-bfq.rules
     local want='ACTION=="add|change", KERNEL=="sd[a-z]", SUBSYSTEM=="block", ATTR{queue/scheduler}="bfq"'
@@ -274,8 +274,18 @@ apply_backingfiles_bfq() {
         log "bfq: udev rule already current"
     fi
 
-    # Apply to the running system now. Resolve the disk backing
-    # /backingfiles (e.g. /dev/sda2 -> sda) rather than assuming sda.
+    # Apply to the running system now — but only while the USB gadget is
+    # NOT bound. Switching the elevator drains the disk's request queue,
+    # which can briefly stall the car's in-flight dashcam writes — the very
+    # SCSI-timeout drive-drop this patch exists to prevent. This script runs
+    # mid-OTA while the car may be recording; when the gadget is bound, the
+    # udev rule simply takes effect at the next boot instead.
+    if [ -n "$(cat /sys/kernel/config/usb_gadget/sentryusb/UDC 2>/dev/null)" ]; then
+        log "bfq: gadget is presented to the car — deferring live scheduler switch to next boot (udev rule covers it)"
+        return 0
+    fi
+    # Resolve the disk backing /backingfiles (e.g. /dev/sda2 -> sda)
+    # rather than assuming sda.
     local src disk sched
     src="$(findmnt -n -o SOURCE /backingfiles 2>/dev/null)" || true
     [ -n "${src:-}" ] || { log "bfq: /backingfiles not mounted — udev rule will cover next boot"; return 0; }
@@ -316,10 +326,12 @@ RuntimeWatchdogSec=15'
     [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
     mkdir -p "$dropin_dir" 2>/dev/null || true
     if printf '%s\n' "$want" > "$dropin" 2>/dev/null; then
-        # daemon-reexec makes PID 1 re-read system.conf.d and start petting
-        # /dev/watchdog0 immediately (no reboot needed). Safe on a live system.
-        systemctl daemon-reexec 2>/dev/null || true
-        log "watchdog: RuntimeWatchdogSec=15 installed + armed"
+        # Deliberately no `systemctl daemon-reexec` here: this script runs
+        # mid-OTA, and re-executing PID 1 (and arming a 15s hardware
+        # watchdog) at that moment adds risk for zero benefit — these boxes
+        # reboot at least daily (car power), so the watchdog arms at the
+        # next boot.
+        log "watchdog: RuntimeWatchdogSec=15 installed (arms at next boot)"
     else
         err "watchdog: failed to write $dropin (read-only fs? check remountfs_rw)"
     fi

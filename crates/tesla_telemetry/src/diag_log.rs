@@ -20,6 +20,14 @@
 //!   state_age  - seconds since last `state` sample landed
 //!   bc_age     - seconds since last body-controller sample landed
 //!   samples_10m - total samples in the last 10 minutes (any source)
+//!
+//! CONTRACT: this line is not just human-scannable. archiveloop's
+//! gadget stall watchdog (run/archiveloop, car_is_awake_via_ble) parses
+//! `state_age=<n>s` from the LAST line of this file as its car-awake
+//! gate (there is no sqlite3 CLI on the Pi). Renaming/reordering that
+//! field, dropping the trailing `s`, or writing other line shapes last
+//! silently disables stall auto-recovery — update the watchdog's sed
+//! pattern in lockstep with any format change.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

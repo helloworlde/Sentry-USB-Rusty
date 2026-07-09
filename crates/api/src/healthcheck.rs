@@ -316,15 +316,7 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
         // what the car actually sees. A gadget can stay "bound" through a
         // dead link (2026-07-08 incident: car showed an X for ~6 min while
         // this check would have passed).
-        let mut udc_state = String::new();
-        if let Ok(entries) = std::fs::read_dir("/sys/class/udc") {
-            for entry in entries.flatten() {
-                if let Ok(s) = std::fs::read_to_string(entry.path().join("state")) {
-                    udc_state = s.trim().to_string();
-                    break;
-                }
-            }
-        }
+        let udc_state = crate::status::read_udc_state();
         match udc_state.as_str() {
             "configured" => gad.push(item("Host link (UDC state)", "pass", None)),
             "" => {}
@@ -332,7 +324,8 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
                 "Host link (UDC state)",
                 "warn",
                 Some(format!(
-                    "gadget is bound but the host link reads '{other}' — the car may not see the drive"
+                    "gadget is bound but the host link reads '{other}' — normal while the car \
+                     sleeps or suspends the bus, a problem if the car is awake and recording"
                 )),
             )),
         }

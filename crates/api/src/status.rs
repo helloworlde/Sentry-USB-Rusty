@@ -693,7 +693,9 @@ fn read_fan_speed() -> String {
 
 /// Host-link state of the first UDC ("configured", "suspended",
 /// "not attached", ...). Empty when there is no UDC (non-gadget dev box).
-fn read_udc_state() -> String {
+/// Shared with the health check so the pill and the health warning can
+/// never disagree about what the link state means.
+pub(crate) fn read_udc_state() -> String {
     let Ok(entries) = std::fs::read_dir("/sys/class/udc") else {
         return String::new();
     };

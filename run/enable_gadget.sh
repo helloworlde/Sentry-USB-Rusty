@@ -67,7 +67,7 @@ lun=0
 # car's SCSI timeout and it drops the drive until re-plugged.
 if [ -e "/backingfiles/cam_disk.bin" ]
 then
-  echo 1 > "$gadget_root/functions/mass_storage.0/lun.${lun}/nofua"
+  echo 1 > "$gadget_root/functions/mass_storage.0/lun.${lun}/nofua" || true
   echo "/backingfiles/cam_disk.bin" > "$gadget_root/functions/mass_storage.0/lun.${lun}/file"
   echo "SentryUSB CAM $(du -h /backingfiles/cam_disk.bin | awk '{print $1}')" > "$gadget_root/functions/mass_storage.0/lun.${lun}/inquiry_string"
   ((++lun))
@@ -76,7 +76,7 @@ fi
 if [ -e "/backingfiles/music_disk.bin" ]
 then
   mkdir -p "$gadget_root/functions/mass_storage.0/lun.${lun}"
-  echo 1 > "$gadget_root/functions/mass_storage.0/lun.${lun}/nofua"
+  echo 1 > "$gadget_root/functions/mass_storage.0/lun.${lun}/nofua" || true
   echo "/backingfiles/music_disk.bin" > "$gadget_root/functions/mass_storage.0/lun.${lun}/file"
   echo "SentryUSB MUSIC $(du -h /backingfiles/music_disk.bin | awk '{print $1}')" > "$gadget_root/functions/mass_storage.0/lun.${lun}/inquiry_string"
   ((++lun))
@@ -85,7 +85,7 @@ fi
 if [ -e "/backingfiles/lightshow_disk.bin" ]
 then
   mkdir -p "$gadget_root/functions/mass_storage.0/lun.${lun}"
-  echo 1 > "$gadget_root/functions/mass_storage.0/lun.${lun}/nofua"
+  echo 1 > "$gadget_root/functions/mass_storage.0/lun.${lun}/nofua" || true
   echo "/backingfiles/lightshow_disk.bin" > "$gadget_root/functions/mass_storage.0/lun.${lun}/file"
   echo "SentryUSB LIGHTSHOW $(du -h /backingfiles/lightshow_disk.bin | awk '{print $1}')" > "$gadget_root/functions/mass_storage.0/lun.${lun}/inquiry_string"
   ((++lun))
@@ -94,7 +94,7 @@ fi
 if [ -e "/backingfiles/boombox_disk.bin" ]
 then
   mkdir -p "$gadget_root/functions/mass_storage.0/lun.${lun}"
-  echo 1 > "$gadget_root/functions/mass_storage.0/lun.${lun}/nofua"
+  echo 1 > "$gadget_root/functions/mass_storage.0/lun.${lun}/nofua" || true
   echo "/backingfiles/boombox_disk.bin" > "$gadget_root/functions/mass_storage.0/lun.${lun}/file"
   echo "SentryUSB BOOMBOX $(du -h /backingfiles/boombox_disk.bin | awk '{print $1}')" > "$gadget_root/functions/mass_storage.0/lun.${lun}/inquiry_string"
   ((++lun))

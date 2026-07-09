@@ -238,7 +238,14 @@ pub fn enable() -> Result<()> {
             // the cam icon) until it is re-plugged. nofua=1 lets FUA writes
             // complete as normal cached writes; the images are fsck'd on
             // every gadget cycle, so the integrity tradeoff is already priced in.
-            write_file(&lun_dir.join("nofua"), "1")?;
+            //
+            // Best-effort: a kernel whose mass_storage function lacks the
+            // nofua attribute must not fail the whole enable — missing nofua
+            // only means FUA stalls stay possible, while failing here would
+            // leave the car with no drive at all.
+            if let Err(e) = write_file(&lun_dir.join("nofua"), "1") {
+                tracing::warn!("could not set nofua on lun.{lun}: {e:#}");
+            }
             write_file(&lun_dir.join("file"), image_path)?;
 
             // Get file size for inquiry string

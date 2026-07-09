@@ -42,7 +42,10 @@ fi
 
 while [ -n "${1+x}" ]
 do
-  rclone --config /root/.config/rclone/rclone.conf move "${flags[@]}" --files-from "$2" "$1" "$RCLONE_DRIVE:$RCLONE_PATH" >> "$LOG_FILE" 2>&1
+  # Low I/O + CPU priority so the archive reads never starve the car's
+  # dashcam writes on the same disk (see run/rsync_archive/archive-clips.sh
+  # for the full rationale; -c2 -n7 not -c3 so progress is guaranteed).
+  ionice -c2 -n7 nice -n19 rclone --config /root/.config/rclone/rclone.conf move "${flags[@]}" --files-from "$2" "$1" "$RCLONE_DRIVE:$RCLONE_PATH" >> "$LOG_FILE" 2>&1
   shift 2
 done
 
