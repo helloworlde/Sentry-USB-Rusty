@@ -28,6 +28,8 @@
 
 The Rust rewrite of the original Go version. Same `sentryusb.conf`, faster server, more reliable.
 
+Sentry USB is one of four free tools for Tesla owners from the [Sentry Six](https://sentry-six.com) project, alongside [Sentry Studio](https://github.com/Sentry-Six/Sentry-Six) (desktop TeslaCam viewer), [Sentry Drive](https://github.com/Sentry-Six/Sentry-Drive) (drive history and FSD analytics), and [Sentry Connect](https://sentry-six.com/sentry-connect/) (the iPhone companion app for this Pi). Not affiliated with Tesla, Inc. Unrelated to the Sentry (sentry.io) error-monitoring service.
+
 > [!IMPORTANT]
 > Beginning with update 2026.20, Tesla has begun offering the ability to encrypt Tesla cam footage, which is enabled by default. Encrypted files cannot be read by Sentry USB. To continue using Sentry USB, please disable the encryption.
 > 
@@ -167,7 +169,7 @@ A Rust rewrite of the original Go [`Scottmg1/Sentry-USB`](https://github.com/Sco
 
 - **Discord** — [discord.gg/9QZEzVwdnt](https://discord.gg/9QZEzVwdnt) — fastest help, real humans
 - **Issues** — [github.com/Sentry-Six/Sentry-USB-Rusty/issues](https://github.com/Sentry-Six/Sentry-USB-Rusty/issues) — reproducible bugs
-- **Site** — [sentryusb.com](https://sentryusb.com)
+- **Site** — [sentry-six.com/sentry-usb](https://sentry-six.com/sentry-usb/)
 
 ## License
 
