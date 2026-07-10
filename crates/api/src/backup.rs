@@ -60,7 +60,7 @@ fn read_ssh_keypair() -> (String, String) {
     (String::new(), String::new())
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 struct BackupData {
     version: u32,
     date: String,
@@ -200,6 +200,101 @@ fn write_backup_to_dir(dir: &str, data: &BackupData) -> Result<(), String> {
         .map_err(|e| format!("failed to finalize backup: {}", e))?;
     info!("[backup] Wrote backup to {} ({} bytes)", path, json_bytes.len());
     Ok(())
+}
+
+/// Run `write` against a mounted `/mnt/archive`, owning the mount for
+/// the duration. Serialized against archiveloop's connect/disconnect
+/// scripts via the shared archive-mount flock, so a mount this creates
+/// can't be adopted by an archive cycle mid-write, and archiveloop's
+/// `umount -f -l` can't land under an in-flight backup.
+///
+/// If the share wasn't mounted, mounts it from fstab and unmounts it
+/// again before releasing the lock — a CIFS mount left up after the
+/// car drives away goes stale ("host is down") and wedges the next
+/// archive cycle, which is exactly what disconnect-archive.sh exists
+/// to prevent. A mount that was already up (an archive cycle's, whose
+/// post-archive step is what called us) is left alone; its owner
+/// unmounts it. The unmount runs even when `write` fails; an unmount
+/// failure is logged but doesn't mask the write result.
+///
+/// The whole transaction runs in its own spawned task: if the HTTP
+/// request future is cancelled (client disconnect), the lock guard must
+/// not drop mid-write and skip the unmount — the task detaches and
+/// finishes cleanup on its own.
+async fn with_archive_mounted<F, Fut>(write: F) -> Result<(), String>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    tokio::spawn(archive_mount_transaction(write))
+        .await
+        .map_err(|e| format!("archive write task: {}", e))?
+}
+
+async fn archive_mount_transaction<F, Fut>(write: F) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    async fn is_mounted() -> bool {
+        sentryusb_shell::run("findmnt", &["--mountpoint", "/mnt/archive"])
+            .await
+            .is_ok()
+    }
+
+    if !Path::new("/mnt/archive").exists() {
+        return Err("archive mount point /mnt/archive does not exist".to_string());
+    }
+
+    // Bounded wait: archiveloop holds this lock only for the seconds a
+    // mount/unmount transition takes, never across a whole cycle.
+    let guard = tokio::task::spawn_blocking(|| {
+        crate::archive_mount_lock::acquire(Duration::from_secs(60))
+    })
+    .await
+    .map_err(|e| format!("archive mount lock task: {}", e))?
+    .map_err(|e| format!("archive mount lock: {}", e))?;
+
+    let mut mounted_by_us = false;
+    if !is_mounted().await {
+        let mount_res = sentryusb_shell::run_with_timeout(
+            Duration::from_secs(30),
+            "mount",
+            &["/mnt/archive"],
+        )
+        .await;
+        // findmnt is ground truth, not mount's exit status: a timed-out
+        // mount(8) may still have completed the kernel transition, and
+        // that mount is ours to clean up.
+        if is_mounted().await {
+            mounted_by_us = true;
+        } else {
+            return match mount_res {
+                Err(e) => Err(format!("mount /mnt/archive: {}", e)),
+                Ok(_) => Err("archive not mounted at /mnt/archive after mount".to_string()),
+            };
+        }
+    }
+
+    let result = write().await;
+
+    if mounted_by_us {
+        // Mirror disconnect-archive.sh: bounded, force+lazy so a dead
+        // share can't hang the API. On failure the mount lingers (same
+        // exposure as a crash mid-archive) — log and move on.
+        if let Err(e) = sentryusb_shell::run_with_timeout(
+            Duration::from_secs(15),
+            "umount",
+            &["-f", "-l", "/mnt/archive"],
+        )
+        .await
+        {
+            warn!("[backup] failed to unmount /mnt/archive after backup: {}", e);
+        }
+    }
+
+    drop(guard);
+    result
 }
 
 async fn sync_backup_to_rsync(data: &BackupData) -> Result<(), String> {
@@ -367,21 +462,21 @@ async fn ship_drive_data(location: &str, gz_path: &str, date: &str) -> Result<()
     let archive_system = active.get("ARCHIVE_SYSTEM").cloned().unwrap_or_default();
     match archive_system.as_str() {
         "cifs" | "nfs" => {
-            if !Path::new("/mnt/archive").exists() {
-                return Err("archive not mounted at /mnt/archive".to_string());
-            }
             let gz = gz_path.to_string();
             let dest = format!("{}/{}", ARCHIVE_BACKUP_DIR, filename);
-            // Tens of MB onto a network mount — keep it off the runtime.
-            tokio::task::spawn_blocking(move || {
-                std::fs::create_dir_all(ARCHIVE_BACKUP_DIR)
-                    .map_err(|e| format!("create {}: {}", ARCHIVE_BACKUP_DIR, e))?;
-                let tmp = format!("{}.tmp", dest);
-                std::fs::copy(&gz, &tmp).map_err(|e| format!("copy to archive: {}", e))?;
-                std::fs::rename(&tmp, &dest).map_err(|e| format!("finalize: {}", e))
+            with_archive_mounted(move || async move {
+                // Tens of MB onto a network mount — keep it off the runtime.
+                tokio::task::spawn_blocking(move || {
+                    std::fs::create_dir_all(ARCHIVE_BACKUP_DIR)
+                        .map_err(|e| format!("create {}: {}", ARCHIVE_BACKUP_DIR, e))?;
+                    let tmp = format!("{}.tmp", dest);
+                    std::fs::copy(&gz, &tmp).map_err(|e| format!("copy to archive: {}", e))?;
+                    std::fs::rename(&tmp, &dest).map_err(|e| format!("finalize: {}", e))
+                })
+                .await
+                .map_err(|e| format!("copy task failed: {}", e))?
             })
             .await
-            .map_err(|e| format!("copy task failed: {}", e))?
         }
         "rsync" => {
             let server = active.get("RSYNC_SERVER").cloned().unwrap_or_default();
@@ -502,11 +597,13 @@ pub async fn create_backup(
             .unwrap_or_default();
         match archive_system.as_str() {
             "cifs" | "nfs" => {
-                if Path::new("/mnt/archive").exists() {
+                // Cloned: the write closure must be 'static so the
+                // transaction task can outlive a cancelled request.
+                let data = data.clone();
+                with_archive_mounted(move || async move {
                     write_backup_to_dir(ARCHIVE_BACKUP_DIR, &data)
-                } else {
-                    Err("archive not mounted at /mnt/archive".to_string())
-                }
+                })
+                .await
             }
             "rsync" => sync_backup_to_rsync(&data).await,
             "rclone" => sync_backup_to_rclone(&data).await,

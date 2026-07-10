@@ -338,6 +338,136 @@ RuntimeWatchdogSec=15'
     return 0
 }
 
+# ── Archive mount lock (CIFS/NFS connect/disconnect scripts) ────────────
+#
+# The API's backup path and archiveloop now coordinate /mnt/archive
+# ownership via a shared flock (/tmp/sentryusb_archive_mount.lock — see
+# crates/api/src/archive_mount_lock.rs). The lock-aware connect/
+# disconnect-archive.sh only land on disk at setup-wizard time
+# (crates/setup/src/archive.rs bakes them into the binary), so existing
+# CIFS/NFS installs need this refresh or archiveloop keeps running the
+# lock-free scripts and the coordination is one-sided.
+#
+# The heredocs below MUST stay byte-identical to
+# run/cifs_archive/{connect,disconnect}-archive.sh (the nfs copies are
+# the same files).
+apply_archive_mount_lock_scripts() {
+    # Only CIFS/NFS archives mount /mnt/archive from fstab; rsync/rclone
+    # (and archiveless) installs have nothing to lock.
+    if ! grep -qE '[[:space:]]/mnt/archive[[:space:]]+(cifs|nfs)[[:space:]]' /etc/fstab 2>/dev/null; then
+        log "archive-mount-lock: no CIFS/NFS /mnt/archive fstab entry — not applicable"
+        return 0
+    fi
+    if grep -q 'ARCHIVE_MOUNT_LOCK' /root/bin/connect-archive.sh 2>/dev/null \
+       && grep -q 'ARCHIVE_MOUNT_LOCK' /root/bin/disconnect-archive.sh 2>/dev/null; then
+        log "archive-mount-lock: already patched"
+        return 0
+    fi
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+
+    # Staged + atomic rename: a power loss or disk-full mid-write must
+    # never leave a truncated live script (archiveloop may invoke these
+    # at any moment, and a half-written file containing the marker would
+    # make the next patch run report "already patched").
+    cat > /root/bin/connect-archive.sh.new <<'CONNECT_EOF'
+#!/bin/bash -eu
+
+# Must match ARCHIVE_MOUNT_LOCK_PATH in crates/api/src/archive_mount_lock.rs
+# and disconnect-archive.sh.
+ARCHIVE_MOUNT_LOCK=/tmp/sentryusb_archive_mount.lock
+
+function mount_if_set() {
+  local mount_point=$1
+  [ -z "$mount_point" ] || ensure_mountpoint_is_mounted_with_retry "$mount_point"
+}
+
+# The archive mount is shared with the API's backup path, which may
+# mount /mnt/archive itself for a Backup Now and unmount it when done.
+# Take the shared flock around the transition so we can't adopt a
+# backup-owned mount that's about to be unmounted from under us. The
+# API holds the lock for its whole mount+write+unmount (bounded well
+# under the wait here). Fail-closed on lock timeout: mounting without
+# the lock reopens the adoption race, and archiveloop already handles a
+# failed connect by skipping the cycle and retrying next time.
+function mount_archive_locked() {
+  local mount_point=$1
+  [ -z "$mount_point" ] && return 0
+  (
+    if ! flock -w 300 210
+    then
+      log "Archive mount lock busy for 300s — failing archive connect (retried next cycle)."
+      exit 1
+    fi
+    ensure_mountpoint_is_mounted_with_retry "$mount_point"
+  ) 210>"$ARCHIVE_MOUNT_LOCK"
+}
+
+mount_archive_locked "${ARCHIVE_MOUNT:-}"
+mount_if_set "${MUSIC_ARCHIVE_MOUNT:-}"
+CONNECT_EOF
+
+    cat > /root/bin/disconnect-archive.sh.new <<'DISCONNECT_EOF'
+#!/bin/bash -eu
+
+# Unmount the archive. Without this, the archive mounts can get into a
+# state where the archive is reachable via the network, appears to be
+# mounted, but the mount is inoperable and any attempt to access it
+# results in a "host is down" message.
+
+# Must match ARCHIVE_MOUNT_LOCK_PATH in crates/api/src/archive_mount_lock.rs
+# and connect-archive.sh.
+ARCHIVE_MOUNT_LOCK=/tmp/sentryusb_archive_mount.lock
+
+unmount_if_set() {
+  local mount_point=$1
+  if [ -n "$mount_point" ]
+  then
+    if findmnt --mountpoint "$mount_point" > /dev/null
+    then
+      if timeout 10 umount -f -l "$mount_point" >> "$LOG_FILE" 2>&1
+      then
+        log "Unmounted $mount_point."
+      else
+        log "Failed to unmount $mount_point."
+      fi
+    else
+      log "$mount_point already unmounted."
+    fi
+  fi
+}
+
+# Archive unmount runs in the FOREGROUND under the shared flock, so an
+# in-flight API backup (which holds the lock across its mount+write)
+# can't have the mount force-lazy-unmounted mid-write. Bounded: the
+# umount itself is capped at 10s and the lock wait at 300s, so this
+# can't wedge the return to archiveloop the way an uncapped unmount
+# once could. Fail-closed on lock timeout: unmounting without the lock
+# is exactly the mid-write teardown the lock exists to prevent — skip,
+# and the next cycle's disconnect gets another chance. Music has no
+# API writer, so it keeps the old backgrounded, lock-free path.
+(
+  if ! flock -w 300 210
+  then
+    log "Archive mount lock busy for 300s — skipping archive unmount this cycle."
+    exit 0
+  fi
+  unmount_if_set "${ARCHIVE_MOUNT:-}"
+) 210>"$ARCHIVE_MOUNT_LOCK"
+unmount_if_set "${MUSIC_ARCHIVE_MOUNT:-}" &
+DISCONNECT_EOF
+
+    chmod 755 /root/bin/connect-archive.sh.new /root/bin/disconnect-archive.sh.new
+    if ! bash -n /root/bin/connect-archive.sh.new || ! bash -n /root/bin/disconnect-archive.sh.new; then
+        err "archive-mount-lock: staged scripts failed bash -n — keeping existing scripts"
+        rm -f /root/bin/connect-archive.sh.new /root/bin/disconnect-archive.sh.new
+        return 1
+    fi
+    # The && marker check above heals a power loss between the renames.
+    mv /root/bin/connect-archive.sh.new /root/bin/connect-archive.sh
+    mv /root/bin/disconnect-archive.sh.new /root/bin/disconnect-archive.sh
+    log "archive-mount-lock: lock-aware connect/disconnect-archive.sh installed"
+}
+
 # ── Run all patches ─────────────────────────────────────────────────────
 
 apply_ble_nonfatal_adv
@@ -345,6 +475,7 @@ apply_ble_adv_helper
 apply_eatt_disable
 apply_backingfiles_bfq
 apply_hardware_watchdog
+apply_archive_mount_lock_scripts
 
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays

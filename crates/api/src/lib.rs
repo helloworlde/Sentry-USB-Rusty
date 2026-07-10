@@ -14,6 +14,7 @@ pub mod travel_mode;
 pub mod notifications;
 pub mod notification_center;
 pub mod setup;
+pub mod archive_mount_lock;
 pub mod backup;
 pub mod update;
 pub mod support;
