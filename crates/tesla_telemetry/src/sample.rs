@@ -275,10 +275,10 @@ pub struct TiresResult {
     pub meta: ResponseMeta,
 }
 
-/// Result of a body-controller-state probe. Both fields are
-/// in-memory signals for the phase machine — they ride the sample
+/// Result of a body-controller-state probe. The signal fields are
+/// in-memory inputs for the phase machine — they ride the sample
 /// row so it gets persisted with a body_controller source marker,
-/// but the user_presence flag itself isn't stored.
+/// but the flags themselves aren't stored.
 pub struct BodyControllerSample {
     pub sample: Sample,
     /// Driver-seat occupancy. Used to detect "user got back in"
@@ -286,6 +286,12 @@ pub struct BodyControllerSample {
     /// promote to full state polling without waiting for the
     /// 15-min asleep cycle.
     pub user_presence: Option<bool>,
+    /// VCSEC vehicleSleepStatus collapsed to a bool (AWAKE → true,
+    /// ASLEEP → false, UNKNOWN → None). Sleep-safe awake signal for
+    /// Quiet mode: cam-disk mtime goes stale whenever the car isn't
+    /// recording (e.g. charging with Sentry off), so this is the only
+    /// awake indicator that survives a sampler restart mid-charge.
+    pub awake: Option<bool>,
 }
 
 /// A single point-in-time observation, in the shape the DB writer
