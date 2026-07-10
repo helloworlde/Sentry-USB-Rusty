@@ -608,6 +608,14 @@ pub async fn sample_body_controller_ble(
         _ => None,
     };
 
+    // VehicleSleepStatus_E (vcsec.proto): 0=UNKNOWN, 1=AWAKE, 2=ASLEEP.
+    // Same unknown-is-None treatment as user_presence above.
+    let awake = match resp.vehicle_sleep_status {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    };
+
     Ok(BodyControllerSample {
         sample: Sample {
             ts: now_secs(),
@@ -615,6 +623,7 @@ pub async fn sample_body_controller_ble(
             ..Sample::default()
         },
         user_presence,
+        awake,
     })
 }
 

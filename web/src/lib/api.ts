@@ -28,6 +28,15 @@ export interface PiStatus {
   free_space: string
   uptime: string
   drives_active: string
+  /**
+   * Host-link state from /sys/class/udc ("configured" = the car is
+   * actually enumerated and talking). drives_active only reflects the
+   * configfs binding — the Pi's intent to present — and stays "yes"
+   * through a dead link. Present only on backends ≥ v3.13.4.
+   */
+  udc_state?: string
+  /** Seconds since the car last wrote to cam_disk.bin, -1 when unknown. */
+  cam_last_write_secs?: number
   wifi_ssid: string
   wifi_strength: string
   wifi_ip: string

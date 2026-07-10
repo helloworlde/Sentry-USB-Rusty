@@ -12,7 +12,8 @@ hex = "0.4"
 
 sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# unix (not just linux): cycle_lock's flock also runs on the macOS dev harness
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

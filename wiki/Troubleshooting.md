@@ -17,9 +17,10 @@ The car isn't seeing the Pi as a USB drive.
 
 **Try:**
 1. **Check the cable** — make sure it's a **USB data cable**, not charge-only. The cheap ones bundled with most USB chargers are charge-only.
-2. Plug the Pi into a different USB port on the Tesla. Newer cars: glovebox port. Older cars: front console ports.
-3. Power-cycle the Pi (unplug, wait 5 seconds, plug back in).
-4. SSH into the Pi and check the USB gadget service: `systemctl status sentryusb-gadget`.
+2. On a **Pi Zero 2 W**, connect the Tesla cable to the port labelled **USB**, not **PWR IN**. The `PWR IN` port can power the Pi, but it does not carry the USB data connection the car needs.
+3. Plug the Pi into a different USB port on the Tesla. Newer cars: glovebox port. Older cars: front console ports.
+4. Power-cycle the Pi (unplug, wait 5 seconds, plug back in).
+5. SSH into the Pi and check the main service: `systemctl status sentryusb`. It includes the USB-gadget functionality; there is no separate `sentryusb-gadget` systemd unit.
 
 ## BLE Keep Awake stops working / can't pair
 

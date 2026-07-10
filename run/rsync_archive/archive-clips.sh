@@ -21,7 +21,12 @@ if [ "${TRAVEL_MODE_ACTIVE:-0}" = "1" ]; then
 else
   MONITOR_MISSES=5             # unchanged
   MONITOR_TIMEOUT=6            # unchanged
-  RSYNC_EXTRA=()               # unchanged (expands to nothing)
+  # --partial in normal mode too: with the archive reads now running at low
+  # I/O priority behind the car's writes, rsync's own --timeout=600 can
+  # abort a slowed-but-wanted transfer; without --partial the in-flight
+  # clip would restart from byte 0 next cycle, re-reading gigabytes against
+  # the same contended disk.
+  RSYNC_EXTRA=(--partial)
 fi
 
 function connectionmonitor {
@@ -51,7 +56,17 @@ connectionmonitor $$ &
 
 while [ -n "${1+x}" ]
 do
-  if ! (rsync -avhRL --timeout=600 --remove-source-files --no-perms --omit-dir-times \
+  # Low I/O + CPU priority: the archive reads tens of GB from the same disk
+  # the car is writing dashcam footage to through the USB gadget. At default
+  # priority those reads compete head-to-head with the car's writes and can
+  # stall them past the car's SCSI timeout (it drops the drive with an X).
+  # Best-effort lowest (-c2 -n7), NOT idle (-c3): under bfq the idle class is
+  # only serviced when the disk is otherwise quiet, so continuous sentry
+  # writes could stall the archive indefinitely and freespacemanager would
+  # end up purging footage that was never archived. -c2 -n7 keeps the car's
+  # default-priority writes winning while guaranteeing the archive makes
+  # progress. Needs the bfq scheduler to have effect (udev rule ships it).
+  if ! (ionice -c2 -n7 nice -n19 rsync -avhRL --timeout=600 --remove-source-files --no-perms --omit-dir-times \
         ${RSYNC_EXTRA[@]+"${RSYNC_EXTRA[@]}"} \
         --stats --log-file=/tmp/archive-rsync-cmd.log --ignore-missing-args \
         --files-from="$2" "$1" "$RSYNC_USER@$RSYNC_SERVER:$RSYNC_PATH" &> /tmp/rsynclog || [[ "$?" = "24" ]] )

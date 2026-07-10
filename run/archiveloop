@@ -265,7 +265,29 @@ function sync_disk_media_to_host () {
   log "Done reverse-syncing disk media to host paths."
 }
 
+# Serializes gadget teardown/bring-up between the main loop, the gadget
+# stall watchdog, and the Rust server's own gadget cycles (lock-chime
+# cam-disk sync, toggle-drives — see crates/usb_gadget/src/cycle_lock.rs).
+# Without it one party could re-enable the gadget while another has
+# cam_disk.bin mounted for a sync (two writers on one block device —
+# filesystem corruption, car stops recording).
+GADGET_CYCLE_LOCK=/tmp/sentryusb_gadget_cycle.lock
+
+# Run "$@" holding the gadget-cycle lock. Single definition so the fd
+# number and lock path can never drift between call sites — a mismatch
+# would silently stop the mutual exclusion.
+function with_gadget_lock () {
+  (
+    flock 209
+    "$@"
+  ) 209>"$GADGET_CYCLE_LOCK"
+}
+
 function connect_usb_drives_to_host() {
+  with_gadget_lock connect_usb_drives_to_host_locked
+}
+
+function connect_usb_drives_to_host_locked() {
   clear_archive_status
   log "Connecting usb to host..."
   # Always ensure the USB gadget is fully torn down before touching the cam
@@ -597,6 +619,10 @@ function fix_errors_in_images () {
 }
 
 function disconnect_usb_drives_from_host () {
+  with_gadget_lock disconnect_usb_drives_from_host_locked
+}
+
+function disconnect_usb_drives_from_host_locked () {
   log "Disconnecting usb from host..."
   if /root/bin/disable_gadget.sh
   then
@@ -1340,6 +1366,234 @@ function snapshotloop {
   done
 }
 
+# True when the car has been reachable over BLE recently. Reads the
+# telemetry daemon's once-a-minute heartbeat in /mutable/sentryusb-ble.log
+# (state_age = seconds since the last successful BLE state sample). The
+# heartbeat's own car= label is derived from cam_disk.bin mtime — the very
+# signal the watchdog is judging — so it must NOT be used here (circular);
+# state_age comes from the telemetry DB and is independent.
+# No sqlite3 CLI exists on the Pi, hence log parsing instead of a DB query.
+function car_is_awake_via_ble () {
+  local f=/mutable/sentryusb-ble.log
+  [ -f "$f" ] || return 1
+  local now mt state_age
+  now=$(date +%s)
+  mt=$(stat --format=%Y "$f" 2>/dev/null) || return 1
+  # Heartbeat itself stale => telemetry daemon down => awake state unknown.
+  # Fail safe: report not-awake so the watchdog never cycles blind.
+  (( now - mt < 180 )) || return 1
+  state_age=$(tail -c 400 "$f" 2>/dev/null | tail -n 1 | sed -n 's/.*state_age=\([0-9]\{1,\}\)s.*/\1/p')
+  [ -n "$state_age" ] && (( state_age <= 120 ))
+}
+
+# Snapshot everything a post-mortem needs BEFORE recovery destroys it.
+# journald is volatile on these installs — this file on /mutable is the
+# only place the kernel's view of a wedged gadget survives a reboot.
+function dump_gadget_stall_evidence () {
+  local out="$1"
+  {
+    echo "===== gadget stall evidence $(date) ====="
+    echo "--- /sys/class/udc state ---"
+    for u in /sys/class/udc/*/state; do echo "$u: $(cat "$u" 2>/dev/null)"; done
+    echo "--- gadget configfs ---"
+    echo "UDC: $(cat /sys/kernel/config/usb_gadget/sentryusb/UDC 2>/dev/null)"
+    for l in /sys/kernel/config/usb_gadget/sentryusb/functions/mass_storage.0/lun.*/file; do
+      echo "$l: $(cat "$l" 2>/dev/null)"
+    done
+    echo "--- cam_disk.bin ---"
+    stat /backingfiles/cam_disk.bin 2>/dev/null
+    echo "--- file-storage kernel thread io ---"
+    for p in $(pgrep -f file-storage 2>/dev/null); do
+      echo "pid $p:"; cat "/proc/$p/io" 2>/dev/null
+    done
+    echo "--- dmesg tail ---"
+    dmesg | tail -150
+  } > "$out" 2>&1 || true
+}
+
+# Detect the drive dying under the car and re-present it. On 2026-07-08 the
+# car stopped writing mid-drive while configfs still reported the gadget
+# bound; Tesla never retries a dropped drive on its own, so the outage
+# lasted until the car power-cycled the USB port (~6 min). A disable/enable
+# cycle re-enumerates the drive like a fresh plug and the car re-mounts it
+# within seconds.
+#
+# Triggers (gadget must be bound, car must be awake via BLE):
+#   1. UDC link state leaves "configured" and stays degraded >= 60s.
+#   2. Car writes to cam_disk.bin were flowing this boot, then stopped
+#      for >= GADGET_STALL_SECS (default 180) — and the archive is
+#      UNREACHABLE. The reachability gate matters: at home, "car stopped
+#      writing while awake" is what every normal arrival looks like once
+#      the dashcam turns off, so trigger 2 would fire a false cycle +
+#      notification on every drive home. Away from home (the incident
+#      scenario) that pattern really is a stall. A real at-home stall is
+#      still covered by trigger 1 plus the next archive cycle's own
+#      gadget re-present.
+# A car that is awake but legitimately not recording away from home can
+# still trip trigger 2 once; the cycle is harmless then (drive idle,
+# ~15s blip) and the rate limit keeps it from repeating.
+function gadget_stall_watchdog () {
+  echo -n gadgetwatchdog > /proc/self/comm
+  local cam=/backingfiles/cam_disk.bin
+  local stall_secs="${GADGET_STALL_SECS:-180}"
+  # One cooldown between recovery cycles plus a hard per-boot cap: a real
+  # stall needs one cycle; anything repeating is a deeper problem where
+  # blind cycling just churns the car.
+  local recovery_cooldown=600
+  local max_recoveries=3
+  local fresh_seen=0
+  local udc_bad_since=0
+  local last_recovery=0
+  local recoveries=0
+  local limit_logged=0
+
+  while true
+  do
+    sleep "${GADGET_WATCHDOG_INTERVAL:-30}"
+
+    # Only act while we intend to present the drive. During archiveloop's
+    # own gadget-down windows (music sync, boot, lock-chime cycle) this is
+    # false and the watchdog idles.
+    if ! usb_gadget_is_active
+    then
+      fresh_seen=0
+      udc_bad_since=0
+      continue
+    fi
+    [ -f "$cam" ] || continue
+
+    local now mtime age reason=""
+    now=$(date +%s)
+    mtime=$(stat --format=%Y "$cam" 2>/dev/null) || continue
+    age=$(( now - mtime ))
+    (( age < 90 )) && fresh_seen=1
+
+    local udc_state
+    udc_state=$(cat /sys/class/udc/*/state 2>/dev/null | head -1)
+    if [ "$udc_state" = "configured" ] || [ -z "$udc_state" ]
+    then
+      udc_bad_since=0
+    elif (( udc_bad_since == 0 ))
+    then
+      udc_bad_since=$now
+    fi
+
+    if [ -e /tmp/gadget_watchdog_force ]
+    then
+      rm -f /tmp/gadget_watchdog_force
+      reason="forced via /tmp/gadget_watchdog_force (test hook)"
+    elif ! car_is_awake_via_ble
+    then
+      continue
+    elif (( udc_bad_since > 0 && now - udc_bad_since >= 60 ))
+    then
+      reason="UDC state '$udc_state' for $(( now - udc_bad_since ))s while car awake"
+    elif (( fresh_seen == 1 && age >= stall_secs ))
+    then
+      # Home suppression for the write-stall trigger (see function header).
+      # Reset fresh_seen so this doesn't re-probe reachability every 30s
+      # until the car actually writes again.
+      if archive_is_reachable
+      then
+        fresh_seen=0
+        continue
+      fi
+      reason="car stopped writing for ${age}s while awake and away from home"
+    else
+      continue
+    fi
+
+    if (( recoveries >= max_recoveries ))
+    then
+      if (( limit_logged == 0 ))
+      then
+        limit_logged=1
+        log "Gadget stall watchdog: $reason — but recovery limit reached (${max_recoveries}/boot), not cycling again this boot"
+      fi
+      continue
+    fi
+    if (( last_recovery > 0 && now - last_recovery < recovery_cooldown ))
+    then
+      continue
+    fi
+
+    local evidence="/mutable/gadget_stall_$(date +%Y%m%d_%H%M%S).log"
+    log "Gadget stall watchdog: $reason — capturing evidence to $evidence, then re-presenting drive"
+    dump_gadget_stall_evidence "$evidence"
+
+    # Subshell exits 0 only when a cycle was actually attempted; a skip
+    # (lock busy, state changed under the lock) exits 3 so the counters
+    # and the push notification below don't fire for a non-event.
+    if (
+      # Bounded wait: if a gadget cycle elsewhere is wedged in an
+      # uninterruptible configfs write (the very failure class this
+      # watchdog targets), a plain flock would block forever and take
+      # the watchdog down with it. Skip and retry next loop instead.
+      if ! flock -w 60 209
+      then
+        log "Gadget stall watchdog: gadget lock busy for 60s, skipping recovery attempt"
+        exit 3
+      fi
+      # Re-verify under the lock — the main loop may have legitimately
+      # taken the gadget down between our decision and acquiring the lock.
+      if usb_gadget_is_active \
+         && ! findmnt --mountpoint "$CAM_MOUNT" > /dev/null \
+         && ! findmnt --mountpoint "$MUSIC_MOUNT" > /dev/null
+      then
+        /root/bin/disable_gadget.sh || log "Gadget stall watchdog: disable_gadget failed (exit $?)"
+        sleep 2
+        if /root/bin/enable_gadget.sh
+        then
+          log "Gadget stall watchdog: drive re-presented to the car"
+        else
+          log "Gadget stall watchdog: ERROR enable_gadget failed (exit $?)"
+        fi
+      else
+        log "Gadget stall watchdog: state changed before recovery could run, skipping cycle"
+        exit 3
+      fi
+    ) 209>"$GADGET_CYCLE_LOCK"
+    then
+      /root/bin/send-push-message "$NOTIFICATION_TITLE:" \
+        "USB drive stall detected ($reason). Re-presented the drive to the car. Evidence: $evidence" \
+        warning gadget_stall 2>/dev/null || true
+      last_recovery=$now
+      recoveries=$((recoveries + 1))
+      fresh_seen=0
+      udc_bad_since=0
+    fi
+  done
+}
+
+# Mirror the kernel log to persistent storage. journald is volatile here,
+# so without this a reboot destroys the only record of dwc2/mass-storage
+# trouble (exactly what happened on 2026-07-08).
+function kmsgmirror {
+  echo -n kmsgmirror > /proc/self/comm
+  local out=/mutable/kernel.log
+  local n=0
+  {
+    echo "===== boot $(date) ====="
+    dmesg --time-format iso 2>/dev/null || dmesg 2>/dev/null || true
+  } >> "$out" 2>/dev/null || true
+  # Trim right after the boot dump too — on a reboot-heavy box with a
+  # quiet kernel the follow loop below may not see enough lines to ever
+  # hit its size check, and repeated boot dumps would grow unbounded.
+  if [[ "$(stat --format=%s "$out" 2>/dev/null)" -gt 2000000 ]] 2>/dev/null
+  then
+    tail -n 8000 "$out" > "${out}.2" 2>/dev/null && mv "${out}.2" "$out" 2>/dev/null || true
+  fi
+  { dmesg -W --time-format iso 2>/dev/null || dmesg -w 2>/dev/null; } | while IFS= read -r line
+  do
+    echo "$line" >> "$out" 2>/dev/null || true
+    n=$((n + 1))
+    if (( n % 200 == 0 )) && [[ "$(stat --format=%s "$out" 2>/dev/null)" -gt 2000000 ]] 2>/dev/null
+    then
+      tail -n 8000 "$out" > "${out}.2" 2>/dev/null && mv "${out}.2" "$out" 2>/dev/null || true
+    fi
+  done
+}
+
 function freespacemanager {
   echo -n freespacemanager > /proc/self/comm
   # 10G
@@ -1436,6 +1690,12 @@ export -f log
 echo "==============================================" >> "$LOG_FILE"
 log "Starting archiveloop at $(awk '{print $1}' /proc/uptime) seconds uptime..."
 
+# One-line boot forensics: distinguishes a car power-cut from a PMIC
+# brownout or watchdog reset when reconstructing an incident later.
+# power_reset is a Pi 5 PMIC flag (all zeros = clean power-on); throttled
+# bit 0 = undervoltage since boot.
+log "Boot reason: power_reset=$(od -An -tx1 /proc/device-tree/chosen/power/power_reset 2>/dev/null | tr -d ' \n' || true) throttled=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2 || true)"
+
 set_sys_param /proc/sys/vm/dirty_background_bytes DIRTY_BACKGROUND_BYTES 65536
 set_sys_param /proc/sys/vm/dirty_ratio DIRTY_RATIO 80
 set_sys_param /sys/devices/system/cpu/cpufreq/policy0/scaling_governor CPU_GOVERNOR conservative
@@ -1446,10 +1706,12 @@ if has_cam_disk
 then
   snapshotloop &
   freespacemanager &
+  gadget_stall_watchdog &
 fi
 logrotator &
 wifichecker &
 timesyncloop &
+kmsgmirror &
 
 # Travel Mode crash-restart guard: the service runs with Restart=always, so
 # any archiveloop crash re-enters this startup path with the system still in
@@ -1481,12 +1743,26 @@ else
   then
     # always remove files that fsck recoverd
     clean_cam_mount boot
-
-    # don't need another fsck because fix_errors_in_images already did that
-    /root/bin/make_snapshot.sh nofsck
   fi
 
+  # Present the drive to the car BEFORE the boot snapshot. The snapshot is
+  # a reflink copy of the live image — safe while the car writes, exactly
+  # like every mid-loop snapshot — and taking it here used to cost the car
+  # ~50 extra seconds without a drive on every power-on. The lock chime is
+  # synced inside connect (before enable), so the car still sees a single
+  # plug-in with everything already in place.
   connect_usb_drives_to_host
+
+  if has_cam_disk
+  then
+    # Snapshot immediately — no waitforidle. In sentry mode the car never
+    # idles for the 5s gap, so waitforidle would burn its full 90s cap on
+    # every boot AND widen the window in which the car can rotate away
+    # clips before this snapshot captures them. A mid-write copy is fine:
+    # make_snapshot fscks the copy (default mode), and a partial in-flight
+    # clip was always possible across the power-loss boundary anyway.
+    /root/bin/make_snapshot.sh || log "ERROR: boot make_snapshot.sh failed (exit $?)"
+  fi
 fi
 
 if archive_is_reachable

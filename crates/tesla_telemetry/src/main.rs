@@ -119,6 +119,37 @@ const PARKED_AWAKE_TPMS_INTERVAL: Duration = Duration::from_secs(1800);
 /// parking.
 const PARK_CONFIRMATIONS_BEFORE_QUIET: u32 = 3;
 
+/// How long a charge/sentry reading stays authoritative for the Quiet
+/// gate. ~3 parked-awake refresh opportunities (see
+/// PARKED_AWAKE_REFRESH_INTERVAL) or ~10 Active charge polls — past
+/// that, the reading predates a sustained poll outage and pinning
+/// Active on it would recreate the accidental-keep-awake loop the
+/// unread defaults used to cause, just with a stale value instead of
+/// no value. Policy constant, deliberately not derived from the poll
+/// cadences.
+const GATE_READING_MAX_AGE: Duration = Duration::from_secs(600);
+
+/// A gate input paired with when it was read, so consumers that make
+/// live decisions (the Quiet gate, poll-cadence hints) can ignore
+/// readings that predate a long poll outage. Keep-accessory
+/// deliberately consumes the raw value instead — see its call site.
+#[derive(Clone, Copy)]
+struct TimedReading<T: Copy> {
+    value: T,
+    at: Instant,
+}
+
+impl<T: Copy> TimedReading<T> {
+    fn now(value: T) -> Self {
+        Self { value, at: Instant::now() }
+    }
+
+    /// The value if read within `max_age`, else None (treat as unread).
+    fn fresh(&self, max_age: Duration) -> Option<T> {
+        (self.at.elapsed() < max_age).then_some(self.value)
+    }
+}
+
 /// Cadence for the keep-accessory geofence `state location` poll. Raw
 /// GPS isn't bundled in `state drive`, so this is its own round-trip —
 /// kept coarse (home/away changes slowly) and only run when the
@@ -303,14 +334,15 @@ async fn main() -> Result<()> {
     // Long-lived BLE session, lazy-spawned in tick() and reused to avoid
     // re-scan + re-handshake each cycle. Recreated if the VIN changes.
     let mut ble_session: Option<sample_ble::SessionHandle> = None;
-    // Last charging_state from a successful `state charge` poll. Drives
-    // the quiet-mode gate: active charging keeps the car awake, so
-    // quieting would leave battery_pct stale. `None` → assume charging
-    // (stay Active until proven otherwise).
-    let mut last_charging_state: Option<sample::ChargingState> = None;
+    // Last charging_state from a successful `state charge` poll,
+    // timestamped so gate consumers can expire it (GATE_READING_MAX_AGE).
+    // Drives the quiet-mode gate: active charging keeps the car awake,
+    // so quieting would leave battery_pct stale. `None` → assume
+    // charging (stay Active until proven otherwise).
+    let mut last_charging_state: Option<TimedReading<sample::ChargingState>> = None;
     // Same gate for sentry mode (from `state closures`): any non-Off
     // value keeps the car awake. `None` → assume on.
-    let mut last_sentry_mode: Option<sample::SentryMode> = None;
+    let mut last_sentry_mode: Option<TimedReading<sample::SentryMode>> = None;
     // Throttle for the staying-Active gate log (~1/min).
     let mut last_gate_log: Option<Instant> = None;
     // Last known GPS from the drive poll (held across ticks; parked
@@ -451,7 +483,14 @@ async fn main() -> Result<()> {
                                 || usb_watch::observe() == CarState::Asleep,
                             lock::is_archive_active(),
                             held_radio,
-                            last_charging_state,
+                            // Deliberately RAW (not freshness-filtered):
+                            // evaluate() reads this as "cable state", and a
+                            // 10-min expiry to None mid-BLE-outage is
+                            // indistinguishable from cable-unplugged — it
+                            // would tear down an in-progress charge hold and
+                            // re-fire its notifications on recovery. Stale
+                            // exposure is bounded by its own CHARGE_HOLD_MAX.
+                            last_charging_state.as_ref().map(|r| r.value),
                         )
                         .await;
                     }
@@ -487,6 +526,45 @@ fn should_enter_quiet(
         && !keep_awake_active
 }
 
+/// Resolve optional charge/sentry readings into the booleans that feed the
+/// Quiet gate.
+///
+/// Unknown values stay conservative while the car is not yet parked-confirmed
+/// and during explicit keep-awake work. Once the sampler has independently
+/// confirmed the car is parked/asleep and keep-awake is not active, unread
+/// charge/sentry values must not pin Active forever: doing so turns telemetry
+/// itself into an accidental keep-awake loop when Tesla omits those optional
+/// fields or encrypted responses fail to decode.
+fn resolve_gate_inputs(
+    car_truly_asleep: bool,
+    parked_confirmed: bool,
+    last_charging_state: Option<sample::ChargingState>,
+    last_sentry_mode: Option<sample::SentryMode>,
+    keep_awake_active: bool,
+) -> (bool, bool) {
+    let sleep_candidate = car_truly_asleep || parked_confirmed;
+    let unknown_should_pin_active = keep_awake_active || !sleep_candidate;
+
+    let actively_charging = last_charging_state
+        .map(|s| s.is_active_charging())
+        .unwrap_or(unknown_should_pin_active);
+    let sentry_on = last_sentry_mode
+        .map(|s| s.is_on())
+        .unwrap_or(unknown_should_pin_active);
+
+    (actively_charging, sentry_on)
+}
+
+/// Whether Quiet mode may run the parked-awake climate/charge/closures
+/// refresh: the car must be provably awake, either recording clips
+/// (cam-disk mtime fresh) or per the body controller's own sleep
+/// status. BC AWAKE matters when the mtime lies — a charging car with
+/// Sentry off writes no clips, so usb_watch reads Asleep/Idle while
+/// the car is wide awake. Polling an awake car adds no wake-up drain.
+fn should_refresh_parked_awake(observation: CarState, bc_awake: Option<bool>) -> bool {
+    observation == CarState::Awake || bc_awake == Some(true)
+}
+
 /// One main-loop iteration; returns how long to sleep before the next,
 /// plus the config snapshot it parsed (so the caller's keep-accessory
 /// pass doesn't re-read the file; `None` = config load failed).
@@ -510,8 +588,8 @@ async fn tick(
     last_parked_awake_refresh: &mut Option<Instant>,
     last_parked_awake_tpms_refresh: &mut Option<Instant>,
     ble_session: &mut Option<sample_ble::SessionHandle>,
-    last_charging_state: &mut Option<sample::ChargingState>,
-    last_sentry_mode: &mut Option<sample::SentryMode>,
+    last_charging_state: &mut Option<TimedReading<sample::ChargingState>>,
+    last_sentry_mode: &mut Option<TimedReading<sample::SentryMode>>,
     last_gate_log: &mut Option<Instant>,
     last_lat: &mut Option<f64>,
     last_lon: &mut Option<f64>,
@@ -576,21 +654,31 @@ async fn tick(
     let car_truly_asleep = observation == CarState::Asleep;
     let parked_confirmed = *parked_polls >= PARK_CONFIRMATIONS_BEFORE_QUIET;
 
-    // Conservative defaults: with no successful charge/closures poll yet,
-    // assume charging / sentry-on to stay Active. Costs a brief Active
-    // burst (~30-60s) at cold start before the first polls confirm the
-    // car can sleep.
-    let actively_charging = last_charging_state
-        .map(|s| s.is_active_charging())
-        .unwrap_or(true);
-    let sentry_on = last_sentry_mode.map(|s| s.is_on()).unwrap_or(true);
-
     // A keep-awake in effect — an archive cycle or any nudge loop (web-UI,
     // drive processing) — must pin us Active. Dropping to sleep-safe
     // polling mid-archive lets the car sleep, which cuts USB power and
     // aborts the copy. Self-clears when the work finishes, so it can't
     // wedge the car permanently awake (see lock::keep_awake_requested).
     let keep_awake_active = lock::keep_awake_requested();
+
+    // Freshness-filtered gate inputs: a reading older than
+    // GATE_READING_MAX_AGE predates a sustained poll outage, so the
+    // gate treats it as unread rather than letting a stale Charging /
+    // SentryOn pin the car Active forever.
+    let charging_fresh = last_charging_state
+        .as_ref()
+        .and_then(|r| r.fresh(GATE_READING_MAX_AGE));
+    let sentry_fresh = last_sentry_mode
+        .as_ref()
+        .and_then(|r| r.fresh(GATE_READING_MAX_AGE));
+
+    let (actively_charging, sentry_on) = resolve_gate_inputs(
+        car_truly_asleep,
+        parked_confirmed,
+        charging_fresh,
+        sentry_fresh,
+        keep_awake_active,
+    );
 
     // Keep-awake state cleanup happens here; the nudge itself fires
     // AFTER the polls below (see "Sampler keep-awake CPC dispatch"
@@ -637,13 +725,17 @@ async fn tick(
             .unwrap_or(true);
         if due {
             *last_gate_log = Some(now);
-            let sentry_src = if last_sentry_mode.is_some() {
+            let sentry_src = if sentry_fresh.is_some() {
                 "read"
+            } else if last_sentry_mode.is_some() {
+                "STALE: treated unread"
             } else {
                 "DEFAULTED: unread"
             };
-            let charge_src = if last_charging_state.is_some() {
+            let charge_src = if charging_fresh.is_some() {
                 "read"
+            } else if last_charging_state.is_some() {
+                "STALE: treated unread"
             } else {
                 "DEFAULTED: unread"
             };
@@ -705,19 +797,25 @@ async fn tick(
             let mut connect_failed = false;
             // Always probe body-controller first — it's the
             // canonical source of user_presence and is sleep-safe.
-            let presence_now = match sample_ble::sample_body_controller_ble(session).await {
-                Ok(bc) => {
-                    let p = bc.user_presence;
-                    persist(conn, bc.sample);
-                    p
-                }
-                Err(e) => {
-                    connect_failed =
-                        sentryusb_tesla_ble::manager::is_connect_failure(&e);
-                    warn!("sample_body_controller failed: {e:#}");
-                    *last_user_presence
-                }
-            };
+            // `bc_awake` is the car's own sleep status (VCSEC), which
+            // stays truthful when the cam-disk mtime doesn't: a
+            // charging car with Sentry off writes no clips, so
+            // usb_watch reads Asleep while the car is wide awake.
+            let (presence_now, bc_awake) =
+                match sample_ble::sample_body_controller_ble(session).await {
+                    Ok(bc) => {
+                        let p = bc.user_presence;
+                        let awake = bc.awake;
+                        persist(conn, bc.sample);
+                        (p, awake)
+                    }
+                    Err(e) => {
+                        connect_failed =
+                            sentryusb_tesla_ble::manager::is_connect_failure(&e);
+                        warn!("sample_body_controller failed: {e:#}");
+                        (*last_user_presence, None)
+                    }
+                };
 
             // Driver-got-back-in: user_presence NOT_PRESENT → PRESENT.
             // Promote to Active immediately (short Duration → state poll
@@ -726,7 +824,12 @@ async fn tick(
                 info!("user_presence flipped PRESENT — resuming full state polls");
                 *parked_polls = 0;
                 *last_user_presence = presence_now;
-                if car_truly_asleep {
+                if car_truly_asleep && bc_awake != Some(true) {
+                    // Same guard as the release at the bottom of the
+                    // quiet path: a fresh BC AWAKE overrides a stale
+                    // cam mtime, and releasing here just hands another
+                    // process a window to grab the lock before the
+                    // Active tick re-acquires it.
                     release_radio().await;
                     *held_radio = false;
                 }
@@ -788,19 +891,22 @@ async fn tick(
             }
 
             // Parked-awake state refresh: when the car is parked
-            // (Quiet mode) but actively recording dashcam clips
-            // (observation == Awake), do a periodic climate +
-            // charge poll so battery/temps don't go indefinitely
-            // stale during Sentry sessions or AC charging. Safe
-            // because the car is already awake — we add no
-            // wake-up drain. Only fires every 3 min to keep BLE
-            // load minimal.
+            // (Quiet mode) but provably awake — recording dashcam
+            // clips (observation == Awake) OR the body controller
+            // reports AWAKE (covers charging with Sentry off, where
+            // no clips are written and the cam mtime lies) — do a
+            // periodic climate + charge poll so battery/temps don't
+            // go indefinitely stale during Sentry sessions or AC
+            // charging. Safe because the car is already awake — we
+            // add no wake-up drain. Only fires every 3 min to keep
+            // BLE load minimal.
             //
-            // Skipped when car_truly_asleep (let it sleep) or
-            // when the user is in the car (the drive probe above
-            // already covers that path and a state transition is
-            // imminent).
-            if !connect_failed && observation == CarState::Awake && presence_now != Some(true) {
+            // Runs even with the user in the car: the drive probe
+            // above already early-returned to Active on an actual
+            // shift out of Park, so reaching here means still-parked
+            // — and someone sitting in a charging car shouldn't
+            // freeze the charge telemetry.
+            if !connect_failed && should_refresh_parked_awake(observation, bc_awake) {
                 // Two independent timers in this branch:
                 //   * `refresh_due`   — climate + charge every 3 min
                 //   * `tpms_due`      — tire pressure every 30 min
@@ -852,7 +958,7 @@ async fn tick(
                                 // charge that starts mid-quiet bumps
                                 // us back to Active on the next tick.
                                 if let Some(cs) = c.charging_state {
-                                    *last_charging_state = Some(cs);
+                                    *last_charging_state = Some(TimedReading::now(cs));
                                 }
                                 any_ok = true;
                             }
@@ -869,7 +975,7 @@ async fn tick(
                                 }
                                 try_sync_clock(c.meta);
                                 if let Some(sm) = c.sentry_mode {
-                                    *last_sentry_mode = Some(sm);
+                                    *last_sentry_mode = Some(TimedReading::now(sm));
                                 }
                             }
                             Err(e) => warn!("parked-awake closures refresh failed: {e:#}"),
@@ -905,13 +1011,28 @@ async fn tick(
             }
 
             *last_user_presence = presence_now;
-            if car_truly_asleep {
-                // Deep sleep + no user → hand the radio back to
-                // iOS GATT between polls.
+            if car_truly_asleep && bc_awake != Some(true) {
+                // Deep sleep + no user → release the inter-process
+                // radio lock between polls. Skipped when the body
+                // controller says the car is actually awake (stale
+                // cam mtime, e.g. charging with Sentry off) — the
+                // 3-min refresh wants the lock every tick, and
+                // dropping it just invites lock churn with the other
+                // BLE processes.
                 release_radio().await;
                 *held_radio = false;
             }
         }
+
+        // Keep the gate snapshot live in Quiet too — this is where a
+        // reading crosses GATE_READING_MAX_AGE, and the (stale) marker
+        // is the diagnostic for "why did the gate stop honoring it".
+        // `shift` is None truthfully: no Active drive poll ran.
+        write_gate_status_file(
+            last_sentry_mode.as_ref(),
+            last_charging_state.as_ref(),
+            None,
+        );
         (QUIET_INTERVAL, Some(cfg))
     } else {
         // Active mode — scheduler-driven multi-poll. Each tick runs the
@@ -1015,6 +1136,7 @@ async fn tick(
         // any_call_ran.
         let charging_now = last_charging_state
             .as_ref()
+            .and_then(|r| r.fresh(GATE_READING_MAX_AGE))
             .map(|s| s.is_active_charging())
             .unwrap_or(false);
         if !connect_failed
@@ -1123,7 +1245,7 @@ async fn tick(
                     // value on failure (don't force an Active burst on one
                     // transient miss).
                     if let Some(cs) = c.charging_state {
-                        *last_charging_state = Some(cs);
+                        *last_charging_state = Some(TimedReading::now(cs));
                     }
                     true
                 }
@@ -1150,7 +1272,7 @@ async fn tick(
                     }
                     try_sync_clock(c.meta);
                     if let Some(sm) = c.sentry_mode {
-                        *last_sentry_mode = Some(sm);
+                        *last_sentry_mode = Some(TimedReading::now(sm));
                     }
                     true
                 }
@@ -1360,7 +1482,11 @@ async fn tick(
         }
 
         // Live gate snapshot for the BLE card (not the DB).
-        write_gate_status_file(*last_sentry_mode, *last_charging_state, shift_state_observed);
+        write_gate_status_file(
+            last_sentry_mode.as_ref(),
+            last_charging_state.as_ref(),
+            shift_state_observed,
+        );
 
         // Sleep until the next sub-sampler is due (usually drive, 15s).
         let next = schedule.next_due();
@@ -1467,26 +1593,46 @@ fn persist(conn: &Connection, sample: Sample) {
 const GATE_STATUS_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
 
 fn write_gate_status_file(
-    sentry: Option<sample::SentryMode>,
-    charging: Option<sample::ChargingState>,
+    sentry: Option<&TimedReading<sample::SentryMode>>,
+    charging: Option<&TimedReading<sample::ChargingState>>,
     shift: Option<sample::ShiftState>,
 ) {
     let sentry_s = sentry
-        .map(|s| format!("{s:?}"))
+        .map(|r| format!("{:?}", r.value))
         .unwrap_or_else(|| "unknown".into());
     let charging_s = charging
-        .map(|c| format!("{c:?}"))
+        .map(|r| format!("{:?}", r.value))
         .unwrap_or_else(|| "unknown".into());
-    // `absent` = drive poll succeeded but shift_state omitted.
+    // `absent` = drive poll didn't report a shift_state (omitted from
+    // the response, or no drive poll ran this tick — Quiet mode).
     let shift_s = shift
         .map(|s| format!("{s:?}"))
         .unwrap_or_else(|| "absent".into());
+    // Reading age as extra keys (parsers strip known prefixes only, so
+    // these are additive). `_stale=true` = past GATE_READING_MAX_AGE —
+    // the gate is treating the value above as unread.
+    let age_line = |name: &str, at: Option<Instant>| -> String {
+        match at {
+            Some(at) => {
+                let age = at.elapsed();
+                let stale = if age >= GATE_READING_MAX_AGE {
+                    format!("{name}_stale=true\n")
+                } else {
+                    String::new()
+                };
+                format!("{name}_age_s={}\n{stale}", age.as_secs())
+            }
+            None => String::new(),
+        }
+    };
+    let sentry_age = age_line("sentry_mode", sentry.map(|r| r.at));
+    let charging_age = age_line("charging_state", charging.map(|r| r.at));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let body = format!(
-        "sentry_mode={sentry_s}\ncharging_state={charging_s}\nshift_state={shift_s}\nupdated={now}\n"
+        "sentry_mode={sentry_s}\n{sentry_age}charging_state={charging_s}\n{charging_age}shift_state={shift_s}\nupdated={now}\n"
     );
     let _ = std::fs::write(GATE_STATUS_PATH, body);
 }
@@ -1777,8 +1923,129 @@ mod tests {
     }
 
     #[test]
+    fn unread_charge_and_sentry_do_not_pin_parked_car_when_keep_awake_is_off() {
+        let (actively_charging, sentry_on) = resolve_gate_inputs(
+            false, // car_truly_asleep
+            true,  // parked_confirmed
+            None,  // charging_state unread
+            None,  // sentry_mode unread
+            false, // keep_awake_active
+        );
+
+        assert!(!actively_charging);
+        assert!(!sentry_on);
+        assert!(should_enter_quiet(false, true, actively_charging, sentry_on, false));
+    }
+
+    #[test]
+    fn unread_charge_and_sentry_still_pin_active_during_keep_awake() {
+        let (actively_charging, sentry_on) = resolve_gate_inputs(
+            false, // car_truly_asleep
+            true,  // parked_confirmed
+            None,  // charging_state unread
+            None,  // sentry_mode unread
+            true,  // keep_awake_active
+        );
+
+        assert!(actively_charging);
+        assert!(sentry_on);
+        assert!(!should_enter_quiet(false, true, actively_charging, sentry_on, true));
+    }
+
+    #[test]
     fn moving_car_never_quiets() {
         // Not parked-confirmed and not asleep (e.g. driving).
         assert!(!should_enter_quiet(false, false, false, false, false));
+    }
+
+    /// A TimedReading backdated by `age` (for expiry tests).
+    fn reading_aged<T: Copy>(value: T, age: Duration) -> TimedReading<T> {
+        TimedReading {
+            value,
+            at: Instant::now().checked_sub(age).expect("test age fits in Instant"),
+        }
+    }
+
+    #[test]
+    fn fresh_reading_within_max_age_returns_value() {
+        let r = reading_aged(sample::ChargingState::Charging, Duration::from_secs(30));
+        assert_eq!(
+            r.fresh(GATE_READING_MAX_AGE),
+            Some(sample::ChargingState::Charging)
+        );
+    }
+
+    #[test]
+    fn expired_reading_returns_none() {
+        let r = reading_aged(
+            sample::ChargingState::Charging,
+            GATE_READING_MAX_AGE + Duration::from_secs(1),
+        );
+        assert_eq!(r.fresh(GATE_READING_MAX_AGE), None);
+    }
+
+    #[test]
+    fn expired_charging_reading_no_longer_pins_parked_car() {
+        // A pre-outage Some(Charging) must expire into the unread path:
+        // parked-confirmed + keep-awake off → gate treats it sleep-safe
+        // instead of pinning Active forever on a stale value.
+        let stale = reading_aged(
+            sample::ChargingState::Charging,
+            GATE_READING_MAX_AGE + Duration::from_secs(1),
+        );
+        let charging_fresh = stale.fresh(GATE_READING_MAX_AGE);
+        assert_eq!(charging_fresh, None);
+
+        let (actively_charging, sentry_on) =
+            resolve_gate_inputs(false, true, charging_fresh, None, false);
+        assert!(!actively_charging);
+        assert!(!sentry_on);
+        assert!(should_enter_quiet(false, true, actively_charging, sentry_on, false));
+    }
+
+    #[test]
+    fn expired_readings_still_pin_active_during_keep_awake() {
+        let stale = reading_aged(
+            sample::ChargingState::Charging,
+            GATE_READING_MAX_AGE + Duration::from_secs(1),
+        );
+        let (actively_charging, sentry_on) =
+            resolve_gate_inputs(false, true, stale.fresh(GATE_READING_MAX_AGE), None, true);
+        assert!(actively_charging);
+        assert!(sentry_on);
+        assert!(!should_enter_quiet(false, true, actively_charging, sentry_on, true));
+    }
+
+    #[test]
+    fn bc_awake_enables_refresh_when_cam_mtime_is_stale() {
+        // Charging with Sentry off: no clip writes, so usb_watch reads
+        // Asleep — but the body controller knows the car is awake.
+        assert!(should_refresh_parked_awake(CarState::Asleep, Some(true)));
+        // Same for the Idle band (writes within 5 min but not 90 s),
+        // which previously got neither refresh path.
+        assert!(should_refresh_parked_awake(CarState::Idle, Some(true)));
+    }
+
+    #[test]
+    fn refresh_skipped_unless_provably_awake() {
+        // BC says asleep / unknown and no clip writes → let it sleep.
+        assert!(!should_refresh_parked_awake(CarState::Asleep, Some(false)));
+        assert!(!should_refresh_parked_awake(CarState::Asleep, None));
+        assert!(!should_refresh_parked_awake(CarState::Idle, None));
+        // Clip writes alone are still sufficient (BC unread).
+        assert!(should_refresh_parked_awake(CarState::Awake, None));
+    }
+
+    #[test]
+    fn expired_reading_raw_value_remains_for_keep_accessory() {
+        // Keep-accessory intentionally consumes the raw value (see its
+        // call site): expiry must hide the reading from the gate without
+        // destroying it for the charge-hold policy.
+        let stale = reading_aged(
+            sample::ChargingState::Charging,
+            GATE_READING_MAX_AGE + Duration::from_secs(1),
+        );
+        assert_eq!(stale.fresh(GATE_READING_MAX_AGE), None);
+        assert_eq!(stale.value, sample::ChargingState::Charging);
     }
 }
