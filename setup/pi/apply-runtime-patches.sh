@@ -439,16 +439,16 @@ unmount_if_set() {
 # Archive unmount runs in the FOREGROUND under the shared flock, so an
 # in-flight API backup (which holds the lock across its mount+write)
 # can't have the mount force-lazy-unmounted mid-write. Bounded: the
-# umount itself is capped at 10s and the lock wait at 60s, so this
+# umount itself is capped at 10s and the lock wait at 300s, so this
 # can't wedge the return to archiveloop the way an uncapped unmount
 # once could. Fail-closed on lock timeout: unmounting without the lock
 # is exactly the mid-write teardown the lock exists to prevent — skip,
 # and the next cycle's disconnect gets another chance. Music has no
 # API writer, so it keeps the old backgrounded, lock-free path.
 (
-  if ! flock -w 60 210
+  if ! flock -w 300 210
   then
-    log "Archive mount lock busy for 60s — skipping archive unmount this cycle."
+    log "Archive mount lock busy for 300s — skipping archive unmount this cycle."
     exit 0
   fi
   unmount_if_set "${ARCHIVE_MOUNT:-}"
