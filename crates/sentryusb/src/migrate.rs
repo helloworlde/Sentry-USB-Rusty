@@ -287,6 +287,15 @@ if [ -f "$TMPDIR/setup/pi/avahi-sentryusb.service" ]; then
   if dpkg -s avahi-daemon >/dev/null 2>&1; then
     mkdir -p /etc/avahi/services
     cp "$TMPDIR/setup/pi/avahi-sentryusb.service" /etc/avahi/services/sentryusb.service
+    # IPv4-only mDNS advertising (stale-AAAA slowness + Chrome PNA "CORS"
+    # blocks on http://sentryusb.local — see the helper's header comment).
+    # Nonfatal, but loud: the setup repair path is the self-heal backstop.
+    if [ -f "$TMPDIR/setup/pi/avahi-ipv4-only.sh" ]; then
+      bash "$TMPDIR/setup/pi/avahi-ipv4-only.sh" \
+        || echo "migrate WARNING: could not apply IPv4-only avahi config" >&2
+    else
+      echo "migrate WARNING: avahi-ipv4-only.sh missing from update payload" >&2
+    fi
     systemctl enable avahi-daemon 2>/dev/null || true
     systemctl restart avahi-daemon 2>/dev/null || true
   fi

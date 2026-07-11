@@ -671,6 +671,16 @@ if ! command -v avahi-daemon >/dev/null 2>&1; then
     apt-get install -y avahi-daemon >/dev/null 2>&1 \
         || warn "avahi-daemon install failed — ${TARGET_HOSTNAME}.local may not resolve"
 fi
+# Advertise IPv4 only: a AAAA answer for .local sends Windows/Chrome to the
+# Pi's rotating SLAAC address (slow, stale) and triggers Chrome Private
+# Network Access "CORS" blocks on the plain-http UI. Device IPv6 untouched.
+AVAHI_V4_URL="https://raw.githubusercontent.com/${REPO}/main/setup/pi/avahi-ipv4-only.sh"
+if curl -fsSL --max-time 15 "$AVAHI_V4_URL" -o /tmp/avahi-ipv4-only.sh 2>/dev/null; then
+    bash /tmp/avahi-ipv4-only.sh >/dev/null 2>&1 || warn "could not apply IPv4-only mDNS config"
+    rm -f /tmp/avahi-ipv4-only.sh
+else
+    warn "could not fetch avahi-ipv4-only.sh — ${TARGET_HOSTNAME}.local may advertise IPv6"
+fi
 systemctl enable avahi-daemon >/dev/null 2>&1 || true
 systemctl restart avahi-daemon >/dev/null 2>&1 || true
 ok "mDNS active: http://${TARGET_HOSTNAME}.local"

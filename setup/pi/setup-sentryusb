@@ -593,6 +593,16 @@ function install_avahi_service () {
   mkdir -p /etc/avahi/services
   copy_script setup/pi/avahi-sentryusb.service /tmp
   mv /tmp/avahi-sentryusb.service /etc/avahi/services/sentryusb.service
+  # Advertise IPv4 only: a AAAA answer for .local sends Windows/Chrome to the
+  # Pi's rotating SLAAC address (slow, stale) and triggers Chrome Private
+  # Network Access "CORS" blocks on the plain-http UI. Device IPv6 untouched.
+  if copy_script setup/pi/avahi-ipv4-only.sh /tmp; then
+    bash /tmp/avahi-ipv4-only.sh || \
+      setup_progress "WARNING: could not apply IPv4-only mDNS config"
+    rm -f /tmp/avahi-ipv4-only.sh
+  else
+    setup_progress "WARNING: avahi-ipv4-only.sh unavailable — .local may advertise IPv6"
+  fi
   systemctl enable avahi-daemon 2>/dev/null || true
   systemctl restart avahi-daemon 2>/dev/null || true
   setup_progress "Avahi mDNS service installed — iOS app can now discover this Pi."

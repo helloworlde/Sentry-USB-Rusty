@@ -46,10 +46,111 @@ pub async fn configure_hostname(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
     Ok(true)
 }
 
+const AVAHI_DAEMON_CONF: &str = "/etc/avahi/avahi-daemon.conf";
+
+/// Daemon settings forcing IPv4-only mDNS advertising. Windows/Chrome
+/// prefer the AAAA answer for .local names; the Pi's global SLAAC address
+/// rotates (privacy extensions) so the advertised AAAA goes stale (slow
+/// loads), and Chrome classifies global IPv6 as *public* address space, so
+/// the plain-http Web UI reached through it hits Private Network Access
+/// blocks that surface as CORS errors. A-record-only sidesteps both;
+/// kernel/socket IPv6 on the device is untouched.
+/// Mirrored for the shell paths in setup/pi/avahi-ipv4-only.sh.
+const AVAHI_IPV4_ONLY: &[(&str, &str, &str)] = &[
+    ("server", "use-ipv6", "no"),
+    ("publish", "publish-aaaa-on-ipv4", "no"),
+];
+
+/// Set `key=value` inside `[section]` of INI-style content. Section-aware:
+/// replaces the first active or commented assignment of the key within that
+/// section (dropping repeats), inserts after the section header when absent,
+/// appends the section itself when missing. Assignments of the same key in
+/// *other* sections are left alone — avahi can refuse to start on a key
+/// planted in the wrong group. Returns (new_content, changed).
+fn set_ini_key(content: &str, section: &str, key: &str, value: &str) -> (String, bool) {
+    let header = format!("[{section}]");
+    let desired = format!("{key}={value}");
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_section = false;
+    let mut found_section = false;
+    let mut done = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if in_section && !done {
+                // Insert before the section's trailing blank lines, not
+                // between them and the next header.
+                let mut pos = out.len();
+                while pos > 0 && out[pos - 1].trim().is_empty() {
+                    pos -= 1;
+                }
+                out.insert(pos, &desired);
+                done = true;
+            }
+            in_section = trimmed == header;
+            found_section |= in_section;
+            out.push(line);
+            continue;
+        }
+        if in_section && !trimmed.is_empty() {
+            let uncommented = trimmed
+                .strip_prefix(['#', ';'])
+                .map(str::trim_start)
+                .unwrap_or(trimmed);
+            if let Some(after_key) = uncommented.strip_prefix(key) {
+                if after_key.trim_start().starts_with('=') {
+                    if !done {
+                        out.push(&desired);
+                        done = true;
+                    }
+                    continue;
+                }
+            }
+        }
+        out.push(line);
+    }
+    if !done {
+        if !found_section {
+            out.push(&header);
+        }
+        out.push(&desired);
+    }
+    let mut new_content = out.join("\n");
+    new_content.push('\n');
+    let changed = new_content != content;
+    (new_content, changed)
+}
+
+/// Compute the IPv4-only rewrite of avahi-daemon.conf, or `None` when the
+/// file is already correct. A missing conf is rebuilt from scratch (it's
+/// abnormal once avahi is installed, and before installation the caller
+/// recomputes after apt lays the real one down); an *unreadable* one is
+/// left alone — clobbering a conf we couldn't inspect is worse than
+/// advertising AAAA for one more release.
+fn avahi_ipv4_only_rewrite() -> Option<String> {
+    let content = match std::fs::read_to_string(AVAHI_DAEMON_CONF) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            tracing::warn!("avahi-daemon.conf unreadable, leaving as-is: {e}");
+            return None;
+        }
+    };
+    let mut current = content;
+    let mut changed = false;
+    for (section, key, value) in AVAHI_IPV4_ONLY {
+        let (next, ch) = set_ini_key(&current, section, key, value);
+        current = next;
+        changed |= ch;
+    }
+    changed.then_some(current)
+}
+
 /// Set up Avahi mDNS service for local network discovery.
 ///
-/// Idempotent: if the service file is already present and matches, do
-/// nothing and return `false` so the caller can skip announcing this phase.
+/// Idempotent: if the service file is already present and matches, and the
+/// daemon config already advertises IPv4-only, do nothing and return
+/// `false` so the caller can skip announcing this phase.
 pub async fn configure_avahi(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let hostname = env.get("SENTRYUSB_HOSTNAME", "sentryusb");
     let service_file = "/etc/avahi/services/sentryusb.service";
@@ -69,8 +170,9 @@ pub async fn configure_avahi(env: &SetupEnv, emitter: &SetupEmitter) -> Result<b
     let needs_install = sentryusb_shell::run("which", &["avahi-daemon"]).await.is_err();
     let existing = std::fs::read_to_string(service_file).unwrap_or_default();
     let content_matches = existing == desired;
+    let mut conf_rewrite = avahi_ipv4_only_rewrite();
 
-    if !needs_install && content_matches {
+    if !needs_install && content_matches && conf_rewrite.is_none() {
         return Ok(false);
     }
 
@@ -83,11 +185,30 @@ pub async fn configure_avahi(env: &SetupEnv, emitter: &SetupEmitter) -> Result<b
             &["avahi-daemon"],
             Duration::from_secs(600),
         ).await.context("failed to install avahi-daemon")?;
+        // The package install just laid down avahi-daemon.conf — recompute
+        // from the real file, not whatever preceded it.
+        conf_rewrite = avahi_ipv4_only_rewrite();
     }
 
     if !content_matches {
         let _ = std::fs::create_dir_all("/etc/avahi/services");
         std::fs::write(service_file, desired)?;
+    }
+
+    if let Some(new_conf) = conf_rewrite {
+        emitter.progress("Restricting mDNS advertising to IPv4...");
+        let prev = format!("{AVAHI_DAEMON_CONF}.sentryusb-prev");
+        if !Path::new(&prev).exists() {
+            let _ = std::fs::copy(AVAHI_DAEMON_CONF, &prev);
+        }
+        // Write-then-rename so a power loss mid-write can't leave a
+        // truncated conf that stops avahi from starting.
+        let tmp = format!("{AVAHI_DAEMON_CONF}.sentryusb-tmp");
+        std::fs::write(&tmp, new_conf)?;
+        if let Ok(meta) = std::fs::metadata(AVAHI_DAEMON_CONF) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        }
+        std::fs::rename(&tmp, AVAHI_DAEMON_CONF)?;
     }
 
     let _ = sentryusb_shell::run("systemctl", &["enable", "avahi-daemon"]).await;
@@ -665,6 +786,71 @@ fn normalize_timezone(tz: &str) -> String {
         other => return other.to_string(),
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod set_ini_key_tests {
+    use super::set_ini_key;
+
+    const STOCK: &str = "[server]\n#use-ipv6=yes\nuse-ipv4=yes\n\n[publish]\n#publish-aaaa-on-ipv4=yes\n";
+
+    #[test]
+    fn uncomments_stock_defaults_in_place() {
+        let (out, changed) = set_ini_key(STOCK, "server", "use-ipv6", "no");
+        assert!(changed);
+        assert_eq!(out, "[server]\nuse-ipv6=no\nuse-ipv4=yes\n\n[publish]\n#publish-aaaa-on-ipv4=yes\n");
+    }
+
+    #[test]
+    fn idempotent_when_already_set() {
+        let (once, _) = set_ini_key(STOCK, "publish", "publish-aaaa-on-ipv4", "no");
+        let (twice, changed) = set_ini_key(&once, "publish", "publish-aaaa-on-ipv4", "no");
+        assert!(!changed);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn only_touches_key_in_target_section() {
+        // A use-ipv6 line under [publish] must be left alone — rewriting it
+        // there could produce a conf avahi refuses to load.
+        let conf = "[publish]\n#use-ipv6=yes\n";
+        let (out, changed) = set_ini_key(conf, "server", "use-ipv6", "no");
+        assert!(changed);
+        assert_eq!(out, "[publish]\n#use-ipv6=yes\n[server]\nuse-ipv6=no\n");
+    }
+
+    #[test]
+    fn inserts_key_when_section_exists_without_it() {
+        let conf = "[server]\nuse-ipv4=yes\n\n[wide-area]\nenable-wide-area=yes\n";
+        let (out, changed) = set_ini_key(conf, "server", "use-ipv6", "no");
+        assert!(changed);
+        assert_eq!(out, "[server]\nuse-ipv4=yes\nuse-ipv6=no\n\n[wide-area]\nenable-wide-area=yes\n");
+    }
+
+    #[test]
+    fn appends_missing_section_at_end() {
+        let conf = "[server]\nuse-ipv4=yes\n";
+        let (out, changed) = set_ini_key(conf, "publish", "publish-aaaa-on-ipv4", "no");
+        assert!(changed);
+        assert_eq!(out, "[server]\nuse-ipv4=yes\n[publish]\npublish-aaaa-on-ipv4=no\n");
+    }
+
+    #[test]
+    fn dedupes_conflicting_assignments_in_section() {
+        let conf = "[server]\nuse-ipv6=yes\n# use-ipv6=no\nuse-ipv6=yes\n";
+        let (out, changed) = set_ini_key(conf, "server", "use-ipv6", "no");
+        assert!(changed);
+        assert_eq!(out, "[server]\nuse-ipv6=no\n");
+    }
+
+    #[test]
+    fn does_not_match_prefixed_keys() {
+        // "use-ipv6" must not swallow a hypothetical "use-ipv6-foo=..." line.
+        let conf = "[server]\nuse-ipv6-foo=yes\n";
+        let (out, changed) = set_ini_key(conf, "server", "use-ipv6", "no");
+        assert!(changed);
+        assert_eq!(out, "[server]\nuse-ipv6-foo=yes\nuse-ipv6=no\n");
+    }
 }
 
 #[cfg(test)]
