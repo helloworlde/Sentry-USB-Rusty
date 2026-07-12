@@ -26,6 +26,7 @@ function fmtInterval(sec: number): string {
 export function TravelModeDialog({ onClose, onChange }: Props) {
   const [enabled, setEnabled] = useState(false)
   const [halfSnapshots, setHalfSnapshots] = useState(false)
+  const [fastRetry, setFastRetry] = useState(false)
   // Matches archiveloop's ${SNAPSHOT_INTERVAL:-3480} until status loads.
   const [intervalSec, setIntervalSec] = useState(3480)
   const [loading, setLoading] = useState(true)
@@ -40,6 +41,7 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
         if (cancelled) return
         setEnabled(r.enabled)
         setHalfSnapshots(r.half_snapshots)
+        setFastRetry(r.fast_retry)
         setIntervalSec(r.snapshot_interval_sec)
       })
       .catch(() => {})
@@ -102,6 +104,20 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
     }
   }
 
+  async function toggleFastRetry(next: boolean) {
+    if (archiving) return
+    setSaving(true)
+    setFastRetry(next) // optimistic
+    try {
+      const r = await api.setTravelMode(enabled, undefined, next)
+      setFastRetry(r.fast_retry)
+    } catch {
+      setFastRetry(!next) // revert on failure
+    } finally {
+      setSaving(false)
+    }
+  }
+
   // Portal to document.body: the Away Mode card is a `glass-card` with a
   // backdrop-filter, which establishes a containing block for `position:
   // fixed` and would otherwise pin/clip this overlay inside the card.
@@ -149,6 +165,18 @@ export function TravelModeDialog({ onClose, onChange }: Props) {
             halfSnapshots
               ? `Half — every ${fmtInterval(intervalSec / 2)} instead of every ${fmtInterval(intervalSec)}. Snapshots and uploads run twice as often, so less footage is at risk if the car's drive fills up on a long trip.`
               : `Default — every ${fmtInterval(intervalSec)}, same as your setup. Flip on to snapshot and upload twice as often while traveling.`
+          }
+        />
+
+        <Toggle
+          checked={fastRetry}
+          onChange={toggleFastRetry}
+          disabled={loading || saving || archiving}
+          label="Retry quickly after failures"
+          sub={
+            fastRetry
+              ? "On — if an archive attempt fails, try again about every minute until it succeeds. Great for spotty connections like Starlink, where a brief dropout under a bridge would otherwise stall archiving until the next cycle."
+              : "Off — after a failed attempt, archiving waits for the next regular cycle. Flip on for spotty connections like Starlink."
           }
         />
 

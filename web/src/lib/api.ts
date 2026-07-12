@@ -183,22 +183,31 @@ export const api = {
   // Travel Mode (secret menu): keep the USB gadget connected to the car while
   // still archiving on the road. Persisted in sentryusb.conf: the master
   // toggle plus an optional "half snapshots" cadence flag (snapshot+archive
-  // every SNAPSHOT_INTERVAL/2 instead of the full interval while traveling).
+  // every SNAPSHOT_INTERVAL/2 instead of the full interval while traveling)
+  // and a "fast retry" flag (retry ~every minute after a failed archive —
+  // for intermittent uplinks like Starlink). Omitted optional flags leave
+  // the persisted values untouched.
   getTravelMode: () =>
-    request<{ enabled: boolean; half_snapshots: boolean; snapshot_interval_sec: number }>(
-      "/travel-mode/status",
-    ),
-  setTravelMode: (enabled: boolean, halfSnapshots?: boolean) =>
+    request<{
+      enabled: boolean
+      half_snapshots: boolean
+      fast_retry: boolean
+      snapshot_interval_sec: number
+    }>("/travel-mode/status"),
+  setTravelMode: (enabled: boolean, halfSnapshots?: boolean, fastRetry?: boolean) =>
     request<{
       ok: boolean
       enabled: boolean
       half_snapshots: boolean
+      fast_retry: boolean
       snapshot_interval_sec: number
     }>("/travel-mode", {
       method: "POST",
-      body: JSON.stringify(
-        halfSnapshots === undefined ? { enabled } : { enabled, half_snapshots: halfSnapshots },
-      ),
+      body: JSON.stringify({
+        enabled,
+        ...(halfSnapshots === undefined ? {} : { half_snapshots: halfSnapshots }),
+        ...(fastRetry === undefined ? {} : { fast_retry: fastRetry }),
+      }),
     }),
   getStatus: () => request<PiStatus>("/status"),
   getStorageBreakdown: () => request<StorageBreakdown>("/status/storage"),

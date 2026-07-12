@@ -18,6 +18,11 @@
 //!   deleting its own oldest footage; halving the cycle shrinks the
 //!   window in which the car can delete a clip before it was snapshotted
 //!   and uploaded.
+//! * `TRAVEL_MODE_FAST_RETRY` (`yes`/`no`) — after a failed archive cycle,
+//!   retry in ~1 minute instead of waiting out the full interval. For
+//!   intermittent uplinks (Starlink dropping under a bridge, cellular dead
+//!   zones) where a brief outage would otherwise stall archiving for up to
+//!   an hour.
 //!
 //! The archiveloop bash script reads both fresh each cycle
 //! (`travel_mode_active` / `travel_mode_interval`), so toggling here takes
@@ -38,6 +43,7 @@ const DEFAULT_SNAPSHOT_INTERVAL_SEC: u64 = 3480;
 struct TravelSettings {
     enabled: bool,
     half_snapshots: bool,
+    fast_retry: bool,
     /// The user's configured snapshot interval — the UI shows this as the
     /// "default" cadence and `interval / 2` as the "half" cadence.
     snapshot_interval_sec: u64,
@@ -53,6 +59,7 @@ fn read_settings_at(config_path: &str) -> TravelSettings {
     let mut settings = TravelSettings {
         enabled: false,
         half_snapshots: false,
+        fast_retry: false,
         snapshot_interval_sec: DEFAULT_SNAPSHOT_INTERVAL_SEC,
     };
     if let Ok((active, commented)) = sentryusb_config::parse_file(config_path) {
@@ -61,6 +68,9 @@ fn read_settings_at(config_path: &str) -> TravelSettings {
         }
         if let Some(v) = sentryusb_config::get_config_value(&active, &commented, "TRAVEL_MODE_HALF_SNAPSHOTS") {
             settings.half_snapshots = flag_is_on(&v);
+        }
+        if let Some(v) = sentryusb_config::get_config_value(&active, &commented, "TRAVEL_MODE_FAST_RETRY") {
+            settings.fast_retry = flag_is_on(&v);
         }
         if let Some(v) = sentryusb_config::get_config_value(&active, &commented, "SNAPSHOT_INTERVAL") {
             if let Ok(n) = v.trim().parse::<u64>() {
@@ -82,12 +92,13 @@ fn settings_json(s: &TravelSettings) -> serde_json::Value {
     serde_json::json!({
         "enabled": s.enabled,
         "half_snapshots": s.half_snapshots,
+        "fast_retry": s.fast_retry,
         "snapshot_interval_sec": s.snapshot_interval_sec,
     })
 }
 
 /// GET /api/travel-mode/status →
-/// `{"enabled": bool, "half_snapshots": bool, "snapshot_interval_sec": u64}`.
+/// `{"enabled": bool, "half_snapshots": bool, "fast_retry": bool, "snapshot_interval_sec": u64}`.
 pub async fn status(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(settings_json(&read_settings())))
 }
@@ -98,9 +109,13 @@ pub struct TravelBody {
     /// Absent (older UI) → leave the persisted cadence flag untouched.
     #[serde(default)]
     half_snapshots: Option<bool>,
+    /// Absent (older UI) → leave the persisted fast-retry flag untouched.
+    #[serde(default)]
+    fast_retry: Option<bool>,
 }
 
-/// POST /api/travel-mode — body `{"enabled": bool, "half_snapshots"?: bool}`.
+/// POST /api/travel-mode — body
+/// `{"enabled": bool, "half_snapshots"?: bool, "fast_retry"?: bool}`.
 ///
 /// Persists the flags so the settings survive reboot and the archiveloop
 /// picks them up on its next cycle. RO root → flip rw for the write, same
@@ -111,6 +126,7 @@ pub async fn set(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let want = body.enabled;
     let want_half = body.half_snapshots;
+    let want_fast_retry = body.fast_retry;
 
     let persist = tokio::task::spawn_blocking(move || -> anyhow::Result<TravelSettings> {
         let config_path = sentryusb_config::find_config_path();
@@ -123,6 +139,12 @@ pub async fn set(
             active.insert(
                 "TRAVEL_MODE_HALF_SNAPSHOTS".to_string(),
                 if half { "yes" } else { "no" }.to_string(),
+            );
+        }
+        if let Some(fast) = want_fast_retry {
+            active.insert(
+                "TRAVEL_MODE_FAST_RETRY".to_string(),
+                if fast { "yes" } else { "no" }.to_string(),
             );
         }
         let _ = std::process::Command::new("bash")
@@ -191,8 +213,21 @@ mod tests {
         let s = read_settings_at(p.to_str().unwrap());
         assert!(!s.enabled);
         assert!(!s.half_snapshots);
+        assert!(!s.fast_retry);
         assert_eq!(s.snapshot_interval_sec, DEFAULT_SNAPSHOT_INTERVAL_SEC);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn reads_fast_retry() {
+        let p = temp_conf("export TRAVEL_MODE_ENABLED=yes\nexport TRAVEL_MODE_FAST_RETRY=yes\n");
+        let s = read_settings_at(p.to_str().unwrap());
+        assert!(s.enabled);
+        assert!(s.fast_retry);
+        let p2 = temp_conf("export TRAVEL_MODE_FAST_RETRY=no\n");
+        assert!(!read_settings_at(p2.to_str().unwrap()).fast_retry);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&p2);
     }
 
     #[test]
