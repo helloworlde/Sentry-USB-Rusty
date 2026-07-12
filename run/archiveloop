@@ -428,7 +428,29 @@ function travel_mode_pace () {
     interval=$(travel_mode_interval)
     log "Travel Mode: next snapshot+archive cycle in ${interval}s"
   fi
-  sleep "$interval"
+
+  # Sleep in short slices, watching for the manual-sync canary that
+  # trigger-sync (POST /api/system/trigger-sync) drops. In normal mode the
+  # canary unsticks the two reachability wait states, but Travel Mode
+  # spends its idle time here instead — without this, "Start Archive"
+  # would be a silent no-op until the interval expired. Consuming the
+  # canary also keeps a stale one from faking a later reachability probe.
+  local deadline=$((SECONDS + interval))
+  local remaining slice
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ -e /tmp/archive_is_reachable ]; then
+      if rm -f -- /tmp/archive_is_reachable; then
+        log "Travel Mode: manual sync requested, starting the next cycle early"
+        return 0
+      fi
+      log "Travel Mode: unable to consume manual sync request"
+    fi
+    remaining=$((deadline - SECONDS))
+    slice=5
+    if [ "$remaining" -lt "$slice" ]; then slice=$remaining; fi
+    [ "$slice" -gt 0 ] && sleep "$slice"
+  done
+  return 0
 }
 
 function run_archive_cycle () {

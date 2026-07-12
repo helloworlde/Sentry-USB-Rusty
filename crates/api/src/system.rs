@@ -136,6 +136,11 @@ pub async fn gadget_disable(State(_s): State<AppState>) -> (StatusCode, Json<ser
 /// consume it, then create the reachable canary (covering both: state
 /// 1 directly, or state 2 after archiveloop transitions out via the
 /// first canary). Either way the loop kicks off an archive cycle.
+///
+/// Travel Mode has a third idle state: the paced sleep between cycles
+/// (travel_mode_pace). It watches for and consumes the reachable
+/// canary too, cutting the sleep short so "Start Archive" works on
+/// the road as well.
 pub async fn trigger_sync(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     tokio::spawn(async {
         let unreachable = std::path::Path::new("/tmp/archive_is_unreachable");
