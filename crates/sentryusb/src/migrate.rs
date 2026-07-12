@@ -302,10 +302,17 @@ if [ -f "$TMPDIR/setup/pi/avahi-sentryusb.service" ]; then
 fi
 
 # ── Migrate AP to Away Mode (AP off by default) ──
+# Skip the teardown while an Away Mode session is active (flag file
+# present): this migration runs unordered vs restore_from_file()'s boot
+# AP start, so downing the profile here could strand a parked-away Pi
+# until it returns home. Autoconnect-off is still safe to apply — Away
+# Mode always raises the AP explicitly.
 if nmcli -t con show SENTRYUSB_AP &>/dev/null; then
   nmcli con modify SENTRYUSB_AP connection.autoconnect no 2>/dev/null || true
-  nmcli con down SENTRYUSB_AP 2>/dev/null || true
-  iw dev ap0 del 2>/dev/null || true
+  if [ ! -f /mutable/sentryusb_away_mode.json ]; then
+    nmcli con down SENTRYUSB_AP 2>/dev/null || true
+    iw dev ap0 del 2>/dev/null || true
+  fi
 fi
 WLAN=$(nmcli -t -f TYPE,DEVICE c show --active 2>/dev/null | grep 802-11-wireless | grep -v ':ap0$' | cut -d: -f2 | head -1)
 WLAN=${{WLAN:-wlan0}}
