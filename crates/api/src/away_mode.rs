@@ -742,7 +742,7 @@ fn spawn_watcher(stop: std::sync::Arc<Notify>, my_epoch: u64) {
 pub fn restore_from_file() {
     // Mode is config-driven (the source of truth shared with the daemon).
     if read_auto_enabled_config() {
-        let (notify, epoch) = {
+        let (notify, epoch, seeded_away) = {
             let mut inner = mgr().lock().unwrap();
             inner.mode = "auto";
             inner.state = "idle"; // auto doesn't use the timer state
@@ -758,13 +758,26 @@ pub fn restore_from_file() {
             inner.pending_count = 0;
             inner.stop = std::sync::Arc::new(Notify::new());
             inner.epoch += 1;
-            (inner.stop.clone(), inner.epoch)
+            (inner.stop.clone(), inner.epoch, inner.last_is_home == Some(false))
         };
-        // Don't touch the flag file: it may exist from a prior "away"
-        // state (the dispatcher uses it to bring the AP up on boot). The
-        // first geofence tick re-derives home/away and reconciles the AP.
+        // Don't touch the flag file: it may exist from a prior "away" state.
         away_mode_log("Automatic Away Mode active on boot — geofence watcher started");
         info!("[away-mode] Automatic mode — geofence watcher started");
+        // Booted while away (flag file present ⟹ seeded away): actively bring
+        // the AP up. Neither of the two mechanisms that otherwise restore it
+        // fires in this case — the NetworkManager dispatcher only resurrects
+        // ap0 on a `wlan0 up` event, which never happens away from home WiFi;
+        // and the watcher's first tick is not a home/away *flip* (it's already
+        // seeded away), so `auto_eval_tick` won't call `start_ap_bg` either.
+        // Without this, a reboot while parked away leaves the AP down until the
+        // car returns home. Mirrors the Manual-mode restore below. If the car
+        // actually reached home during the reboot, the first confirmed home
+        // flip stops the AP again (~1 min) — a brief, self-healing flicker.
+        if seeded_away {
+            away_mode_log("Automatic: booted while away — starting AP");
+            info!("[away-mode] auto: booted while away → starting AP");
+            start_ap_bg();
+        }
         spawn_auto_watcher(notify, epoch);
         return;
     }
