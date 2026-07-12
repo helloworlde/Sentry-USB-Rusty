@@ -329,6 +329,17 @@ fn auto_seed_decision(flag_exists: bool) -> Option<bool> {
     Some(!flag_exists)
 }
 
+/// Whether booting into Automatic mode should actively (re)start the AP.
+/// The seeded decision comes from the flag file (see `auto_seed_decision`):
+/// present ⟹ away ⟹ the AP must be up. On a boot while away neither the NM
+/// dispatcher (fires only on `wlan0 up`, which never happens off home WiFi)
+/// nor the watcher's first tick (not a home/away *flip*) brings it up — so
+/// `restore_from_file` must. Extracted as a pure fn so this boot-start rule
+/// is unit-tested without the surrounding singleton/filesystem/shell I/O.
+fn should_start_ap_on_boot(flag_exists: bool) -> bool {
+    auto_seed_decision(flag_exists) == Some(false)
+}
+
 /// The daemon's last GPS fix as `(lat, lon, age_sec)`, or `None` if the
 /// file is missing/unparseable or has no coordinates. `age_sec` is how
 /// long ago the fix was taken (clamped ≥ 0).
@@ -742,6 +753,7 @@ fn spawn_watcher(stop: std::sync::Arc<Notify>, my_epoch: u64) {
 pub fn restore_from_file() {
     // Mode is config-driven (the source of truth shared with the daemon).
     if read_auto_enabled_config() {
+        let flag_exists = std::path::Path::new(FLAG_FILE).exists();
         let (notify, epoch) = {
             let mut inner = mgr().lock().unwrap();
             inner.mode = "auto";
@@ -753,18 +765,31 @@ pub fn restore_from_file() {
             // present ⟹ away/AP-up). With `None` instead, `status` would
             // report ap_on=false while the AP is physically up, and an
             // arrived-home reboot would hold the stale AP until a fresh fix.
-            inner.last_is_home = auto_seed_decision(std::path::Path::new(FLAG_FILE).exists());
+            inner.last_is_home = auto_seed_decision(flag_exists);
             inner.pending_is_home = None;
             inner.pending_count = 0;
             inner.stop = std::sync::Arc::new(Notify::new());
             inner.epoch += 1;
             (inner.stop.clone(), inner.epoch)
         };
-        // Don't touch the flag file: it may exist from a prior "away"
-        // state (the dispatcher uses it to bring the AP up on boot). The
-        // first geofence tick re-derives home/away and reconciles the AP.
+        // Don't touch the flag file: it may exist from a prior "away" state.
         away_mode_log("Automatic Away Mode active on boot — geofence watcher started");
         info!("[away-mode] Automatic mode — geofence watcher started");
+        // Booted while away (flag file present ⟹ seeded away): actively bring
+        // the AP up. Neither of the two mechanisms that otherwise restore it
+        // fires in this case — the NetworkManager dispatcher only resurrects
+        // ap0 on a `wlan0 up` event, which never happens away from home WiFi;
+        // and the watcher's first tick is not a home/away *flip* (it's already
+        // seeded away), so `auto_eval_tick` won't call `start_ap_bg` either.
+        // Without this, a reboot while parked away leaves the AP down until the
+        // car returns home. Mirrors the Manual-mode restore below. If the car
+        // actually reached home during the reboot, the first confirmed home
+        // flip stops the AP again (~1 min) — a brief, self-healing flicker.
+        if should_start_ap_on_boot(flag_exists) {
+            away_mode_log("Automatic: booted while away — starting AP");
+            info!("[away-mode] auto: booted while away → starting AP");
+            start_ap_bg();
+        }
         spawn_auto_watcher(notify, epoch);
         return;
     }
@@ -1246,6 +1271,16 @@ mod tests {
         // Seeding last_is_home from it must NOT invert this mapping.
         assert_eq!(auto_seed_decision(true), Some(false)); // flag present → away
         assert_eq!(auto_seed_decision(false), Some(true)); // no flag → home
+    }
+
+    #[test]
+    fn boot_starts_ap_only_when_away() {
+        // On boot, the AP must be (re)started iff the seeded state is away —
+        // i.e. the flag file exists. Guards against inverting the condition,
+        // which would either leave the AP down while parked away (the #153
+        // bug) or spuriously raise it at home.
+        assert!(should_start_ap_on_boot(true)); // flag present → away → start AP
+        assert!(!should_start_ap_on_boot(false)); // no flag → home → don't start
     }
 }
 
