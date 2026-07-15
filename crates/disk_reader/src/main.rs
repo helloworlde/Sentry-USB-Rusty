@@ -62,8 +62,16 @@ enum Command {
         #[arg(default_value = "")]
         path: String,
     },
-    /// Debug: write a file from a snap.bin-style image to stdout.
-    ImgCat { image: PathBuf, path: String },
+    /// Debug: write a file (or byte range) from a snap.bin-style image to
+    /// stdout.
+    ImgCat {
+        image: PathBuf,
+        path: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long)]
+        len: Option<usize>,
+    },
 }
 
 fn open_cam_image(
@@ -151,9 +159,21 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::ImgCat { image, path } => {
+        Command::ImgCat {
+            image,
+            path,
+            offset,
+            len,
+        } => {
             let cam = open_cam_image(&image)?;
-            let buf = cam.read_file(&path)?;
+            let buf = match len {
+                Some(len) => cam.read_file_range(&path, offset, len)?,
+                None if offset == 0 => cam.read_file(&path)?,
+                None => {
+                    let full = cam.read_file(&path)?;
+                    full.get(offset as usize..).unwrap_or(&[]).to_vec()
+                }
+            };
             std::io::stdout().write_all(&buf)?;
         }
         Command::Cat { disk, path } => {

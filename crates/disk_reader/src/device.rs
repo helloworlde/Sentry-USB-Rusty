@@ -24,11 +24,28 @@ pub struct Disk {
 
 impl Disk {
     pub fn open_image(path: &Path) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let size = file
+        let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut size = file
             .metadata()
             .with_context(|| format!("stat {}", path.display()))?
             .len();
+        if size == 0 {
+            // Block devices report len 0 via metadata (e.g. /dev/sdX on the
+            // Pi); the seekable end is the real media size.
+            size = file
+                .seek(SeekFrom::End(0))
+                .with_context(|| format!("size {}", path.display()))?;
+            file.seek(SeekFrom::Start(0))?;
+        }
+        #[cfg(target_os = "macos")]
+        if size == 0 {
+            // macOS /dev/(r)diskN doesn't support SEEK_END; ask the driver.
+            size = macos_media_size(&file)
+                .with_context(|| format!("media size of {}", path.display()))?;
+        }
+        if size == 0 {
+            anyhow::bail!("cannot determine size of {}", path.display());
+        }
         Ok(Self {
             inner: Arc::new(Mutex::new(file)),
             size,
@@ -55,6 +72,25 @@ impl Disk {
     pub fn whole(&self) -> Window {
         self.window(0, self.size)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_media_size(file: &File) -> Result<u64> {
+    use std::os::fd::AsRawFd;
+    // <sys/disk.h>: DKIOCGETBLOCKSIZE = _IOR('d', 24, u32),
+    //               DKIOCGETBLOCKCOUNT = _IOR('d', 25, u64)
+    const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x40046418;
+    const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x40086419;
+    let fd = file.as_raw_fd();
+    let mut blocksize: u32 = 0;
+    let mut blockcount: u64 = 0;
+    // SAFETY: both ioctls only write to the out-param of the given size.
+    let r1 = unsafe { libc::ioctl(fd, DKIOCGETBLOCKSIZE, &mut blocksize) };
+    let r2 = unsafe { libc::ioctl(fd, DKIOCGETBLOCKCOUNT, &mut blockcount) };
+    if r1 != 0 || r2 != 0 {
+        anyhow::bail!("DKIOCGETBLOCKSIZE/COUNT ioctl failed (not a disk device?)");
+    }
+    Ok(blockcount * u64::from(blocksize))
 }
 
 pub struct Window {
