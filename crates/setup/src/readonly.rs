@@ -682,10 +682,17 @@ fn update_fstab() -> Result<()> {
     // persist bond keys on the read-only root FS. x-systemd.requires-mounts-for
     // guarantees /mutable mounts first; x-systemd.before ensures the bind is
     // in place before bluetoothd starts.
+    //
+    // Both bind mount points must exist before root goes read-only: systemd
+    // cannot create a missing mount point on a ro root, and without `nofail`
+    // the failed bind takes down local-fs.target and drops the Pi into
+    // Emergency Mode on the first boot after setup (#158). Hard-fail on
+    // mkdir so we never write a boot-breaking fstab entry.
+    std::fs::create_dir_all("/var/lib/bluetooth")?;
     if !fstab_has_mountpoint(&fstab, "/var/lib/bluetooth") {
         fstab.push_str(
             "/mutable/.bluetooth /var/lib/bluetooth none \
-             bind,x-systemd.requires-mounts-for=/mutable,x-systemd.before=bluetooth.service 0 0\n",
+             bind,nofail,x-systemd.requires-mounts-for=/mutable,x-systemd.before=bluetooth.service 0 0\n",
         );
     }
 
@@ -694,15 +701,54 @@ fn update_fstab() -> Result<()> {
     // runtime on the read-only root FS. Without this, cloud pairing fails at
     // "set credentials" and hangs. x-systemd.before ensures the bind is in
     // place before the daemon reads/writes credentials at startup.
+    std::fs::create_dir_all("/root/.sentryusb")?;
+    std::fs::set_permissions(
+        "/root/.sentryusb",
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
     if !fstab_has_mountpoint(&fstab, "/root/.sentryusb") {
         fstab.push_str(
             "/mutable/.sentryusb /root/.sentryusb none \
-             bind,x-systemd.requires-mounts-for=/mutable,x-systemd.before=sentryusb.service 0 0\n",
+             bind,nofail,x-systemd.requires-mounts-for=/mutable,x-systemd.before=sentryusb.service 0 0\n",
         );
+    }
+
+    // Repair bind entries written by v3.13.0–v3.14.3, which lack `nofail`
+    // (setup re-run after a #158 recovery, or a pre-fix line already present).
+    for mp in ["/var/lib/bluetooth", "/root/.sentryusb"] {
+        add_nofail_to_bind(&mut fstab, mp);
     }
 
     std::fs::write(FSTAB_PATH, fstab)?;
     Ok(())
+}
+
+/// Add `nofail` to the options of an existing bind-mount fstab entry for
+/// `mountpoint`, if the entry exists and doesn't already have it.
+fn add_nofail_to_bind(fstab: &mut String, mountpoint: &str) {
+    let lines: Vec<String> = fstab
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with('#') {
+                return line.to_string();
+            }
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.get(1) != Some(&mountpoint) || fields.len() < 4 {
+                return line.to_string();
+            }
+            let opts = fields[3];
+            if opts.split(',').any(|o| o == "nofail") || !opts.split(',').any(|o| o == "bind") {
+                return line.to_string();
+            }
+            let mut new_fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+            new_fields[3] = format!("{},nofail", opts);
+            new_fields.join(" ")
+        })
+        .collect();
+    *fstab = lines.join("\n");
+    if !fstab.ends_with('\n') {
+        fstab.push('\n');
+    }
 }
 
 fn fstab_has_mountpoint(fstab: &str, mountpoint: &str) -> bool {
