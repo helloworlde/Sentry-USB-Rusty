@@ -333,6 +333,48 @@ impl Archive {
     pub fn file_count(&self) -> usize {
         self.files.len()
     }
+
+    fn source_by_label(&self, label: &str) -> Result<&Source> {
+        self.sources
+            .iter()
+            .find(|s| s.label == label)
+            .ok_or_else(|| anyhow!("no source labeled {label} (see probe output)"))
+    }
+
+    /// Debug: the raw exFAT/FAT32 boot sector of a source's CAM partition,
+    /// plus the MBR partition type.
+    pub fn debug_cam_boot(&self, label: &str) -> Result<(Vec<u8>, u8)> {
+        let s = self.source_by_label(label)?;
+        let mut image = XfsFile::open(&self.xfs, &s.image_path)?;
+        let part = mbr::first_partition(&mut image)?;
+        let mut view = SubFile::new(XfsFile::open(&self.xfs, &s.image_path)?, part.start, part.len);
+        let mut boot = vec![0u8; 512];
+        use std::io::Read as _;
+        view.read_exact(&mut boot)?;
+        Ok((boot, part.part_type))
+    }
+
+    /// Debug: the entry-type byte of the first `n` root-directory entries
+    /// of a source's exFAT CAM filesystem (assumes root dir is contiguous
+    /// from its first cluster — true for freshly-mkfs'd images).
+    pub fn debug_root_entry_types(&self, label: &str, n: usize) -> Result<Vec<u8>> {
+        let (boot, _) = self.debug_cam_boot(label)?;
+        let s = self.source_by_label(label)?;
+        let bps = 1u64 << boot[108];
+        let spc = 1u64 << boot[109];
+        let heap = u64::from(u32::from_le_bytes(boot[88..92].try_into().unwrap()));
+        let root = u64::from(u32::from_le_bytes(boot[96..100].try_into().unwrap()));
+        let root_off = (heap + (root - 2) * spc) * bps;
+
+        let mut image = XfsFile::open(&self.xfs, &s.image_path)?;
+        let part = mbr::first_partition(&mut image)?;
+        let mut view = SubFile::new(XfsFile::open(&self.xfs, &s.image_path)?, part.start, part.len);
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        view.seek(SeekFrom::Start(root_off))?;
+        let mut buf = vec![0u8; 32 * n];
+        view.read_exact(&mut buf)?;
+        Ok(buf.chunks(32).map(|e| e[0]).collect())
+    }
 }
 
 fn parse_toc(text: &str) -> Vec<TocEntry> {

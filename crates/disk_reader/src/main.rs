@@ -62,6 +62,13 @@ enum Command {
         #[arg(default_value = "")]
         path: String,
     },
+    /// Debug: dump exFAT boot-sector fields of a snapshot's CAM partition.
+    CamBoot {
+        disk: PathBuf,
+        /// Source label from `probe` (e.g. snap-000025 or live).
+        #[arg(default_value = "live")]
+        source: String,
+    },
     /// Debug: write a file (or byte range) from a snap.bin-style image to
     /// stdout.
     ImgCat {
@@ -148,6 +155,36 @@ fn main() -> Result<()> {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             std::io::copy(&mut f, &mut out)?;
+        }
+        Command::CamBoot { disk, source } => {
+            let ar = open_archive(&disk)?;
+            let (boot, part_type) = ar.debug_cam_boot(&source)?;
+            println!("MBR partition type: 0x{part_type:02x}");
+            println!("fs name: {:?}", String::from_utf8_lossy(&boot[3..11]));
+            println!(
+                "VolumeFlags: 0x{:04x} (ActiveFat={}, VolumeDirty={}, MediaFailure={})",
+                u16::from_le_bytes([boot[106], boot[107]]),
+                boot[106] & 1,
+                (boot[106] >> 1) & 1,
+                (boot[106] >> 2) & 1,
+            );
+            println!("BytesPerSectorShift: {}", boot[108]);
+            println!("SectorsPerClusterShift: {}", boot[109]);
+            println!("NumberOfFats: {}", boot[110]);
+            println!(
+                "FatOffset: {}, FatLength: {}, ClusterHeapOffset: {}, ClusterCount: {}, RootCluster: {}",
+                u32::from_le_bytes(boot[80..84].try_into().unwrap()),
+                u32::from_le_bytes(boot[84..88].try_into().unwrap()),
+                u32::from_le_bytes(boot[88..92].try_into().unwrap()),
+                u32::from_le_bytes(boot[92..96].try_into().unwrap()),
+                u32::from_le_bytes(boot[96..100].try_into().unwrap()),
+            );
+            // First 16 root-directory entry types help spot what the exfat
+            // crate's root-dir scan chokes on.
+            match ar.debug_root_entry_types(&source, 16) {
+                Ok(types) => println!("root entry types: {types:02x?}"),
+                Err(e) => println!("root entry read failed: {e:#}"),
+            }
         }
         Command::ImgLs { image, path } => {
             let cam = open_cam_image(&image)?;

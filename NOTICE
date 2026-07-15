@@ -123,3 +123,15 @@ and remain under the BSD 2-Clause License reproduced in each file's header.
 Local modifications: fuser/libc/nix dependencies replaced with a portability
 shim (see shim.rs) and the FUSE server replaced with a path-based read-only
 API (fs.rs).
+
+================================================================================
+3. Vendored exfat crate  --  MIT License
+================================================================================
+
+The files under crates/disk_reader/vendor/exfat/ are vendored from the
+exfat crate, version 0.1.0 (https://github.com/obhq/exfat), Copyright (c)
+Obliteration contributors, MIT License (see COPYING in that directory).
+Local modifications: unused (deleted) directory entries are skipped per the
+exFAT specification instead of ending the directory scan, and benign
+primary entries (e.g. Volume GUID) are ignored instead of failing — both
+required to read Tesla-written filesystems.

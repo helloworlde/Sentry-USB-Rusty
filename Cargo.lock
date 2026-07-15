@@ -876,8 +876,6 @@ dependencies = [
 [[package]]
 name = "exfat"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef9a1a1b794b9e161ac062304811272f4a0962332e555f9b8a225b3c02b3ac42"
 dependencies = [
  "byteorder",
  "thiserror 1.0.69",
