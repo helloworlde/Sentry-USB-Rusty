@@ -18,6 +18,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
 
+# serve mode (localhost HTTP for Sentry Studio)
+tokio.workspace = true
+axum = "0.8"
+bytes = "1"
+tokio-stream = "0.1"
+getrandom = "0.3"
+hex = "0.4"
+
 # Vendored libxfuse (xfs-fuse 0.7.1, BSD-2-Clause) dependencies.
 bincode-next = { version = "2.1.0", default-features = false, features = ["derive", "std"] }
 bitflags = "2.4"

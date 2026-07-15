@@ -34,6 +34,15 @@ const LIVE_IMAGE: &str = "cam_disk.bin";
 /// inside the XFS volume.
 type Cam = CamFs<SubFile<XfsFile<Window>>>;
 
+/// SAFETY: `fatfs::FileSystem` is `!Send` only because its `FsOptions`
+/// holds `&'static dyn OemCpConverter/TimeProvider` without a `Sync`
+/// bound. We construct it exclusively with `FsOptions::new()` defaults,
+/// whose implementations (`LossyOemCpConverter`, `DefaultTimeProvider`)
+/// are stateless unit structs, so moving the filesystem between threads
+/// is sound. Everything else in the stack is naturally `Send`.
+struct SendCam(Cam);
+unsafe impl Send for SendCam {}
+
 /// One source of clips: a snapshot's snap.bin or the live cam_disk.bin.
 /// `ord` sorts oldest-first; the live image is always newest.
 #[derive(Clone, Debug)]
@@ -64,8 +73,10 @@ pub struct Archive {
     pub sources: Vec<Source>,
     /// Merged virtual tree: CAM-relative path -> winning source + size.
     files: BTreeMap<String, FileMeta>,
-    /// Lazily opened CAM filesystems, keyed by source index.
-    open_cams: Mutex<HashMap<usize, Arc<Cam>>>,
+    /// Lazily opened CAM filesystems, keyed by source index. The inner
+    /// Mutex makes the fatfs variant (RefCell inside) shareable across the
+    /// HTTP server's threads.
+    open_cams: Mutex<HashMap<usize, Arc<Mutex<SendCam>>>>,
     pub warnings: Vec<String>,
 }
 
@@ -225,10 +236,11 @@ impl Archive {
     /// when there is no .toc).
     fn walk_cam(&self, source: usize) -> Result<Vec<TocEntry>> {
         let cam = self.cam(source)?;
+        let cam = cam.lock().unwrap();
         let mut out = Vec::new();
         let mut stack = vec![String::new()];
         while let Some(dir) = stack.pop() {
-            for entry in cam.read_dir(&dir)? {
+            for entry in cam.0.read_dir(&dir)? {
                 let path = if dir.is_empty() {
                     entry.name.clone()
                 } else {
@@ -248,7 +260,7 @@ impl Archive {
     }
 
     /// Lazily open (and cache) the CAM filesystem of a source.
-    fn cam(&self, source: usize) -> Result<Arc<Cam>> {
+    fn cam(&self, source: usize) -> Result<Arc<Mutex<SendCam>>> {
         if let Some(c) = self.open_cams.lock().unwrap().get(&source) {
             return Ok(Arc::clone(c));
         }
@@ -260,7 +272,9 @@ impl Archive {
         // Re-open so CamFs owns a fresh file positioned via its own window.
         let image = XfsFile::open(&self.xfs, &s.image_path)?;
         let part_view = SubFile::new(image, part.start, part.len);
-        let cam = Arc::new(CamFs::open(part_view).with_context(|| format!("{}: CAM fs", s.label))?);
+        let cam = Arc::new(Mutex::new(SendCam(
+            CamFs::open(part_view).with_context(|| format!("{}: CAM fs", s.label))?,
+        )));
         self.open_cams
             .lock()
             .unwrap()
@@ -316,7 +330,8 @@ impl Archive {
             .get(path)
             .ok_or_else(|| anyhow!("no such file: {path}"))?;
         let cam = self.cam(meta.source)?;
-        cam.read_file_range(path, offset, len)
+        let result = cam.lock().unwrap().0.read_file_range(path, offset, len);
+        result
     }
 
     /// Read a whole (small) file.
@@ -327,7 +342,8 @@ impl Archive {
             .get(path)
             .ok_or_else(|| anyhow!("no such file: {path}"))?;
         let cam = self.cam(meta.source)?;
-        cam.read_file(path)
+        let result = cam.lock().unwrap().0.read_file(path);
+        result
     }
 
     pub fn file_count(&self) -> usize {

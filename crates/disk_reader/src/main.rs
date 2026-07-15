@@ -20,6 +20,7 @@ mod archive;
 mod camfs;
 mod device;
 mod gpt;
+mod http;
 mod mbr;
 // The vendored parser carries code paths we don't exercise (xattrs,
 // symlinks, realtime); keep the diff against upstream minimal instead of
@@ -61,6 +62,21 @@ enum Command {
         image: PathBuf,
         #[arg(default_value = "")]
         path: String,
+    },
+    /// Serve the merged archive over token-authed localhost HTTP (for
+    /// Sentry Studio).
+    Serve {
+        disk: PathBuf,
+        /// TCP port (0 = pick a free one).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Where to write the {port, token, pid} handshake JSON (0600).
+        /// Without it, the handshake is printed to stdout.
+        #[arg(long)]
+        handshake_file: Option<PathBuf>,
+        /// Exit after this many seconds without a request (0 = never).
+        #[arg(long, default_value_t = 0)]
+        idle_exit: u64,
     },
     /// Debug: dump exFAT boot-sector fields of a snapshot's CAM partition.
     CamBoot {
@@ -155,6 +171,21 @@ fn main() -> Result<()> {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             std::io::copy(&mut f, &mut out)?;
+        }
+        Command::Serve {
+            disk,
+            port,
+            handshake_file,
+            idle_exit,
+        } => {
+            let ar = open_archive(&disk)?;
+            for w in &ar.warnings {
+                eprintln!("warning: {w}");
+            }
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(http::serve(ar, port, handshake_file, idle_exit))?;
         }
         Command::CamBoot { disk, source } => {
             let ar = open_archive(&disk)?;
