@@ -17,6 +17,7 @@ export function useKeepAccessory() {
   const [values, setValues] = useState<KeepAccessoryValues>(DEFAULT)
   const [loaded, setLoaded] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
   const saveTimer = useRef<number | null>(null)
 
   useEffect(() => {
@@ -55,7 +56,12 @@ export function useKeepAccessory() {
             home_radius_m: next.radiusM,
           }),
         })
-          .catch(() => {})
+          .then((res) => {
+            setSaveError(res.ok ? null : "Couldn't save — the Pi rejected the change.")
+          })
+          .catch(() => {
+            setSaveError("Couldn't save — the Pi is unreachable.")
+          })
           .finally(() => setSaving(false))
       }, 600)
       return next
@@ -92,5 +98,5 @@ export function useKeepAccessory() {
     }
   }, [])
 
-  return { values, loaded, saving, update, useCurrentLocation, manualSet }
+  return { values, loaded, saving, saveError, update, useCurrentLocation, manualSet }
 }

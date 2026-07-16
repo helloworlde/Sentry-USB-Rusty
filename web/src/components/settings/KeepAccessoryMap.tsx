@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react"
 import L from "leaflet"
 import "leaflet/dist/leaflet.css"
+import { normalizeLon } from "@/lib/geo"
 
 const TILES = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png"
 
@@ -30,6 +31,9 @@ export function KeepAccessoryMap({
   radiusM: number
   onPlace: (lat: number, lon: number) => void
 }) {
+  // Legacy configs may hold a world-copy longitude (e.g. -221 for 139°E);
+  // wrap so the pin and the readout agree with what gets stored.
+  lon = lon != null ? normalizeLon(lon) : null
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const markerRef = useRef<L.Marker | null>(null)
@@ -55,7 +59,9 @@ export function KeepAccessoryMap({
     const hasHome = la != null && lo != null
     const center: L.LatLngExpression = hasHome ? [la as number, lo as number] : [39.5, -98.35]
 
-    const map = L.map(el, { attributionControl: false, zoomControl: true })
+    // worldCopyJump keeps the pin on the primary world copy while panning
+    // across the antimeridian (e.g. from the US default to Japan).
+    const map = L.map(el, { attributionControl: false, zoomControl: true, worldCopyJump: true })
     mapRef.current = map
     L.tileLayer(TILES, { maxZoom: 19, minZoom: 2 }).addTo(map)
     map.setView(center, hasHome ? 16 : 4)
@@ -75,12 +81,14 @@ export function KeepAccessoryMap({
     circleRef.current = circle
     if (hasHome) map.fitBounds(circle.getBounds(), { padding: [24, 24], maxZoom: 17 })
 
+    // Wrap lng: panning into an adjacent world copy yields values like
+    // -221.4 for 138.6°E, which would otherwise display and persist as-is.
     marker.on("dragend", () => {
       const p = marker.getLatLng()
-      onPlaceRef.current(p.lat, p.lng)
+      onPlaceRef.current(p.lat, normalizeLon(p.lng))
     })
     map.on("click", (e: L.LeafletMouseEvent) => {
-      onPlaceRef.current(e.latlng.lat, e.latlng.lng)
+      onPlaceRef.current(e.latlng.lat, normalizeLon(e.latlng.lng))
     })
 
     // Leaflet mis-sizes if the container wasn't fully laid out at init

@@ -48,6 +48,8 @@ interface AwayModeContextValue {
     setMode: (mode: AwayModeKind) => Promise<void>
     config: AwayGeofenceValues
     updateConfig: (patch: Partial<AwayGeofenceValues>) => void
+    /** Last geofence-save failure, or null. Cleared on the next successful save. */
+    saveError: string | null
     useCurrentLocation: () => Promise<{ lat: number; lon: number } | null>
 }
 
@@ -60,6 +62,7 @@ const AwayModeContext = createContext<AwayModeContextValue>({
     setMode: async () => { },
     config: DEFAULT_CONFIG,
     updateConfig: () => { },
+    saveError: null,
     useCurrentLocation: async () => null,
 })
 
@@ -83,6 +86,7 @@ export function getStoredAwayMode(): { enabled_at: string; ap_ssid: string; ap_i
 export function AwayModeProvider({ children }: { children: React.ReactNode }) {
     const [status, setStatus] = useState<AwayModeStatus>({ state: "idle" })
     const [config, setConfig] = useState<AwayGeofenceValues>(DEFAULT_CONFIG)
+    const [saveError, setSaveError] = useState<string | null>(null)
     const lastMutation = useRef(0)
     const saveTimer = useRef<number | null>(null)
 
@@ -194,7 +198,13 @@ export function AwayModeProvider({ children }: { children: React.ReactNode }) {
                         home_lon: next.homeLon,
                         home_radius_m: next.radiusM,
                     }),
-                }).catch(() => { })
+                })
+                    .then((res) => {
+                        setSaveError(res.ok ? null : "Couldn't save the geofence — the Pi rejected the change.")
+                    })
+                    .catch(() => {
+                        setSaveError("Couldn't save the geofence — the Pi is unreachable.")
+                    })
             }, 600)
             return next
         })
@@ -215,7 +225,7 @@ export function AwayModeProvider({ children }: { children: React.ReactNode }) {
 
     return (
         <AwayModeContext.Provider
-            value={{ status, enable, disable, setMode, config, updateConfig, useCurrentLocation }}
+            value={{ status, enable, disable, setMode, config, updateConfig, saveError, useCurrentLocation }}
         >
             {children}
         </AwayModeContext.Provider>

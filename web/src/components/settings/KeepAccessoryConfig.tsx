@@ -21,11 +21,14 @@ export function KeepAccessoryConfig({
   values,
   onChange,
   onUseCurrentLocation,
+  saveError,
   checkKeepAwake = false,
 }: {
   values: KeepAccessoryValues
   onChange: (patch: Partial<KeepAccessoryValues>) => void
   onUseCurrentLocation?: () => Promise<{ lat: number; lon: number } | null>
+  /** Persistence failure from the owning hook — surfaced under the geofence map. */
+  saveError?: string | null
   /**
    * When true (Settings context), live-check whether "Use BLE for
    * keep-awake" is on and warn if it isn't — the home→OFF release needs
@@ -129,6 +132,7 @@ export function KeepAccessoryConfig({
           values={{ homeLat: values.homeLat, homeLon: values.homeLon, radiusM: values.radiusM }}
           onChange={(patch) => onChange(patch)}
           onUseCurrentLocation={onUseCurrentLocation}
+          saveError={saveError}
           mapHint={
             <>
               Tap the map (or drag the pin) to set your home — the blue circle is your radius.

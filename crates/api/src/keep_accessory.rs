@@ -135,7 +135,11 @@ pub async fn keep_accessory_config_get(
                     Some("yes") | Some("true") | Some("1")
                 );
                 let lat = g("KEEP_ACCESSORY_HOME_LAT").and_then(|s| s.trim().parse::<f64>().ok());
-                let lon = g("KEEP_ACCESSORY_HOME_LON").and_then(|s| s.trim().parse::<f64>().ok());
+                // Normalize on read: configs written before the wrap fix may
+                // hold a world-copy longitude (e.g. -221 for 139°E).
+                let lon = g("KEEP_ACCESSORY_HOME_LON")
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .map(crate::normalize_lon);
                 let radius = g("KEEP_ACCESSORY_HOME_RADIUS_M")
                     .and_then(|s| s.trim().parse::<f64>().ok())
                     .filter(|r| *r > 0.0)
@@ -179,10 +183,13 @@ pub async fn keep_accessory_config_set(
                 if enabled { "yes" } else { "no" }.to_string(),
             );
         }
-        if let Some(lat) = body.home_lat {
+        if let Some(lat) = body.home_lat.filter(|v| v.is_finite()) {
+            let lat = lat.clamp(-90.0, 90.0);
             active.insert("KEEP_ACCESSORY_HOME_LAT".to_string(), format!("{lat:.6}"));
         }
-        if let Some(lon) = body.home_lon {
+        if let Some(lon) = body.home_lon.filter(|v| v.is_finite()) {
+            // Leaflet world-copy clicks can arrive as e.g. -221.4 for 138.6°E.
+            let lon = crate::normalize_lon(lon);
             active.insert("KEEP_ACCESSORY_HOME_LON".to_string(), format!("{lon:.6}"));
         }
         if let Some(r) = body.home_radius_m {

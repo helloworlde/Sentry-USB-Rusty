@@ -29,7 +29,7 @@ interface Props {
 }
 
 export function AwayModeControl({ onOpenWizard }: Props = {}) {
-  const { status, enable, disable, setMode, config, updateConfig, useCurrentLocation } = useAwayMode()
+  const { status, enable, disable, setMode, config, updateConfig, saveError, useCurrentLocation } = useAwayMode()
   // Undefined means the first status poll hasn't resolved (or an older
   // backend) — assume configured/manual so the card doesn't flash.
   const apConfigured = status.ap_configured !== false
@@ -241,6 +241,7 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
             values={config}
             onChange={updateConfig}
             onUseCurrentLocation={useCurrentLocation}
+            saveError={saveError}
             mapHint={
               <>
                 Tap the map (or drag the pin) to set your home — the blue circle is your radius.

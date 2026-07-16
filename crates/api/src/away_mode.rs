@@ -365,7 +365,11 @@ fn read_away_geofence() -> (Option<f64>, Option<f64>, f64) {
         Ok((active, commented)) => {
             let g = |k: &str| sentryusb_config::get_config_value(&active, &commented, k);
             let lat = g("KEEP_ACCESSORY_HOME_LAT").and_then(|s| s.trim().parse::<f64>().ok());
-            let lon = g("KEEP_ACCESSORY_HOME_LON").and_then(|s| s.trim().parse::<f64>().ok());
+            // Normalize on read: configs written before the wrap fix may hold
+            // a world-copy longitude (e.g. -221 for 139°E).
+            let lon = g("KEEP_ACCESSORY_HOME_LON")
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .map(crate::normalize_lon);
             let radius = g("AWAY_MODE_HOME_RADIUS_M")
                 .and_then(|s| s.trim().parse::<f64>().ok())
                 .filter(|r| *r > 0.0)
@@ -1139,10 +1143,13 @@ pub async fn config_set(
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let config_path = sentryusb_config::find_config_path();
         let (mut active, _) = sentryusb_config::parse_file(config_path)?;
-        if let Some(lat) = body.home_lat {
+        if let Some(lat) = body.home_lat.filter(|v| v.is_finite()) {
+            let lat = lat.clamp(-90.0, 90.0);
             active.insert("KEEP_ACCESSORY_HOME_LAT".to_string(), format!("{lat:.6}"));
         }
-        if let Some(lon) = body.home_lon {
+        if let Some(lon) = body.home_lon.filter(|v| v.is_finite()) {
+            // Leaflet world-copy clicks can arrive as e.g. -221.4 for 138.6°E.
+            let lon = crate::normalize_lon(lon);
             active.insert("KEEP_ACCESSORY_HOME_LON".to_string(), format!("{lon:.6}"));
         }
         if let Some(r) = body.home_radius_m {

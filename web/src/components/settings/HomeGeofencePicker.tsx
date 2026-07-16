@@ -27,6 +27,7 @@ export function HomeGeofencePicker({
   onUseCurrentLocation,
   mapHint,
   radiusHint,
+  saveError,
 }: {
   values: HomeGeofenceValues
   onChange: (patch: Partial<HomeGeofenceValues>) => void
@@ -36,6 +37,8 @@ export function HomeGeofencePicker({
   mapHint?: ReactNode
   /** Caption under the radius input. */
   radiusHint?: ReactNode
+  /** Persistence failure from the owning hook — shown so a failed PUT isn't silent. */
+  saveError?: string | null
 }) {
   const [locating, setLocating] = useState(false)
   const [locError, setLocError] = useState<string | null>(null)
@@ -115,6 +118,7 @@ export function HomeGeofencePicker({
         </p>
       )}
       {locError && <p className="text-xs text-red-400">{locError}</p>}
+      {saveError && <p className="text-xs text-red-400">{saveError}</p>}
 
       {/* Adjustable radius — number input + quick presets */}
       <div>

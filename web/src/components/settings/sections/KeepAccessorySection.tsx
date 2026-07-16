@@ -15,7 +15,7 @@ interface Props {
  * and a manual ON/OFF override that hits the car over BLE right now.
  */
 export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
-  const { values, loaded, saving, update, useCurrentLocation, manualSet } = useKeepAccessory()
+  const { values, loaded, saving, saveError, update, useCurrentLocation, manualSet } = useKeepAccessory()
   const [msg, setMsg] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
 
@@ -65,6 +65,7 @@ export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
             values={values}
             onChange={update}
             onUseCurrentLocation={useCurrentLocation}
+            saveError={saveError}
             checkKeepAwake
           />
 
