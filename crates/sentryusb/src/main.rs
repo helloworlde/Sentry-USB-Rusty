@@ -200,11 +200,23 @@ async fn main() {
     let cloud_notify = Arc::new(tokio::sync::Notify::new());
 
     // Drive processor
-    let processor = Arc::new(sentryusb_drives::processor::Processor::with_on_complete(
+    let mut processor = sentryusb_drives::processor::Processor::with_on_complete(
         store.clone(),
         hub.clone(),
         Some(cloud_notify.clone()),
-    ));
+    );
+    // Gap-fill backfill: create missing RecentClips links for manifest
+    // clips right after each process pass rewrites the manifest. Lives
+    // here (not in the snapshot path) because on-device snapshots run
+    // through the bash make_snapshot.sh, which never reaches the Rust
+    // snapshot code — the daemon is the only OTA-updatable place this
+    // can run. No-op unless the manifest changed since the last pass.
+    processor.set_after_process(Arc::new(|| {
+        if let Err(e) = sentryusb_gadget::snapshot::backfill_gapfill_links() {
+            tracing::warn!("gap-fill backfill: {}", e);
+        }
+    }));
+    let processor = Arc::new(processor);
 
     let drive_state = sentryusb_api::drives_handler::DriveState {
         store: store.clone(),

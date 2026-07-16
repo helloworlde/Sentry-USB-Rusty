@@ -44,6 +44,14 @@ pub struct Processor {
     /// tail of the archive lifecycle without polling. None on call sites
     /// that don't want a wake (e.g. tests).
     on_complete: Option<Arc<tokio::sync::Notify>>,
+    /// Optional hook run at the tail of every process pass, right after
+    /// the gap-fill manifest is rewritten. The daemon attaches the
+    /// RecentClips backfill-link pass (usb_gadget crate) here — snapshots
+    /// on real devices go through the bash make_snapshot.sh, which never
+    /// reaches the Rust snapshot code, so the daemon is the only
+    /// OTA-updatable place the backfill can run. Blocking-friendly: the
+    /// hook is invoked via spawn_blocking.
+    after_process: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Processor {
@@ -75,7 +83,14 @@ impl Processor {
             }),
             clip_dir: Self::DEFAULT_CLIP_DIR.to_string(),
             on_complete,
+            after_process: None,
         }
+    }
+
+    /// Attach the post-process hook (see the `after_process` field docs).
+    /// Must be called before the processor is shared (`Arc::new`).
+    pub fn set_after_process(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.after_process = Some(hook);
     }
 
     /// Test-only: a processor scanning a temp clip tree instead of the
@@ -340,6 +355,15 @@ impl Processor {
         // drive data.
         if let Err(e) = self.update_gapfill_manifest(&recent_ts) {
             warn!("gap-fill manifest update failed: {}", e);
+        }
+
+        // Post-process hook (daemon: RecentClips backfill links). Runs
+        // AFTER the manifest rewrite so a fresh manifest is what it reads;
+        // fs-heavy, so keep it off the async worker thread.
+        if let Some(hook) = self.after_process.clone() {
+            if let Err(e) = tokio::task::spawn_blocking(move || hook()).await {
+                warn!("after-process hook panicked: {}", e);
+            }
         }
 
         // Mirror drive data to a mounted CIFS/NFS archive — the counterpart
@@ -685,6 +709,31 @@ mod tests {
             vec!["2026-07-15_04-50-00", "2026-07-15_04-55-00"],
             "interior parked fills listed; the occupied-slot twin excluded"
         );
+    }
+
+    /// The after-process hook is the daemon's only path to the RecentClips
+    /// backfill (device snapshots run the bash script, not the Rust
+    /// snapshot code) — it must fire at the tail of every process pass,
+    /// even a pass that found nothing to extract.
+    #[tokio::test]
+    async fn after_process_hook_fires_on_process_pass() {
+        let root = tempfile::TempDir::new().unwrap();
+        let clip_dir = root.path().join("TeslaCam");
+        std::fs::create_dir_all(&clip_dir).unwrap();
+
+        let store = Arc::new(crate::db::DriveStore::open_memory().unwrap());
+        let mut processor = Processor::with_clip_dir_for_test(
+            store,
+            clip_dir.to_string_lossy().to_string(),
+        );
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = fired.clone();
+        processor.set_after_process(Arc::new(move || {
+            flag.store(true, Ordering::SeqCst);
+        }));
+
+        processor.process_new().await.unwrap();
+        assert!(fired.load(Ordering::SeqCst), "hook must run after the pass");
     }
 
     #[test]
