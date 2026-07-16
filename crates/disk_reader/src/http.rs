@@ -37,10 +37,20 @@ use axum::{
 use serde::Deserialize;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::archive::Archive;
+use crate::{archive::Archive, device::Disk};
+
+/// The archive opens in the background after the server is already up, so
+/// Studio can watch progress instead of staring at a silent process.
+enum ArchiveState {
+    Opening,
+    Ready(Archive),
+    Failed(String),
+}
 
 struct AppState {
-    archive: Mutex<Archive>,
+    archive: Mutex<ArchiveState>,
+    /// Human-readable progress while Opening.
+    progress: Mutex<String>,
     token: String,
     last_request: AtomicU64,
 }
@@ -76,7 +86,7 @@ fn authorized(state: &AppState, headers: &HeaderMap, q: &AuthQuery) -> bool {
 }
 
 pub async fn serve(
-    archive: Archive,
+    disk: Disk,
     port: u16,
     handshake_file: Option<PathBuf>,
     idle_exit_secs: u64,
@@ -87,13 +97,35 @@ pub async fn serve(
     let token = hex::encode(token_bytes);
 
     let state = Arc::new(AppState {
-        archive: Mutex::new(archive),
+        archive: Mutex::new(ArchiveState::Opening),
+        progress: Mutex::new("Starting".to_string()),
         token: token.clone(),
         last_request: AtomicU64::new(now_secs()),
     });
 
+    // Index the archive off-thread; the server answers /api/status while
+    // this runs (81 snapshots over USB can take a while).
+    {
+        let state = Arc::clone(&state);
+        tokio::task::spawn_blocking(move || {
+            let progress_state = Arc::clone(&state);
+            let result = Archive::open_with_progress(&disk, &move |msg| {
+                *progress_state.progress.lock().unwrap() = msg;
+            });
+            *state.archive.lock().unwrap() = match result {
+                Ok(a) => ArchiveState::Ready(a),
+                Err(e) => {
+                    tracing::error!("archive open failed: {e:#}");
+                    ArchiveState::Failed(format!("{e:#}"))
+                }
+            };
+            state.last_request.store(now_secs(), Ordering::Relaxed);
+        });
+    }
+
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/api/status", get(api_status))
         .route("/api/info", get(api_info))
         .route("/fs/{*path}", get(fs_get))
         .with_state(Arc::clone(&state));
@@ -166,6 +198,41 @@ async fn healthz(
     "ok".into_response()
 }
 
+async fn api_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<AuthQuery>,
+) -> Response {
+    if !authorized(&state, &headers, &q) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    state.last_request.store(now_secs(), Ordering::Relaxed);
+    let body = match &*state.archive.lock().unwrap() {
+        ArchiveState::Opening => serde_json::json!({
+            "state": "opening",
+            "progress": state.progress.lock().unwrap().clone(),
+        }),
+        ArchiveState::Ready(_) => serde_json::json!({ "state": "ready" }),
+        ArchiveState::Failed(e) => serde_json::json!({ "state": "failed", "error": e }),
+    };
+    Json(body).into_response()
+}
+
+/// Respond 503 (opening) / 500 (failed) unless the archive is ready.
+macro_rules! require_ready {
+    ($state:expr) => {
+        match &*$state {
+            ArchiveState::Ready(ar) => ar,
+            ArchiveState::Opening => {
+                return (StatusCode::SERVICE_UNAVAILABLE, "archive still opening").into_response()
+            }
+            ArchiveState::Failed(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.clone()).into_response()
+            }
+        }
+    };
+}
+
 async fn api_info(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -175,7 +242,8 @@ async fn api_info(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     state.last_request.store(now_secs(), Ordering::Relaxed);
-    let ar = state.archive.lock().unwrap();
+    let guard = state.archive.lock().unwrap();
+    let ar = require_ready!(guard);
     Json(serde_json::json!({
         "fileCount": ar.file_count(),
         "sources": ar.sources.iter().map(|s| s.label.clone()).collect::<Vec<_>>(),
@@ -227,7 +295,8 @@ async fn fs_get(
     let path = path.trim_matches('/').to_string();
 
     if q.op.as_deref() == Some("ls") {
-        let ar = state.archive.lock().unwrap();
+        let guard = state.archive.lock().unwrap();
+        let ar = require_ready!(guard);
         let entries: Vec<_> = ar
             .read_dir(&path)
             .into_iter()
@@ -244,7 +313,8 @@ async fn fs_get(
     }
 
     let size = {
-        let ar = state.archive.lock().unwrap();
+        let guard = state.archive.lock().unwrap();
+        let ar = require_ready!(guard);
         match ar.stat(&path) {
             Some(meta) => meta.size,
             None => return (StatusCode::NOT_FOUND, "no such file").into_response(),
@@ -266,8 +336,11 @@ async fn fs_get(
         while remaining > 0 {
             let want = CHUNK.min(remaining as usize);
             let chunk = {
-                let ar = stream_state.archive.lock().unwrap();
-                ar.read_range(&stream_path, offset, want)
+                let guard = stream_state.archive.lock().unwrap();
+                match &*guard {
+                    ArchiveState::Ready(ar) => ar.read_range(&stream_path, offset, want),
+                    _ => break,
+                }
             };
             stream_state
                 .last_request

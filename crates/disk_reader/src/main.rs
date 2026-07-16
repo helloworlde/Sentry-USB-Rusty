@@ -178,14 +178,15 @@ fn main() -> Result<()> {
             handshake_file,
             idle_exit,
         } => {
-            let ar = open_archive(&disk)?;
-            for w in &ar.warnings {
-                eprintln!("warning: {w}");
-            }
+            // Opening the device must succeed up front (permission errors
+            // surface immediately, before the handshake, so the caller can
+            // fall back to elevation); the slow archive indexing happens in
+            // the background with progress on /api/status.
+            let dev = device::Disk::open_image(&disk)?;
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(http::serve(ar, port, handshake_file, idle_exit))?;
+            rt.block_on(http::serve(dev, port, handshake_file, idle_exit))?;
         }
         Command::CamBoot { disk, source } => {
             let ar = open_archive(&disk)?;

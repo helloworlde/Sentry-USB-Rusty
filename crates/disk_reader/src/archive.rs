@@ -111,10 +111,19 @@ pub fn probe(disk: &Disk) -> Result<ProbeResult> {
 
 impl Archive {
     pub fn open(disk: &Disk) -> Result<Self> {
+        Self::open_with_progress(disk, &|_| {})
+    }
+
+    /// Like [`Archive::open`], reporting human-readable progress as it
+    /// enumerates and indexes snapshots (opening a large archive over USB
+    /// takes a while; callers surface these messages in their UI).
+    pub fn open_with_progress(disk: &Disk, progress: &dyn Fn(String)) -> Result<Self> {
+        progress("Reading partition table".to_string());
         let probe = probe(disk)?;
         let part = &probe.backingfiles;
         let window = disk.window(part.start, part.len);
         let len = window.len();
+        progress("Opening the backingfiles filesystem".to_string());
         let xfs = XfsFs::open(window, len).context("opening backingfiles XFS")?;
         let xfs = Arc::new(Mutex::new(xfs));
         let mut warnings = Vec::new();
@@ -172,13 +181,16 @@ impl Archive {
             open_cams: Mutex::new(HashMap::new()),
             warnings,
         };
-        archive.load_tocs();
+        archive.load_tocs(progress);
+        progress("Merging snapshots".to_string());
         archive.build_merged_tree()?;
         Ok(archive)
     }
 
-    fn load_tocs(&mut self) {
-        for s in &mut self.sources {
+    fn load_tocs(&mut self, progress: &dyn Fn(String)) {
+        let total = self.sources.len();
+        for (i, s) in self.sources.iter_mut().enumerate() {
+            progress(format!("Indexing snapshot {} of {total}", i + 1));
             let toc_path = PathBuf::from(format!("{}.toc", s.image_path.display()));
             match XfsFile::open(&self.xfs, &toc_path) {
                 Ok(mut f) => {
