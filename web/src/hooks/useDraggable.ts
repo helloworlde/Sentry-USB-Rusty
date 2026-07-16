@@ -34,8 +34,8 @@ export function useDraggable(options: UseDraggableOptions = {}) {
     const ew = el.offsetWidth
     const eh = el.offsetHeight
 
-    let x = 0
-    let y = 0
+    let x: number
+    let y: number
 
     switch (initialAnchor) {
       case "top-right":

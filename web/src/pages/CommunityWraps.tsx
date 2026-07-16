@@ -1,7 +1,9 @@
 import { useEffect, useState, useCallback, useRef } from "react"
 import { Search, Download, Paintbrush, ChevronLeft, ChevronRight, Loader2, CheckCircle, AlertCircle, Trash2, Pencil } from "lucide-react"
 import GodotRenderer, { type GodotRendererHandle } from "../components/wraps/GodotRenderer"
-import MultiFileUploader, { type FileEntry, useObjectUrl } from "../components/upload/MultiFileUploader"
+import MultiFileUploader, { type FileEntry } from "../components/upload/MultiFileUploader"
+import { useObjectUrl } from "@/hooks/useObjectUrl"
+import { errorMessage } from "@/lib/utils"
 
 const API_BASE = "/api"
 
@@ -200,8 +202,8 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
       const data: LibraryResponse = await res.json()
       setWraps(data.wraps || [])
       setTotal(data.total || 0)
-    } catch (err: any) {
-      setError(err.message || "Failed to load wraps")
+    } catch (err) {
+      setError(errorMessage(err, "Failed to load wraps"))
     } finally {
       setLoading(false)
     }
@@ -210,7 +212,7 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
   useEffect(() => {
     const timer = setTimeout(fetchWraps, search ? 300 : 0)
     return () => clearTimeout(timer)
-  }, [fetchWraps])
+  }, [fetchWraps, search])
 
   useEffect(() => { setPage(1) }, [model, search, sort])
 
@@ -228,8 +230,8 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
       }
       setToast({ message: `"${wrap.name}" added to your Wraps folder!`, type: "success" })
       setSelectedWrap(null)
-    } catch (err: any) {
-      setToast({ message: err.message || "Download failed", type: "error" })
+    } catch (err) {
+      setToast({ message: errorMessage(err, "Download failed"), type: "error" })
     } finally {
       setDownloading(null)
     }
@@ -257,8 +259,8 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
       setEditingWrap(null)
       setSelectedWrap(null)
       fetchWraps()
-    } catch (err: any) {
-      setToast({ message: err.message || "Edit failed", type: "error" })
+    } catch (err) {
+      setToast({ message: errorMessage(err, "Edit failed"), type: "error" })
     }
   }
 
@@ -283,8 +285,8 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
       setDeletingWrap(null)
       setSelectedWrap(null)
       fetchWraps()
-    } catch (err: any) {
-      setToast({ message: err.message || "Delete failed", type: "error" })
+    } catch (err) {
+      setToast({ message: errorMessage(err, "Delete failed"), type: "error" })
     }
   }
 

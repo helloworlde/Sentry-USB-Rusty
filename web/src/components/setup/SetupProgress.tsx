@@ -87,7 +87,7 @@ export function SetupProgress({ complete, phase = "running" }: SetupProgressProp
   const [stale, setStale] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const prevLenRef = useRef(0)
-  const lastChangeRef = useRef(Date.now())
+  const lastChangeRef = useRef(0) // seeded on mount below (render must stay pure)
 
   // Poll setup log as a fallback / catch-up mechanism only. Real-time log
   // lines arrive via the `setup_progress` WebSocket event in the next
@@ -202,6 +202,7 @@ export function SetupProgress({ complete, phase = "running" }: SetupProgressProp
 
   // Auto-scroll log + stale detection
   useEffect(() => {
+    if (lastChangeRef.current === 0) lastChangeRef.current = Date.now()
     if (logLines.length > prevLenRef.current) {
       if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight
       lastChangeRef.current = Date.now()

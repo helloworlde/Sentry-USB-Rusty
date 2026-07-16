@@ -9,9 +9,13 @@ import BarChart from "@/components/charts/BarChart"
 
 type Period = "day" | "week" | "all"
 
+// Adapts untyped backend JSON that may arrive in snake_case or camelCase;
+// every field is defaulted, so loose typing is contained here.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function normalizeFsdAnalytics(raw: any): FSDAnalyticsData | null {
   if (!raw || typeof raw !== "object") return null
   const daily = Array.isArray(raw.daily)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ? raw.daily.map((d: any) => ({
       date: d?.date ?? "",
       dayName: d?.dayName ?? d?.day_name ?? "",

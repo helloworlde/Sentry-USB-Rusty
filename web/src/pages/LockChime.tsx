@@ -23,7 +23,8 @@ import {
   Pencil,
   Unplug,
 } from "lucide-react"
-import MultiFileUploader, { type FileEntry, useObjectUrl } from "../components/upload/MultiFileUploader"
+import MultiFileUploader, { type FileEntry } from "../components/upload/MultiFileUploader"
+import { useObjectUrl } from "@/hooks/useObjectUrl"
 
 const API_BASE = "/api"
 const MAX_DURATION_SECONDS = 5
@@ -710,6 +711,9 @@ function MyLibraryTab({ volume }: { volume: number }) {
                     >
                       <div className="flex items-center gap-3 px-4 py-3">
                       <button
+                        // False positive: togglePlay touches audio refs but
+                        // only runs on click, never during render.
+                        // eslint-disable-next-line react-hooks/refs
                         onClick={() => togglePlay(sound.name)}
                         className={`shrink-0 flex h-9 w-9 items-center justify-center rounded-full transition-colors ${
                           isPlaying
@@ -1500,7 +1504,7 @@ function CommunityBrowse({ adminPasscode, volume }: { adminPasscode: string | nu
   useEffect(() => {
     const timer = setTimeout(fetchSounds, search ? 300 : 0)
     return () => clearTimeout(timer)
-  }, [fetchSounds])
+  }, [fetchSounds, search])
 
   async function handleDownload(sound: CommunitySound) {
     setDownloadingCode(sound.code)

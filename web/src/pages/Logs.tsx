@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react"
+import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from "react"
 import { ScrollText, Download, RefreshCw, ArrowDown, Loader2 } from "lucide-react"
 import { cn } from "@/lib/utils"
 
@@ -224,50 +224,53 @@ function FormattedLog({ content }: { content: string }) {
 
   // Track the last displayed date string so we only show a date header
   // when the date actually changes (or at the start of a boot cycle).
+  // Plain loop (not a .map closure) so the accumulators stay render-local.
+  const rows: ReactNode[] = []
   let prevDate = ""
   let inBootCycle = false // becomes true after we see the first entry
 
-  return (
-    <>
-      {lines.map((parsed, i) => {
-        if (parsed.raw.trim() === "") {
-          return <span key={i} className="block">{"\n"}</span>
-        }
+  for (let i = 0; i < lines.length; i++) {
+    const parsed = lines[i]
+    if (parsed.raw.trim() === "") {
+      rows.push(<span key={i} className="block">{"\n"}</span>)
+      continue
+    }
 
-        // Boot cycle separator (====== lines from archiveloop)
-        if (parsed.raw.trim().startsWith("=====")) {
-          prevDate = "" // reset — new boot cycle
-          inBootCycle = false
-          return (
-            <span key={i} className="block border-b border-slate-700/40 my-3" />
-          )
-        }
+    // Boot cycle separator (====== lines from archiveloop)
+    if (parsed.raw.trim().startsWith("=====")) {
+      prevDate = "" // reset — new boot cycle
+      inBootCycle = false
+      rows.push(
+        <span key={i} className="block border-b border-slate-700/40 my-3" />
+      )
+      continue
+    }
 
-        // Show a date header when:
-        // 1. First timestamped entry in a boot cycle
-        // 2. The date string actually changes (new day or clock correction)
-        let dateSeparator = null
-        if (parsed.date) {
-          if (!inBootCycle || parsed.date !== prevDate) {
-            dateSeparator = (
-              <span className="block border-b border-slate-700/50 pb-1 pt-3 mb-1 text-xs font-medium text-slate-500 select-none">
-                — {parsed.date} —
-              </span>
-            )
-          }
-          prevDate = parsed.date
-          inBootCycle = true
-        }
-
-        return (
-          <span key={i}>
-            {dateSeparator}
-            <LogLine parsed={parsed} />
+    // Show a date header when:
+    // 1. First timestamped entry in a boot cycle
+    // 2. The date string actually changes (new day or clock correction)
+    let dateSeparator = null
+    if (parsed.date) {
+      if (!inBootCycle || parsed.date !== prevDate) {
+        dateSeparator = (
+          <span className="block border-b border-slate-700/50 pb-1 pt-3 mb-1 text-xs font-medium text-slate-500 select-none">
+            — {parsed.date} —
           </span>
         )
-      })}
-    </>
-  )
+      }
+      prevDate = parsed.date
+      inBootCycle = true
+    }
+
+    rows.push(
+      <span key={i}>
+        {dateSeparator}
+        <LogLine parsed={parsed} />
+      </span>
+    )
+  }
+
+  return <>{rows}</>
 }
 
 export default function Logs() {

@@ -185,6 +185,9 @@ export default function Files() {
 
   useEffect(() => {
     if (currentPath) fetchFiles(currentPath, search || undefined)
+    // search intentionally omitted: search changes fetch via the debounced
+    // handler below; including it here would double-fetch on every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentPath])
 
   // Debounced search
@@ -324,6 +327,10 @@ export default function Files() {
       setUploads([])
       setUploading(false)
     }, 2000)
+    // fetchFiles is a plain function (new identity each render); listing it
+    // would defeat the memoization. It only closes over currentPath, which
+    // is a dep.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentPath])
 
   const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {

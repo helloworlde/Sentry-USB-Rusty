@@ -1,4 +1,4 @@
-import { useRef, useState } from "react"
+import { useState } from "react"
 import { Plug, Power } from "lucide-react"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { KeepAccessoryConfig } from "@/components/settings/KeepAccessoryConfig"
@@ -22,9 +22,11 @@ export function KeepAccessorySection({ onOpenWizard }: Props = {}) {
   // Niche, 12V-only feature for glovebox-USB setups. Once it's been enabled in
   // the session (everOn) we keep showing the full UI even if the user toggles
   // it back off mid-edit, so settings don't vanish mid-change.
-  const everOn = useRef(false)
-  if (values.enabled) everOn.current = true
-  const showDisabled = loaded && !values.enabled && !everOn.current
+  // Render-phase state adjustment (React's "storing information from
+  // previous renders" pattern) — sticky for the component's lifetime.
+  const [everOn, setEverOn] = useState(false)
+  if (values.enabled && !everOn) setEverOn(true)
+  const showDisabled = loaded && !values.enabled && !everOn
 
   async function manual(on: boolean) {
     setPending(true)

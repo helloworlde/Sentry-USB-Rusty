@@ -307,7 +307,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
   const originalDataRef = useRef<SetupFormData | undefined>(initialData)
   const [destructiveWarning, setDestructiveWarning] = useState<DestructiveChange[] | null>(null)
   // Tracks whether the user restored from a backup (affects warning dialog wording)
-  const isRestoreFlow = useRef(false)
+  const [isRestoreFlow, setIsRestoreFlow] = useState(false)
   // True when SENTRYUSB_SETUP_FINISHED exists on disk — i.e. the user is
   // re-running the wizard against an already-set-up system. Used to
   // (a) show a green "data preserved" banner when no destructive change
@@ -321,7 +321,12 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
   // bail!. Null means "no current rejection".
   const [spaceRejection, setSpaceRejection] = useState<string | null>(null)
 
-  // Keep formDataRef in sync with formData on every render.
+  // Keep formDataRef in sync with formData on every render. Load-bearing:
+  // handleApply blurs the active input, waits a frame for the onChange
+  // setState to commit, then reads this ref — so "edit size field, click
+  // Apply without tabbing out" still applies the typed value. Do not move
+  // this into an effect without testing that flow.
+  // eslint-disable-next-line react-hooks/refs
   formDataRef.current = formData
 
   const handleChange = useCallback((key: string, value: string) => {
@@ -337,7 +342,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
       const baseline = { ...updates }
       delete baseline._restore_baseline
       originalDataRef.current = { ...(originalDataRef.current ?? {}), ...baseline }
-      isRestoreFlow.current = true
+      setIsRestoreFlow(true)
     }
   }, [])
 
@@ -389,7 +394,6 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
       })
     })
     return () => { cancelled = true }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Poll setup status while running
@@ -711,10 +715,10 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
             </div>
             <div>
               <h2 className="text-lg font-semibold text-slate-100">
-                {isRestoreFlow.current ? "Drive Sizes Changed From Backup" : "Data Will Be Deleted"}
+                {isRestoreFlow ? "Drive Sizes Changed From Backup" : "Data Will Be Deleted"}
               </h2>
               <p className="mt-1 text-sm text-slate-400">
-                {isRestoreFlow.current
+                {isRestoreFlow
                   ? "You changed drive sizes from what was in your backup. This will cause the SSD to be reformatted, which will erase all existing footage and data on the affected drives."
                   : "The following changes require drive images to be recreated. All data on the affected drives will be permanently lost."}
               </p>
@@ -743,13 +747,13 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
               onClick={handleSkipDestructive}
               className="rounded-lg border border-blue-500/30 bg-blue-500/10 px-4 py-2 text-sm font-medium text-blue-400 transition-colors hover:bg-blue-500/20"
             >
-              {isRestoreFlow.current ? "Restore Backup Sizes" : "Skip Data-Affecting Changes"}
+              {isRestoreFlow ? "Restore Backup Sizes" : "Skip Data-Affecting Changes"}
             </button>
             <button
               onClick={handleApplyAll}
               className="rounded-lg bg-red-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-600"
             >
-              {isRestoreFlow.current ? "Continue & Reformat" : "Delete Data & Apply All"}
+              {isRestoreFlow ? "Continue & Reformat" : "Delete Data & Apply All"}
             </button>
           </div>
         </div>
@@ -918,6 +922,10 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
           */}
           {isLast
             && setupAlreadyFinished
+            // originalDataRef must stay a ref (apply handlers read it at event
+            // time); every write is paired with a setFormData, so this render
+            // read is never stale.
+            // eslint-disable-next-line react-hooks/refs
             && detectDestructiveChanges(formData, originalDataRef.current).length === 0
             && !saveError
             && !currentStepError

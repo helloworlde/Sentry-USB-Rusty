@@ -1,5 +1,6 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from "react"
+import { useState, useRef, useCallback } from "react"
 import { Upload, X, CheckCircle, Loader2, AlertCircle, Plus, RotateCcw } from "lucide-react"
+import { errorMessage } from "@/lib/utils"
 
 export interface FileEntry {
   id: string
@@ -144,9 +145,9 @@ export default function MultiFileUploader({
         const nextPending = filesRef.current.find((f) => f.id !== id && f.status === "pending")
         setExpandedId(nextPending?.id ?? null)
       }
-    } catch (err: any) {
+    } catch (err) {
       setFiles((prev) =>
-        prev.map((f) => f.id === id ? { ...f, status: "error", error: err.message || "Upload failed" } : f)
+        prev.map((f) => f.id === id ? { ...f, status: "error", error: errorMessage(err, "Upload failed") } : f)
       )
     } finally {
       setCurrentStep(null)
@@ -180,10 +181,10 @@ export default function MultiFileUploader({
               : f
           )
         )
-      } catch (err: any) {
+      } catch (err) {
         setFiles((prev) =>
           prev.map((f) =>
-            f.id === entry.id ? { ...f, status: "error", error: err.message || "Upload failed" } : f
+            f.id === entry.id ? { ...f, status: "error", error: errorMessage(err, "Upload failed") } : f
           )
         )
       }
@@ -482,12 +483,4 @@ export default function MultiFileUploader({
       )}
     </div>
   )
-}
-
-export function useObjectUrl(file: File): string {
-  const url = useMemo(() => URL.createObjectURL(file), [file])
-  useEffect(() => {
-    return () => URL.revokeObjectURL(url)
-  }, [url])
-  return url
 }

@@ -22,6 +22,19 @@ export function MobileNotificationsSection() {
   const [countdown, setCountdown] = useState(0)
   const [testState, setTestState] = useState<"idle" | "loading" | "success" | "error">("idle")
 
+  async function loadPairedDevices() {
+    try {
+      const res = await fetch("/api/notifications/paired-devices")
+      if (res.ok) {
+        const data = await res.json()
+        setPairedDevices(data.devices || [])
+      }
+    } catch {
+      /* ignore */
+    }
+    setDevicesLoading(false)
+  }
+
   useEffect(() => {
     loadPairedDevices()
   }, [])
@@ -41,19 +54,6 @@ export function MobileNotificationsSection() {
     }, 1000)
     return () => clearInterval(interval)
   }, [expiresAt])
-
-  async function loadPairedDevices() {
-    try {
-      const res = await fetch("/api/notifications/paired-devices")
-      if (res.ok) {
-        const data = await res.json()
-        setPairedDevices(data.devices || [])
-      }
-    } catch {
-      /* ignore */
-    }
-    setDevicesLoading(false)
-  }
 
   async function generateCode() {
     setLoading(true)
