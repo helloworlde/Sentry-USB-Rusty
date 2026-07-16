@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { Cloud, CloudOff, Loader2, RotateCw, Trash2, Upload } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
@@ -32,7 +32,9 @@ export default function CloudPairingSection({ compact = false }: Props) {
   const [confirmUnpair, setConfirmUnpair] = useState(false)
   const [retrying, setRetrying] = useState(false)
 
-  const sessionStartRef = useRef<{ pending: number; uploaded: number } | null>(null)
+  // Baseline of the current upload session (drives the progress bar) —
+  // state, not a ref, since it feeds rendering.
+  const [sessionStart, setSessionStart] = useState<{ pending: number; uploaded: number } | null>(null)
 
   useEffect(() => {
     let mounted = true
@@ -44,13 +46,14 @@ export default function CloudPairingSection({ compact = false }: Props) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const data: CloudStatus = await res.json()
         if (!mounted) return
-        if (data.paired && !sessionStartRef.current) {
-          sessionStartRef.current = {
-            pending: data.pendingRouteCount + data.totalUploadedRouteCount,
-            uploaded: data.totalUploadedRouteCount,
-          }
-        }
-        if (!data.paired) sessionStartRef.current = null
+        setSessionStart((prev) =>
+          data.paired
+            ? prev ?? {
+                pending: data.pendingRouteCount + data.totalUploadedRouteCount,
+                uploaded: data.totalUploadedRouteCount,
+              }
+            : null,
+        )
         setStatus(data)
         scheduleNext(data)
       } catch {
@@ -112,7 +115,9 @@ export default function CloudPairingSection({ compact = false }: Props) {
   async function cancelPairing() {
     try {
       await fetch("/api/cloud/pair/cancel", { method: "POST" })
-    } catch {}
+    } catch {
+      // fire-and-forget; pairing UI resets regardless
+    }
   }
 
   // Nudge the uploader to retry immediately. Used when `lastUploadError`
@@ -166,7 +171,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
 
   const uploadProgress = useMemo(() => {
     if (!paired || !status) return null
-    const session = sessionStartRef.current
+    const session = sessionStart
     if (!session || session.pending === 0) return null
     const done = Math.max(0, status.totalUploadedRouteCount - session.uploaded)
     const remaining = status.pendingRouteCount
@@ -174,7 +179,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
     if (total === 0) return null
     const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0
     return { done, remaining, total, pct }
-  }, [paired, status])
+  }, [paired, status, sessionStart])
 
   return (
     <div className="glass-card overflow-hidden">

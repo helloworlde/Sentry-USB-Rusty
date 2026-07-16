@@ -34,8 +34,11 @@ export function KeepAccessoryMap({
   const mapRef = useRef<L.Map | null>(null)
   const markerRef = useRef<L.Marker | null>(null)
   const circleRef = useRef<L.Circle | null>(null)
+  // Latest-callback pattern: map click handlers read this at event time.
   const onPlaceRef = useRef(onPlace)
-  onPlaceRef.current = onPlace
+  useEffect(() => {
+    onPlaceRef.current = onPlace
+  }, [onPlace])
   // Capture the initial home so the init effect (run once) can center without
   // needing lat/lon in its deps. Subsequent changes are handled below.
   const initRef = useRef<{ lat: number | null; lon: number | null; r: number }>({
@@ -92,7 +95,6 @@ export function KeepAccessoryMap({
       circleRef.current = null
     }
     // Init-once: deliberately no deps. Live updates handled by the effect below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Keep the pin + circle in sync with the live values.

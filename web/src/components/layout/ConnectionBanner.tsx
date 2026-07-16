@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Wifi, WifiOff, Loader2, X } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useConnectionStatus, type ConnectionState } from "@/hooks/useConnectionStatus"
@@ -9,12 +9,15 @@ export function ConnectionBanner() {
   const [visible, setVisible] = useState(false)
   const [displayState, setDisplayState] = useState<ConnectionState | "connected-flash">(state)
   const [dismissed, setDismissed] = useState(false)
-  const [prevState, setPrevState] = useState<ConnectionState>(state)
+  // Transition bookkeeping only (never rendered) — a ref, so the effect
+  // doesn't re-run on update and cancel the connected-flash timer.
+  const prevStateRef = useRef<ConnectionState>(state)
 
   useEffect(() => {
+    const prevState = prevStateRef.current
     if (state === prevState) return
     const wasDisconnected = prevState === "disconnected" || prevState === "reconnecting"
-    setPrevState(state)
+    prevStateRef.current = state
     setDismissed(false)
 
     if (state === "connected" && wasDisconnected) {

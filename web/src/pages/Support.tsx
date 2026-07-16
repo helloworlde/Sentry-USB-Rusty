@@ -128,7 +128,9 @@ export default function Support() {
     try {
       if (t) localStorage.setItem(STORAGE_KEY, JSON.stringify(t))
       else localStorage.removeItem(STORAGE_KEY)
-    } catch { }
+    } catch {
+      // localStorage unavailable (private mode/quota) — ticket just won't persist
+    }
   }
 
   async function handleSend() {

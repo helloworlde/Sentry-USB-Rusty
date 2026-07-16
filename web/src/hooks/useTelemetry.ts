@@ -8,14 +8,18 @@ export function useTelemetry(clipPath: string | null, frontFile: string | null) 
   const cacheRef = useRef<Map<string, ClipTelemetry>>(new Map())
 
   useEffect(() => {
+    // Early returns must clear loading: a prior in-flight fetch's finally is
+    // cancelled on cleanup, so nothing else resets it.
     if (!clipPath || !frontFile) {
       setTelemetry(null)
+      setLoading(false)
       return
     }
     const key = `${clipPath}/${frontFile}`
     const cached = cacheRef.current.get(key)
     if (cached) {
       setTelemetry(cached)
+      setLoading(false)
       return
     }
 

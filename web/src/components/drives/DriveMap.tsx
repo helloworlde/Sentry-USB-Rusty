@@ -406,6 +406,10 @@ export function DriveMap({
       pulseRef.current = null
       eventsLayerRef.current = null
     }
+    // batterySeries/metric/startTime only seed the initial tooltip; adding
+    // them would tear down and recreate the whole Leaflet map. Live tooltip
+    // updates are handled by the playback effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [points, fsdStates, source])
 
   useEffect(() => {

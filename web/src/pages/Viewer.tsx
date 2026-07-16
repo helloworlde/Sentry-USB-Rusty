@@ -342,6 +342,10 @@ export default function Viewer() {
     }
 
     return () => { cancelled = true; cleanups.forEach((c) => c()) }
+    // segmentDurations intentionally omitted: it's only read to skip
+    // already-probed segments; depending on it would cancel and re-create
+    // in-flight probes every time one completes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clipSets, currentSetIdx])
 
   // Drift correction: re-sync any camera >200ms off the master every 2s

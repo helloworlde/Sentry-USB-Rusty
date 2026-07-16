@@ -323,6 +323,24 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  lint-web:
+    name: Lint web
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Lint
+        # Warning budget covers the reviewed react-hooks compiler-era
+        # backlog (see eslint.config.js) — only ratchet this DOWN.
+        run: |
+          cd web
+          npm ci
+          npx eslint . --max-warnings 30
+
   release:
     name: Create Release
     needs: [build, test]
