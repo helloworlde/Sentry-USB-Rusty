@@ -78,6 +78,15 @@ impl Processor {
         }
     }
 
+    /// Test-only: a processor scanning a temp clip tree instead of the
+    /// Pi's /mutable/TeslaCam.
+    #[cfg(test)]
+    pub(crate) fn with_clip_dir_for_test(store: Arc<DriveStore>, clip_dir: String) -> Self {
+        let mut p = Self::new(store, sentryusb_ws::Hub::new());
+        p.clip_dir = clip_dir;
+        p
+    }
+
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
@@ -222,11 +231,14 @@ impl Processor {
                 // Driving gate for gap-fill event clips: the
                 // pre-extraction scan is timestamp-only, so a parked
                 // car's sentry clips chained after a drive reach here
-                // too. A route row under SavedClips/SentryClips feeds
-                // gap_fill_files() → the playback manifest →
-                // RecentClips cross-links — exactly the parked bloat
-                // 60c5602 removed — so a no-driving event clip is never
-                // stored, only marked processed.
+                // too. A route row under SavedClips/SentryClips would
+                // put the clip in the drive list and its telemetry in
+                // the drive map — exactly the parked bloat 60c5602
+                // removed — so a no-driving event clip is never stored,
+                // only marked processed. (Playback continuity is
+                // separate: update_gapfill_manifest's ungated interior
+                // scan still restores parked minutes that sit strictly
+                // inside a RecentClips hole.)
                 Ok(gps)
                     if crate::grouper::is_event_folder_path(file)
                         && !crate::grouper::telemetry_has_driving(
@@ -319,12 +331,14 @@ impl Processor {
         let _ = self.store.save();
 
         // Refresh the gap-fill manifest the snapshot builder reads to
-        // cross-link driving-hole clips back into RecentClips for
-        // continuous playback. Rebuilt from the routes table every pass so
-        // it self-heals on already-processed devices (the fills are already
-        // rows) as well as fresh deploys. Best-effort — a manifest write
-        // failure only costs playback continuity, never drive data.
-        if let Err(e) = self.update_gapfill_manifest() {
+        // cross-link hole-filling event clips back into RecentClips for
+        // continuous playback. Rebuilt every pass — from the routes table
+        // (driving fills) plus an ungated interior-hole scan (parked fills,
+        // e.g. a user save of parked footage) — so it self-heals on
+        // already-processed devices as well as fresh deploys. Best-effort —
+        // a manifest write failure only costs playback continuity, never
+        // drive data.
+        if let Err(e) = self.update_gapfill_manifest(&recent_ts) {
             warn!("gap-fill manifest update failed: {}", e);
         }
 
@@ -417,6 +431,12 @@ impl Processor {
                 self.scan_dir_inner(&path, files, skip_event_dirs)?;
             } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.ends_with("-front.mp4") {
+                    // Gap-fill playback aliases live under RecentClips but
+                    // point back into SavedClips/SentryClips. They must not
+                    // re-enter the drive timeline as genuine recent clips.
+                    if skip_event_dirs && is_event_crosslink(&path) {
+                        continue;
+                    }
                     // Store relative path from clip_dir
                     if let Ok(rel) = path.strip_prefix(&self.clip_dir) {
                         if let Some(rel_str) = rel.to_str() {
@@ -451,14 +471,7 @@ impl Processor {
         recent_sorted_ts: &[chrono::NaiveDateTime],
         processed: &std::collections::HashSet<String>,
     ) -> Result<Vec<String>> {
-        let mut event_files: Vec<String> = Vec::new();
-        for sub in ["SavedClips", "SentryClips"] {
-            let dir = std::path::Path::new(&self.clip_dir).join(sub);
-            if dir.is_dir() {
-                self.scan_dir_inner(&dir, &mut event_files, false)?;
-            }
-        }
-        event_files.sort();
+        let event_files = self.scan_event_files()?;
 
         let cands: Vec<(chrono::NaiveDateTime, &str)> = event_files
             .iter()
@@ -473,31 +486,71 @@ impl Processor {
             .collect())
     }
 
+    /// Walk `SavedClips/` and `SentryClips/` under the clip dir and return
+    /// every clip file (relative paths, sorted). Shared by the gap-fill
+    /// candidate scan and the playback-manifest interior scan — the latter
+    /// must see ALL event clips, including already-processed ones.
+    fn scan_event_files(&self) -> Result<Vec<String>> {
+        let mut event_files: Vec<String> = Vec::new();
+        for sub in ["SavedClips", "SentryClips"] {
+            let dir = std::path::Path::new(&self.clip_dir).join(sub);
+            if dir.is_dir() {
+                self.scan_dir_inner(&dir, &mut event_files, false)?;
+            }
+        }
+        event_files.sort();
+        Ok(event_files)
+    }
+
     /// Rewrite `<clip_dir>/../.gapfill_recent_links` — the manifest of
     /// event-clip timestamps the snapshot builder cross-links back into
-    /// RecentClips for continuous drive playback. Derived from the routes
-    /// table (every Saved/Sentry route file is, by construction, a
-    /// hole-fill), so it converges to the correct set regardless of when
-    /// the fill happened. Skips the write when unchanged to avoid churn.
-    fn update_gapfill_manifest(&self) -> Result<()> {
+    /// RecentClips for continuous drive playback. Union of two sources:
+    ///
+    /// * the routes table (every Saved/Sentry route file is, by
+    ///   construction, a driving hole-fill — interior, trailing or
+    ///   leading), which converges regardless of when the fill happened;
+    /// * a fresh event-folder scan selecting clips strictly INSIDE a
+    ///   RecentClips hole, WITHOUT the driving gate: a user save moves
+    ///   parked pre-roll minutes out of RecentClips too, and those must
+    ///   still play back even though they never become routes. Scanned
+    ///   without the processed filter — gate-rejected clips are already
+    ///   marked processed and would otherwise never be reconsidered.
+    ///
+    /// Skips the write when unchanged to avoid churn.
+    fn update_gapfill_manifest(&self, recent_sorted_ts: &[chrono::NaiveDateTime]) -> Result<()> {
         let manifest = match std::path::Path::new(&self.clip_dir).parent() {
             Some(p) => p.join(".gapfill_recent_links"),
             None => return Ok(()),
         };
 
-        // Reduce each gap-fill route file to its YYYY-MM-DD_HH-MM-SS stamp
+        // Reduce each gap-fill file to its YYYY-MM-DD_HH-MM-SS stamp
         // (shared by every camera of that minute), sorted + deduped.
+        fn stamp_of(f: &str) -> Option<String> {
+            f.rsplit('/')
+                .next()
+                .filter(|b| b.len() >= 19)
+                .map(|b| b[..19].to_string())
+        }
         let mut stamps: Vec<String> = self
             .store
             .gap_fill_files()?
             .iter()
+            .filter_map(|f| stamp_of(f))
+            .collect();
+
+        let event_files = self.scan_event_files()?;
+        let cands: Vec<(chrono::NaiveDateTime, &str)> = event_files
+            .iter()
             .filter_map(|f| {
-                f.rsplit('/')
-                    .next()
-                    .filter(|b| b.len() >= 19)
-                    .map(|b| b[..19].to_string())
+                crate::grouper::parse_clip_timestamp(f).map(|ts| (ts, f.as_str()))
             })
             .collect();
+        stamps.extend(
+            crate::grouper::select_interior_fill(recent_sorted_ts, &cands)
+                .into_iter()
+                .filter_map(|i| stamp_of(cands[i].1)),
+        );
+
         stamps.sort();
         stamps.dedup();
 
@@ -521,6 +574,16 @@ impl Processor {
     }
 }
 
+fn is_event_crosslink(path: &std::path::Path) -> bool {
+    let Ok(target) = std::fs::read_link(path) else {
+        return false;
+    };
+    target.components().any(|component| {
+        let name = component.as_os_str();
+        name == "SavedClips" || name == "SentryClips"
+    })
+}
+
 /// Directory names that hold Tesla event clips (Sentry triggers + user
 /// saves). Excluded from drive discovery to keep parked recordings and
 /// duplicate-of-RecentClips entries out of the grouper.
@@ -531,6 +594,98 @@ pub(crate) fn is_event_folder(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn recent_scan_excludes_event_gapfill_crosslinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let clip_dir = root.path().join("TeslaCam");
+        let recents = clip_dir.join("RecentClips/2026-07-15");
+        let saved = clip_dir.join("SavedClips/2026-07-15_04-59-30");
+        std::fs::create_dir_all(&recents).unwrap();
+        std::fs::create_dir_all(&saved).unwrap();
+
+        let real_recent = root.path().join("real-recent-front.mp4");
+        let event_clip = saved.join("2026-07-15_04-50-00-front.mp4");
+        std::fs::write(&real_recent, b"recent").unwrap();
+        std::fs::write(&event_clip, b"event").unwrap();
+        symlink(
+            &real_recent,
+            recents.join("2026-07-15_04-49-00-front.mp4"),
+        )
+        .unwrap();
+        symlink(
+            &event_clip,
+            recents.join("2026-07-15_04-50-00-front.mp4"),
+        )
+        .unwrap();
+
+        let processor = Processor::with_clip_dir_for_test(
+            Arc::new(crate::db::DriveStore::open_memory().unwrap()),
+            clip_dir.to_string_lossy().to_string(),
+        );
+        let mut files = Vec::new();
+        processor.scan_dir(&clip_dir, &mut files).unwrap();
+        files.sort();
+
+        assert_eq!(
+            files,
+            vec!["RecentClips/2026-07-15/2026-07-15_04-49-00-front.mp4"],
+            "event-targeting playback aliases must not become timeline anchors or routes"
+        );
+    }
+
+    /// A user save moves parked minutes out of RecentClips into
+    /// SavedClips. Those clips never pass the driving gate (no routes),
+    /// and may already be marked processed from a previous rejected pass —
+    /// the manifest must still list them so playback stays continuous.
+    #[test]
+    fn manifest_includes_parked_saved_clips_in_interior_hole() {
+        let root = tempfile::TempDir::new().unwrap();
+        let clip_dir = root.path().join("TeslaCam");
+        let event_dir = clip_dir.join("SavedClips/2026-07-15_04-59-30");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        // The moved minutes (interior hole 04:49 → 05:00) …
+        for name in [
+            "2026-07-15_04-50-00-front.mp4",
+            "2026-07-15_04-55-00-front.mp4",
+        ] {
+            std::fs::write(event_dir.join(name), b"x").unwrap();
+        }
+        // … plus an event clip duplicating an occupied recent slot.
+        std::fs::write(event_dir.join("2026-07-15_05-00-03-front.mp4"), b"x").unwrap();
+
+        let store = Arc::new(crate::db::DriveStore::open_memory().unwrap());
+        // One clip already marked processed (rejected by the driving gate
+        // on an earlier pass) — must not keep it out of the manifest.
+        store
+            .mark_processed("SavedClips/2026-07-15_04-59-30/2026-07-15_04-50-00-front.mp4")
+            .unwrap();
+
+        let processor = Processor::with_clip_dir_for_test(
+            store,
+            clip_dir.to_string_lossy().to_string(),
+        );
+
+        let recent_ts = vec![
+            chrono::NaiveDateTime::parse_from_str("2026-07-15 04:49:09", "%Y-%m-%d %H:%M:%S")
+                .unwrap(),
+            chrono::NaiveDateTime::parse_from_str("2026-07-15 05:00:03", "%Y-%m-%d %H:%M:%S")
+                .unwrap(),
+        ];
+        processor.update_gapfill_manifest(&recent_ts).unwrap();
+
+        let manifest =
+            std::fs::read_to_string(root.path().join(".gapfill_recent_links")).unwrap();
+        let stamps: Vec<&str> = manifest.lines().collect();
+        assert_eq!(
+            stamps,
+            vec!["2026-07-15_04-50-00", "2026-07-15_04-55-00"],
+            "interior parked fills listed; the occupied-slot twin excluded"
+        );
+    }
 
     #[test]
     fn test_is_event_folder() {

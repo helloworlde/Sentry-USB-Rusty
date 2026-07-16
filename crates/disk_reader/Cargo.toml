@@ -17,6 +17,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
+chrono.workspace = true
 
 # serve mode (localhost HTTP for Sentry Studio)
 tokio.workspace = true
@@ -43,3 +44,7 @@ exfat = { path = "vendor/exfat" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# The vendored libxfuse sources carry their upstream rstest test suite.
+rstest = "0.23"

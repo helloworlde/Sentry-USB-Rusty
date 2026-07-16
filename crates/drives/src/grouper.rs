@@ -456,6 +456,64 @@ pub(crate) struct GapFillCandidate<'a> {
     pub(crate) driving: Option<bool>,
 }
 
+/// Steps 2-3 of gap-fill admission (see [`select_gap_fill`]): drop
+/// candidates that duplicate an occupied RecentClips slot (one-sided,
+/// within GAP_FILL_DUP_MS after a recent clip — Tesla stamps the
+/// Saved/Sentry twin of a segment 0-1 s later), then dedup overlapping
+/// candidates in (timestamp, path) order so lowest path wins and
+/// SavedClips/SentryClips twins of the same minute never both land.
+/// `order` holds the still-eligible indices into `cands`; returns the
+/// kept subset.
+fn dedup_candidates(
+    recent_sorted_ts: &[NaiveDateTime],
+    cands: &[(NaiveDateTime, &str)],
+    mut order: Vec<usize>,
+) -> Vec<usize> {
+    let dup_of_recent = |ts: NaiveDateTime| -> bool {
+        let i = recent_sorted_ts.partition_point(|&r| r <= ts);
+        i > 0 && (ts - recent_sorted_ts[i - 1]).num_milliseconds() <= GAP_FILL_DUP_MS
+    };
+    order.retain(|&i| !dup_of_recent(cands[i].0));
+    order.sort_by(|&a, &b| cands[a].cmp(&cands[b]));
+    let mut kept: Vec<usize> = Vec::new();
+    for i in order {
+        if let Some(&last) = kept.last()
+            && (cands[i].0 - cands[last].0).num_milliseconds() <= GAP_FILL_DUP_MS
+        {
+            continue;
+        }
+        kept.push(i);
+    }
+    kept
+}
+
+/// Playback-manifest selection: event clips whose timestamp lies STRICTLY
+/// INSIDE a fillable RecentClips hole, WITHOUT the driving gate. An
+/// interior clip's minute is missing from RecentClips by definition
+/// (Tesla moved it into the event folder), so cross-linking it back
+/// cannot double-list footage — the reason drive-path admission is
+/// driving-gated does not apply. Trailing/leading chains stay excluded
+/// here: with no bounding recent clip, an ungated chain would pull whole
+/// parked sentry sessions into RecentClips. Timestamp-only — no SEI
+/// needed, so clips already rejected (and marked processed) by the
+/// driving gate still qualify. Returns indices into `candidates`.
+pub(crate) fn select_interior_fill(
+    recent_sorted_ts: &[NaiveDateTime],
+    candidates: &[(NaiveDateTime, &str)],
+) -> Vec<usize> {
+    if recent_sorted_ts.is_empty() || candidates.is_empty() {
+        return Vec::new();
+    }
+    let holes = fillable_holes(recent_sorted_ts);
+    if holes.is_empty() {
+        return Vec::new();
+    }
+    dedup_candidates(recent_sorted_ts, candidates, (0..candidates.len()).collect())
+        .into_iter()
+        .filter(|&i| ts_in_holes(&holes, candidates[i].0))
+        .collect()
+}
+
 /// Timestamp-only wrapper around [`select_gap_fill`] for callers without
 /// SEI in hand (the processor's disk scan).
 pub(crate) fn select_gap_fill_events(
@@ -494,13 +552,6 @@ pub(crate) fn select_gap_fill(
     }
     let holes = fillable_holes(recent_sorted_ts);
 
-    // Same recorder segment as an occupied RecentClips slot? One-sided:
-    // shortly-BEFORE-next-recent clips are truncated pre-roll tails that
-    // carry unique footage (see GAP_FILL_DUP_MS).
-    let dup_of_recent = |ts: NaiveDateTime| -> bool {
-        let i = recent_sorted_ts.partition_point(|&r| r <= ts);
-        i > 0 && (ts - recent_sorted_ts[i - 1]).num_milliseconds() <= GAP_FILL_DUP_MS
-    };
     let nearest_recent_ms = |ts: NaiveDateTime| -> i64 {
         let i = recent_sorted_ts.partition_point(|&r| r < ts);
         let mut best = i64::MAX;
@@ -513,22 +564,14 @@ pub(crate) fn select_gap_fill(
         best
     };
 
-    // Steps 1-3: eligibility, then dedup in (timestamp, path) order.
-    let mut order: Vec<usize> = (0..candidates.len())
-        .filter(|&i| candidates[i].driving != Some(false) && !dup_of_recent(candidates[i].ts))
+    // Steps 1-3: driving eligibility, then the shared dup-of-recent +
+    // twin dedup in (timestamp, path) order.
+    let pairs: Vec<(NaiveDateTime, &str)> =
+        candidates.iter().map(|c| (c.ts, c.file)).collect();
+    let order: Vec<usize> = (0..candidates.len())
+        .filter(|&i| candidates[i].driving != Some(false))
         .collect();
-    order.sort_by(|&a, &b| {
-        (candidates[a].ts, candidates[a].file).cmp(&(candidates[b].ts, candidates[b].file))
-    });
-    let mut kept: Vec<usize> = Vec::new();
-    for i in order {
-        if let Some(&last) = kept.last()
-            && (candidates[i].ts - candidates[last].ts).num_milliseconds() <= GAP_FILL_DUP_MS
-        {
-            continue;
-        }
-        kept.push(i);
-    }
+    let kept = dedup_candidates(recent_sorted_ts, &pairs, order);
 
     // Step 4b: chain connectivity over the merged recent+kept timeline.
     // Clusters are maximal runs whose consecutive gaps stay within
@@ -3330,6 +3373,77 @@ mod tests {
                 "SentryClips/2026-06-01_10-02-30/2026-06-01_10-02-00-front.mp4",
             ]
         );
+    }
+
+    #[test]
+    fn test_select_interior_fill_admits_parked_hole_clips_only() {
+        // A user save moved parked minutes 10:01-10:02 out of RecentClips.
+        // No SEI/driving info exists at selection time — interior clips
+        // must be admitted anyway (playback continuity), while anything
+        // outside a hole stays out regardless.
+        let recent = vec![
+            dts("2026-06-01 10:00:00"),
+            dts("2026-06-01 10:03:00"),
+            dts("2026-06-01 10:04:00"),
+        ];
+        let cands = vec![
+            // Interior hole fills → admitted.
+            (dts("2026-06-01 10:01:00"), "SavedClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4"),
+            (dts("2026-06-01 10:02:00"), "SavedClips/2026-06-01_10-02-30/2026-06-01_10-02-00-front.mp4"),
+            // Leading (before first recent clip) → chain shapes stay
+            // driving-gated on the route path, never admitted here.
+            (dts("2026-06-01 09:58:00"), "SavedClips/2026-06-01_10-02-30/2026-06-01_09-58-00-front.mp4"),
+            // Trailing (after last recent clip) → same.
+            (dts("2026-06-01 10:06:00"), "SentryClips/2026-06-01_10-07-00/2026-06-01_10-06-00-front.mp4"),
+            // Duplicate of the occupied 10:04 slot (twin stamped 1s later) → rejected.
+            (dts("2026-06-01 10:04:01"), "SavedClips/2026-06-01_10-05-00/2026-06-01_10-04-01-front.mp4"),
+        ];
+        let picked: Vec<&str> = select_interior_fill(&recent, &cands)
+            .into_iter()
+            .map(|i| cands[i].1)
+            .collect();
+        assert_eq!(
+            picked,
+            vec![
+                "SavedClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4",
+                "SavedClips/2026-06-01_10-02-30/2026-06-01_10-02-00-front.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_select_interior_fill_twin_dedup_lowest_path_wins() {
+        let recent = vec![
+            dts("2026-06-01 10:00:00"),
+            dts("2026-06-01 10:03:00"),
+        ];
+        // The same missing minute exists in both event folders → exactly
+        // one winner, lowest path (SavedClips sorts before SentryClips).
+        let cands = vec![
+            (dts("2026-06-01 10:01:00"), "SentryClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4"),
+            (dts("2026-06-01 10:01:00"), "SavedClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4"),
+        ];
+        let picked: Vec<&str> = select_interior_fill(&recent, &cands)
+            .into_iter()
+            .map(|i| cands[i].1)
+            .collect();
+        assert_eq!(
+            picked,
+            vec!["SavedClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4"]
+        );
+    }
+
+    #[test]
+    fn test_select_interior_fill_no_holes_or_empty_recent() {
+        let cands = vec![
+            (dts("2026-06-01 10:01:00"), "SavedClips/2026-06-01_10-02-30/2026-06-01_10-01-00-front.mp4"),
+        ];
+        // No recent timeline at all → an isolated event cluster, nothing
+        // to anchor a hole → nothing admitted.
+        assert!(select_interior_fill(&[], &cands).is_empty());
+        // Contiguous recent timeline (no fillable hole) → nothing admitted.
+        let recent = vec![dts("2026-06-01 10:00:00"), dts("2026-06-01 10:01:00")];
+        assert!(select_interior_fill(&recent, &cands).is_empty());
     }
 
     #[test]
