@@ -14,6 +14,7 @@ members = [
     "crates/cloud_uploader",
     "crates/tesla_telemetry",
     "crates/tesla_ble",
+    "crates/disk_reader",
 ]
 
 [workspace.package]
