@@ -328,62 +328,7 @@ impl<Ctx> Decode<Ctx> for DinodeCore {
 }
 impl_borrow_decode!(DinodeCore);
 
-#[cfg(test)]
-mod tests {
-    use rstest::rstest;
-
-    use super::*;
-
-    /// Test the afork_btree_ptr_gap function against data from real live file systems.  The XFS
-    /// Algorithms & Data Structures book does not accurately document this gap.
-    #[rstest]
-    #[case(512, 24, 3, 1, 56)]
-    #[case(512, 24, 3, 5, 24)]
-    #[case(256, 15, 2, 1, 8)]
-    fn afork_btree_ptr_gap(
-        #[case] inode_size: usize,
-        #[case] di_forkoff: u8,
-        #[case] di_version: i8,
-        #[case] bb_numrecs: u16,
-        #[case] gap: usize,
-    ) {
-        let dic = DinodeCore {
-            di_forkoff,
-            di_version,
-            di_aformat: XfsDinodeFmt::Btree,
-            ..Default::default()
-        };
-        assert_eq!(dic.afork_btree_ptr_gap(inode_size, bb_numrecs), gap);
-    }
-
-    /// Test the dfork_btree_ptr_gap function against data from real live file systems.  The XFS
-    /// Algorithms & Data Structures book does not accurately document this gap.
-    #[rstest]
-    #[case(512, 0, 3, 1, 152)]
-    #[case(512, 0, 3, 3, 136)]
-    #[case(512, 24, 3, 1, 80)]
-    #[case(512, 0, 3, 2, 144)]
-    #[case(512, 24, 3, 9, 16)]
-    #[case(512, 37, 3, 2, 128)]
-    #[case(256, 0, 2, 2, 56)]
-    #[case(256, 0, 2, 1, 64)]
-    #[case(256, 15, 2, 1, 48)]
-    #[case(2048, 0, 3, 1, 920)]
-    #[case(2048, 0, 3, 3, 904)]
-    #[case(1024, 0, 3, 7, 360)]
-    fn dfork_btree_ptr_gap(
-        #[case] inode_size: usize,
-        #[case] di_forkoff: u8,
-        #[case] di_version: i8,
-        #[case] bb_numrecs: u16,
-        #[case] gap: usize,
-    ) {
-        let dic = DinodeCore {
-            di_forkoff,
-            di_version,
-            di_format: XfsDinodeFmt::Btree,
-            ..Default::default()
-        };
-        assert_eq!(dic.dfork_btree_ptr_gap(inode_size, bb_numrecs), gap);
-    }
-}
+// NOTE: upstream xfuce's #[cfg(test)] module was removed when vendoring —
+// it depends on rstest + fixture images (resources/*.img) that are not
+// vendored here. Parsing is exercised by disk_reader's own integration test
+// (tests/make_golden_image.sh) and the probe/ls/cat CLI instead.

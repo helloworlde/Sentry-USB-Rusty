@@ -191,33 +191,7 @@ impl<I: IntoIterator<Item = BmbtRec>> From<I> for Bmx {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn map_dblock() {
-        let bmx = Bmx::new(&[
-            BmbtRec {
-                br_startoff:   0,
-                br_startblock: 20,
-                br_blockcount: 2,
-                br_flag:       false,
-            },
-            BmbtRec {
-                br_startoff:   2,
-                br_startblock: 30,
-                br_blockcount: 3,
-                br_flag:       false,
-            },
-            BmbtRec {
-                br_startoff:   5,
-                br_startblock: 40,
-                br_blockcount: 2,
-                br_flag:       false,
-            },
-        ]);
-
-        assert_eq!(bmx.map_dblock(6), Some(41));
-    }
-}
+// NOTE: upstream xfuce's #[cfg(test)] module was removed when vendoring —
+// it depends on rstest + fixture images (resources/*.img) that are not
+// vendored here. Parsing is exercised by disk_reader's own integration test
+// (tests/make_golden_image.sh) and the probe/ls/cat CLI instead.
