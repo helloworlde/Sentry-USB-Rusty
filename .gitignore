@@ -8,5 +8,7 @@ Sentry-USB-OLD
 .cursorignore
 server/ble/__pycache__
 .claude
+.codex
+docs/superpowers
 /crates/sentryusb/static/
 /graphify-out
