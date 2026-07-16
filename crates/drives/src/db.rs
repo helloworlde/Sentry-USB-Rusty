@@ -632,12 +632,9 @@ impl DriveStore {
     /// set, and the driving filter drops any parked row that entered the
     /// table before the `do_process` driving gate existed (older builds,
     /// drive-data.json imports). The snapshot builder reads a manifest
-    /// derived from this (unioned with the processor's ungated
-    /// interior-hole scan, which restores parked minutes a user save moved
-    /// out of RecentClips) to cross-link those clips back into RecentClips
-    /// for continuous playback. A parked ROW here would also put the clip
-    /// in the drive list — exactly the parked presence 60c5602 removed —
-    /// so the driving filter stays.
+    /// derived from this to cross-link those clips back into RecentClips
+    /// for continuous playback — a parked event clip in the manifest would
+    /// reintroduce exactly the parked presence 60c5602 removed.
     ///
     /// The predicate is `grouper::row_has_driving` — the SAME one the
     /// grouper applies to stored rows when admitting gap-fills — so the

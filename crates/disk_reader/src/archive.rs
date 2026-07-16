@@ -66,11 +66,6 @@ pub struct FileMeta {
     /// Index into `Archive::sources`.
     pub source: usize,
     pub size: u64,
-    /// For a gap-fill alias (an event clip surfaced under a virtual
-    /// `RecentClips/` path): the clip's REAL path inside the source's CAM
-    /// filesystem. `None` for ordinary entries, whose merged-tree key IS
-    /// the CAM path.
-    pub real: Option<String>,
 }
 
 pub struct Archive {
@@ -189,12 +184,6 @@ impl Archive {
         archive.load_tocs(progress);
         progress("Merging snapshots".to_string());
         archive.build_merged_tree()?;
-        let aliased = alias_gapfill_recents(&mut archive.files);
-        if aliased > 0 {
-            progress(format!(
-                "Restored {aliased} clip(s) into RecentClips from event folders"
-            ));
-        }
         Ok(archive)
     }
 
@@ -245,7 +234,6 @@ impl Archive {
                     FileMeta {
                         source: idx,
                         size: e.size,
-                        real: None,
                     },
                 );
             }
@@ -353,11 +341,8 @@ impl Archive {
             .files
             .get(path)
             .ok_or_else(|| anyhow!("no such file: {path}"))?;
-        // Gap-fill aliases live at a virtual RecentClips path; the bytes
-        // are read from the clip's real event-folder location.
-        let cam_path = meta.real.as_deref().unwrap_or(path);
         let cam = self.cam(meta.source)?;
-        let result = cam.lock().unwrap().0.read_file_range(cam_path, offset, len);
+        let result = cam.lock().unwrap().0.read_file_range(path, offset, len);
         result
     }
 
@@ -368,9 +353,8 @@ impl Archive {
             .files
             .get(path)
             .ok_or_else(|| anyhow!("no such file: {path}"))?;
-        let cam_path = meta.real.as_deref().unwrap_or(path);
         let cam = self.cam(meta.source)?;
-        let result = cam.lock().unwrap().0.read_file(cam_path);
+        let result = cam.lock().unwrap().0.read_file(path);
         result
     }
 
@@ -421,141 +405,6 @@ impl Archive {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Gap-fill aliasing: a Tesla save/event MOVES continuous-recording minutes
-// out of RecentClips into SavedClips/SentryClips. When that happens before
-// any snapshot captured the minute at its RecentClips path, the merged tree
-// has a hole in the 24/7 timeline even though the footage is right there in
-// an event folder. Mirror of the Pi's playback gap-fill (the interior-hole
-// rules of crates/drives/src/grouper.rs — same constants, kept in sync by
-// comment because the drives crate carries Pi-only deps): surface event
-// clips whose minute is MISSING from RecentClips under a virtual
-// RecentClips/<basename> path. Occupied minutes are never touched, so
-// parked sentry sessions and event twins of existing footage stay out of
-// RecentClips exactly as before.
-// ---------------------------------------------------------------------------
-
-const RECENTS_PREFIX: &str = "TeslaCam/RecentClips/";
-const EVENT_PREFIXES: [&str; 2] = ["TeslaCam/SavedClips/", "TeslaCam/SentryClips/"];
-/// A hole must be wider than one missing minute-clip…
-const GAP_FILL_MIN_S: i64 = 90;
-/// …but within the fill cap: longer gaps are park/drive boundaries where
-/// recording genuinely stopped (grouper::GAP_FILL_MAX_MS).
-const GAP_FILL_MAX_S: i64 = 30 * 60;
-/// Same-recorder-segment window: an event clip stamped ≤30 s after an
-/// occupied RecentClips slot is Tesla's twin of that segment, not new
-/// footage (grouper::GAP_FILL_DUP_MS).
-const GAP_FILL_DUP_S: i64 = 30;
-
-/// The `YYYY-MM-DD_HH-MM-SS` timestamp of a clip path's FILENAME component
-/// (event paths embed the event-folder timestamp earlier in the path).
-fn clip_ts(path: &str) -> Option<chrono::NaiveDateTime> {
-    let base = path.rsplit('/').next()?;
-    let stamp = base.get(..19)?;
-    chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d_%H-%M-%S").ok()
-}
-
-/// Insert virtual `RecentClips/` entries for event clips that fill holes
-/// in the continuous-recording timeline. Returns how many were added.
-fn alias_gapfill_recents(files: &mut BTreeMap<String, FileMeta>) -> usize {
-    // Continuous timeline: every RecentClips clip minute, sorted + deduped.
-    let mut recent_ts: Vec<chrono::NaiveDateTime> = files
-        .range(RECENTS_PREFIX.to_string()..)
-        .take_while(|(p, _)| p.starts_with(RECENTS_PREFIX))
-        .filter_map(|(p, _)| clip_ts(p))
-        .collect();
-    recent_ts.sort();
-    recent_ts.dedup();
-    if recent_ts.is_empty() {
-        return 0;
-    }
-
-    // Event candidates, in BTreeMap (path) order so SavedClips precedes
-    // SentryClips — lowest path wins the per-minute admission below.
-    let cands: Vec<(chrono::NaiveDateTime, String)> = EVENT_PREFIXES
-        .iter()
-        .flat_map(|prefix| {
-            files
-                .range(prefix.to_string()..)
-                .take_while(move |(p, _)| p.starts_with(prefix))
-                .filter_map(|(p, _)| clip_ts(p).map(|ts| (ts, p.clone())))
-        })
-        .collect();
-    if cands.is_empty() {
-        return 0;
-    }
-
-    let holes: Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)> = recent_ts
-        .windows(2)
-        .filter(|w| {
-            let gap = (w[1] - w[0]).num_seconds();
-            gap > GAP_FILL_MIN_S && gap <= GAP_FILL_MAX_S
-        })
-        .map(|w| (w[0], w[1]))
-        .collect();
-    if holes.is_empty() {
-        return 0;
-    }
-    let in_hole = |ts: chrono::NaiveDateTime| -> bool {
-        let i = holes.partition_point(|h| h.0 < ts);
-        i > 0 && ts < holes[i - 1].1
-    };
-    let dup_of_recent = |ts: chrono::NaiveDateTime| -> bool {
-        let i = recent_ts.partition_point(|&r| r <= ts);
-        i > 0 && (ts - recent_ts[i - 1]).num_seconds() <= GAP_FILL_DUP_S
-    };
-
-    // Admit per unique minute STAMP (all camera angles of a minute share
-    // it): interior hole, not a twin of an occupied slot, and not within
-    // the twin window of an already-admitted minute (drops the 0-1 s-later
-    // duplicate the other event folder may hold).
-    let mut stamps: Vec<chrono::NaiveDateTime> =
-        cands.iter().map(|(ts, _)| *ts).collect();
-    stamps.sort();
-    stamps.dedup();
-    let mut admitted: Vec<chrono::NaiveDateTime> = Vec::new();
-    for ts in stamps {
-        if !in_hole(ts) || dup_of_recent(ts) {
-            continue;
-        }
-        if admitted
-            .last()
-            .is_some_and(|&last| (ts - last).num_seconds() <= GAP_FILL_DUP_S)
-        {
-            continue;
-        }
-        admitted.push(ts);
-    }
-    if admitted.is_empty() {
-        return 0;
-    }
-
-    let mut added = 0usize;
-    for (ts, path) in cands {
-        if admitted.binary_search(&ts).is_err() {
-            continue;
-        }
-        let Some(base) = path.rsplit('/').next() else {
-            continue;
-        };
-        let alias = format!("{RECENTS_PREFIX}{base}");
-        if files.contains_key(&alias) {
-            continue;
-        }
-        let meta = files[&path].clone();
-        files.insert(
-            alias,
-            FileMeta {
-                source: meta.source,
-                size: meta.size,
-                real: Some(path),
-            },
-        );
-        added += 1;
-    }
-    added
-}
-
 fn parse_toc(text: &str) -> Vec<TocEntry> {
     text.lines()
         .filter_map(|line| {
@@ -599,114 +448,6 @@ impl<T: std::io::Read + std::io::Seek> std::io::Read for SubFile<T> {
         let n = self.inner.read(&mut buf[..want])?;
         self.pos += n as u64;
         Ok(n)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn meta(source: usize) -> FileMeta {
-        FileMeta {
-            source,
-            size: 1,
-            real: None,
-        }
-    }
-
-    fn tree(paths: &[&str]) -> BTreeMap<String, FileMeta> {
-        paths.iter().map(|p| (p.to_string(), meta(0))).collect()
-    }
-
-    #[test]
-    fn clip_ts_parses_filename_not_event_folder() {
-        let ts = clip_ts("TeslaCam/SavedClips/2026-07-15_04-59-30/2026-07-15_04-50-00-front.mp4")
-            .unwrap();
-        assert_eq!(ts.to_string(), "2026-07-15 04:50:00");
-        assert!(clip_ts("TeslaCam/RecentClips/thumb.png").is_none());
-    }
-
-    /// The user-save scenario: parked minutes moved into SavedClips before
-    /// any snapshot caught them in RecentClips. They must surface at
-    /// virtual RecentClips paths; the twin of an occupied slot, the
-    /// SentryClips duplicate of an admitted minute, and out-of-hole event
-    /// clips must not.
-    #[test]
-    fn alias_gapfill_fills_interior_holes_only() {
-        let mut files = tree(&[
-            // Continuous timeline with a 04:49 → 05:00 hole.
-            "TeslaCam/RecentClips/2026-07-15_04-49-09-front.mp4",
-            "TeslaCam/RecentClips/2026-07-15_05-00-03-front.mp4",
-            // Missing minutes, all cameras (moved by the save).
-            "TeslaCam/SavedClips/2026-07-15_04-59-30/2026-07-15_04-50-00-front.mp4",
-            "TeslaCam/SavedClips/2026-07-15_04-59-30/2026-07-15_04-50-00-back.mp4",
-            "TeslaCam/SavedClips/2026-07-15_04-59-30/2026-07-15_04-55-00-front.mp4",
-            // SentryClips twin of an admitted minute, stamped 1 s later → dropped.
-            "TeslaCam/SentryClips/2026-07-15_04-58-00/2026-07-15_04-55-01-front.mp4",
-            // Twin of the occupied 05:00:03 slot → dropped.
-            "TeslaCam/SavedClips/2026-07-15_04-59-30/2026-07-15_05-00-04-front.mp4",
-            // Parked sentry session hours away, outside any hole → dropped.
-            "TeslaCam/SentryClips/2026-07-15_01-00-00/2026-07-15_00-59-00-front.mp4",
-        ]);
-        let added = alias_gapfill_recents(&mut files);
-        assert_eq!(added, 3);
-
-        let aliases: Vec<&str> = files
-            .iter()
-            .filter(|(_, m)| m.real.is_some())
-            .map(|(p, _)| p.as_str())
-            .collect();
-        assert_eq!(
-            aliases,
-            vec![
-                "TeslaCam/RecentClips/2026-07-15_04-50-00-back.mp4",
-                "TeslaCam/RecentClips/2026-07-15_04-50-00-front.mp4",
-                "TeslaCam/RecentClips/2026-07-15_04-55-00-front.mp4",
-            ]
-        );
-        // Aliases read from the clip's real event-folder path.
-        assert_eq!(
-            files["TeslaCam/RecentClips/2026-07-15_04-50-00-front.mp4"]
-                .real
-                .as_deref(),
-            Some("TeslaCam/SavedClips/2026-07-15_04-59-30/2026-07-15_04-50-00-front.mp4"),
-        );
-    }
-
-    /// A minute the union already holds at its RecentClips path (an older
-    /// snapshot caught it before Tesla moved it) is never overwritten,
-    /// and a boundary gap wider than the fill cap admits nothing.
-    #[test]
-    fn alias_gapfill_never_clobbers_and_respects_cap() {
-        let mut files = tree(&[
-            "TeslaCam/RecentClips/2026-07-15_04-49-00-front.mp4",
-            "TeslaCam/RecentClips/2026-07-15_04-52-00-front.mp4",
-            // Same minute exists BOTH places (snapshot caught the move
-            // mid-flight) → the RecentClips entry wins, no alias.
-            "TeslaCam/RecentClips/2026-07-15_04-50-00-front.mp4",
-            "TeslaCam/SavedClips/2026-07-15_04-51-00/2026-07-15_04-50-00-front.mp4",
-            // 45-min park boundary later that day → not a fillable hole.
-            "TeslaCam/RecentClips/2026-07-15_06-00-00-front.mp4",
-            "TeslaCam/SentryClips/2026-07-15_05-30-00/2026-07-15_05-29-00-front.mp4",
-        ]);
-        assert_eq!(alias_gapfill_recents(&mut files), 0);
-        assert!(files["TeslaCam/RecentClips/2026-07-15_04-50-00-front.mp4"]
-            .real
-            .is_none());
-    }
-
-    #[test]
-    fn alias_gapfill_empty_inputs() {
-        // No RecentClips at all → nothing to anchor holes.
-        let mut only_events =
-            tree(&["TeslaCam/SavedClips/2026-07-15_04-59-30/2026-07-15_04-50-00-front.mp4"]);
-        assert_eq!(alias_gapfill_recents(&mut only_events), 0);
-        // No event folders → nothing to fill with.
-        let mut only_recents = tree(&[
-            "TeslaCam/RecentClips/2026-07-15_04-49-09-front.mp4",
-            "TeslaCam/RecentClips/2026-07-15_05-00-03-front.mp4",
-        ]);
-        assert_eq!(alias_gapfill_recents(&mut only_recents), 0);
     }
 }
 
