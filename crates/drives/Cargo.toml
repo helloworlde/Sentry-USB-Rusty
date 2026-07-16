@@ -15,3 +15,6 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 base64 = "0.22"
 
 sentryusb-ws = { path = "../ws", package = "sentryusb-ws" }
+
+[dev-dependencies]
+tempfile = "3"
