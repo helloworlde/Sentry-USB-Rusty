@@ -89,6 +89,7 @@ pub async fn serve(
     disk: Disk,
     port: u16,
     handshake_file: Option<PathBuf>,
+    handshake_owner_uid: Option<u32>,
     idle_exit_secs: u64,
 ) -> Result<()> {
     let mut token_bytes = [0u8; 16];
@@ -144,7 +145,7 @@ pub async fn serve(
     .to_string();
     match &handshake_file {
         Some(path) => {
-            write_private(path, &handshake)?;
+            write_private(path, &handshake, handshake_owner_uid)?;
             tracing::info!("handshake written to {}", path.display());
         }
         None => println!("{handshake}"),
@@ -170,7 +171,7 @@ pub async fn serve(
     Ok(())
 }
 
-fn write_private(path: &std::path::Path, contents: &str) -> Result<()> {
+fn write_private(path: &std::path::Path, contents: &str, owner_uid: Option<u32>) -> Result<()> {
     use std::io::Write as _;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -183,6 +184,16 @@ fn write_private(path: &std::path::Path, contents: &str) -> Result<()> {
         .open(path)
         .with_context(|| format!("write {}", path.display()))?;
     f.write_all(contents.as_bytes())?;
+    drop(f);
+    // When running elevated, hand the file to the user who launched us —
+    // 0600 root-owned would be unreadable to the polling caller.
+    #[cfg(unix)]
+    if let Some(uid) = owner_uid {
+        std::os::unix::fs::chown(path, Some(uid), None)
+            .with_context(|| format!("chown {} to uid {uid}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = owner_uid;
     Ok(())
 }
 

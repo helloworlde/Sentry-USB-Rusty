@@ -74,6 +74,11 @@ enum Command {
         /// Without it, the handshake is printed to stdout.
         #[arg(long)]
         handshake_file: Option<PathBuf>,
+        /// chown the handshake file to this uid (unix). Needed when the
+        /// helper runs elevated but the caller polls the file as a normal
+        /// user.
+        #[arg(long)]
+        handshake_owner_uid: Option<u32>,
         /// Exit after this many seconds without a request (0 = never).
         #[arg(long, default_value_t = 0)]
         idle_exit: u64,
@@ -176,6 +181,7 @@ fn main() -> Result<()> {
             disk,
             port,
             handshake_file,
+            handshake_owner_uid,
             idle_exit,
         } => {
             // Opening the device must succeed up front (permission errors
@@ -186,7 +192,13 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(http::serve(dev, port, handshake_file, idle_exit))?;
+            rt.block_on(http::serve(
+                dev,
+                port,
+                handshake_file,
+                handshake_owner_uid,
+                idle_exit,
+            ))?;
         }
         Command::CamBoot { disk, source } => {
             let ar = open_archive(&disk)?;
