@@ -22,7 +22,7 @@ const HOME_ICON = L.divIcon({
  */
 export function KeepAccessoryMap({
   lat,
-  lon,
+  lon: rawLon,
   radiusM,
   onPlace,
 }: {
@@ -33,7 +33,7 @@ export function KeepAccessoryMap({
 }) {
   // Legacy configs may hold a world-copy longitude (e.g. -221 for 139°E);
   // wrap so the pin and the readout agree with what gets stored.
-  lon = lon != null ? normalizeLon(lon) : null
+  const lon = rawLon != null ? normalizeLon(rawLon) : null
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const markerRef = useRef<L.Marker | null>(null)
