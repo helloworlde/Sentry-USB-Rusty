@@ -80,6 +80,18 @@ fn load_regular_private_key(path: &Path) -> Result<KeyPair> {
     KeyPair::load(path).context("loading Tesla BLE private key")
 }
 
+/// Is there a usable private key at `path`?
+///
+/// Prefer this over `Path::exists()` for every "do we need to generate a
+/// key?" decision. A bare existence test caused an unrecoverable deadlock:
+/// an interrupted keygen leaves a 0-byte `key_private.pem`, which "exists"
+/// but cannot be parsed, so pairing failed forever while every guard
+/// happily reported the key was already installed. This actually parses
+/// the key, so empty, truncated and corrupt files all read as unusable.
+pub fn key_is_usable(path: &Path) -> bool {
+    KeyPair::load(path).is_ok()
+}
+
 struct KeyDirectoryLock {
     file: File,
 }
@@ -491,7 +503,7 @@ mod tests {
     fn parses_sec1_pem_from_openssl() {
         // SEC1 PEM equivalent to the format `tesla-keygen` produces.
         // Generated via:
-        //   openssl ecparam -name prime256v1 -genkey -noout
+        //   openssl ecparam -name prime256v1 -genkey -noob
         // The exact bytes don't matter — just that the SEC1 path works.
         let pem = "-----BEGIN EC PRIVATE KEY-----\n\
                    MHcCAQEEIBnEX3tDgQHQX5IcAOA2RrvHV7ZzNeb7BLJ3vh7zVRpJoAoGCCqGSM49\n\

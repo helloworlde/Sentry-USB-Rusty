@@ -232,7 +232,7 @@ where
     let _guard = TESLA_BLE_INSTALL_LOCK.lock().await;
     let key_dir = std::path::Path::new("/root/.ble");
     let private_key = key_dir.join("key_private.pem");
-    if tesla_ble_keypair_is_valid() {
+    if sentryusb_tesla_ble::keys::key_is_usable(&private_key) {
         return Ok(());
     }
 
@@ -292,7 +292,9 @@ pub async fn configure_tesla_ble(env: &SetupEnv, emitter: &SetupEmitter) -> Resu
     }
 
     // Native action binaries ship with the image; only the keypair is durable.
-    if tesla_ble_keypair_is_valid() {
+    if sentryusb_tesla_ble::keys::key_is_usable(
+        std::path::Path::new("/root/.ble/key_private.pem"),
+    ) {
         return Ok(false);
     }
 
